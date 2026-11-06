@@ -149,7 +149,7 @@ export function landingPage() {
   });
 }
 
-export function loginPage({ clientName, queryParams, error = null }) {
+export function loginPage({ clientName, consentId = "", queryParams = {}, error = null }) {
   return layout({
     title: "Connect Things 3",
     content: `
@@ -158,6 +158,7 @@ export function loginPage({ clientName, queryParams, error = null }) {
       <p>Log in with your Things Cloud credentials to authorize <strong>${clientName || "your AI Assistant"}</strong>.</p>
       ${error ? `<div class="error-box">${error}</div>` : ""}
       <form action="/authorize/login" method="POST">
+        <input type="hidden" name="consentId" value="${consentId || ""}">
         <input type="hidden" name="oauthParams" value="${encodeURIComponent(JSON.stringify(queryParams))}">
         <div class="field">
           <label for="email">Things Cloud Email</label>

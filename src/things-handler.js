@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { landingPage, loginPage, privacyPage, errorPage } from "./pages.js";
 import { ThingsCloudClient } from "./things-client.js";
+import { encryptJson } from "./oauth-storage.js";
 
 const app = new Hono();
 
@@ -24,7 +25,8 @@ app.get("/authorize", async (c) => {
   try {
     oauthReqInfo = await c.env.OAUTH_PROVIDER.parseAuthRequest(c.req.raw);
   } catch (err) {
-    return c.html(errorPage("Invalid authorization request."), 400);
+    console.error("parseAuthRequest error:", err);
+    return c.html(errorPage("Invalid authorization request. Please try connecting from your AI client again."), 400);
   }
 
   if (!oauthReqInfo?.clientId) {
@@ -34,75 +36,157 @@ app.get("/authorize", async (c) => {
   const client = await c.env.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId);
   const clientName = client?.clientName || oauthReqInfo.clientId;
 
+  const consentId = crypto.randomUUID();
+  if (c.env.OAUTH_KV) {
+    await c.env.OAUTH_KV.put(`consent:${consentId}`, JSON.stringify(oauthReqInfo), {
+      expirationTtl: 900,
+    });
+  }
+
   const queryParams = Object.fromEntries(new URL(c.req.url).searchParams.entries());
-  return c.html(loginPage({ clientName, queryParams }));
+  return c.html(loginPage({ clientName, consentId, queryParams }));
 });
 
 // OAuth 2.1 Login Form Submission
 app.post("/authorize/login", async (c) => {
-  const body = await c.req.parseBody();
-  const email = (body.email || "").toString().trim();
-  const password = (body.password || "").toString();
-  const oauthParamsRaw = body.oauthParams ? decodeURIComponent(body.oauthParams.toString()) : "{}";
   let oauthParams = {};
-  try {
-    oauthParams = JSON.parse(oauthParamsRaw);
-  } catch (_) {}
+  let email = "";
+  let password = "";
+  let consentId = "";
 
-  if (!email || !password) {
-    return c.html(loginPage({ clientName: "AI Assistant", queryParams: oauthParams, error: "Email and password are required." }), 400);
-  }
-
-  // Validate credentials directly with Things Cloud
-  let accountInfo;
   try {
-    const client = new ThingsCloudClient({ email, password });
-    accountInfo = await client.validateAndFetchAccount();
+    const body = await c.req.parseBody();
+    email = (body.email || "").toString().trim();
+    password = (body.password || "").toString();
+    consentId = (body.consentId || "").toString().trim();
+    const oauthParamsRaw = body.oauthParams ? decodeURIComponent(body.oauthParams.toString()) : "{}";
+    try {
+      oauthParams = JSON.parse(oauthParamsRaw);
+    } catch (_) {}
+
+    if (!email || !password) {
+      return c.html(
+        loginPage({
+          clientName: "AI Assistant",
+          consentId,
+          queryParams: oauthParams,
+          error: "Email and password are required.",
+        }),
+        400
+      );
+    }
+
+    // Validate credentials directly with Things Cloud
+    let accountInfo;
+    try {
+      const client = new ThingsCloudClient({ email, password });
+      accountInfo = await client.validateAndFetchAccount();
+    } catch (err) {
+      return c.html(
+        loginPage({
+          clientName: "AI Assistant",
+          consentId,
+          queryParams: oauthParams,
+          error: err.message || "Failed to authenticate with Things Cloud. Please check your email and password.",
+        }),
+        401
+      );
+    }
+
+    // Retrieve original OAuth request info
+    let oauthReqInfo = null;
+    if (consentId && c.env.OAUTH_KV) {
+      try {
+        const stored = await c.env.OAUTH_KV.get(`consent:${consentId}`);
+        if (stored) {
+          oauthReqInfo = JSON.parse(stored);
+        }
+      } catch (kvErr) {
+        console.error("Failed to read consent from KV:", kvErr);
+      }
+    }
+
+    if (!oauthReqInfo) {
+      // Fallback: Reconstruct request from original parameters
+      const authUrl = new URL(`${c.env.CONNECTOR_BASE_URL || "https://things3mcp.org"}/authorize`);
+      for (const [k, v] of Object.entries(oauthParams)) {
+        authUrl.searchParams.set(k, v);
+      }
+
+      const dummyReq = new Request(authUrl.toString(), {
+        headers: c.req.raw.headers,
+      });
+
+      oauthReqInfo = await c.env.OAUTH_PROVIDER.parseAuthRequest(dummyReq);
+    }
+
+    if (!oauthReqInfo?.clientId) {
+      return c.html(errorPage("Authorization request expired or invalid. Please restart connection from your AI client."), 400);
+    }
+
+    const grantId = crypto.randomUUID();
+
+    // Store credentials securely in Durable Object
+    const credDO = c.env.OAUTH_CREDENTIALS.get(c.env.OAUTH_CREDENTIALS.idFromName(grantId));
+    await credDO.setCredentials({
+      email,
+      password,
+      historyKey: accountInfo.historyKey,
+      mailDropEmail: accountInfo.mailDropEmail,
+    });
+
+    let encryptedCredentials = null;
+    if (c.env.DATA_ENCRYPTION_KEY) {
+      encryptedCredentials = await encryptJson(
+        {
+          email,
+          password,
+          historyKey: accountInfo.historyKey,
+          mailDropEmail: accountInfo.mailDropEmail,
+        },
+        c.env.DATA_ENCRYPTION_KEY
+      );
+    }
+
+    const scopes = Array.isArray(oauthReqInfo.scope)
+      ? oauthReqInfo.scope
+      : (typeof oauthReqInfo.scope === "string" ? oauthReqInfo.scope.split(" ").filter(Boolean) : ["read", "write"]);
+
+    // Complete OAuth flow and redirect back to client (Claude / ChatGPT / etc.)
+    const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
+      request: oauthReqInfo,
+      userId: email,
+      metadata: {
+        authorizedAt: new Date().toISOString(),
+        email,
+      },
+      scope: scopes.length > 0 ? scopes : ["read", "write"],
+      props: {
+        grantId,
+        email,
+        historyKey: accountInfo.historyKey,
+        encryptedCredentials,
+      },
+    });
+
+    // Clean up temporary consent record
+    if (consentId && c.env.OAUTH_KV) {
+      c.executionCtx.waitUntil(c.env.OAUTH_KV.delete(`consent:${consentId}`));
+    }
+
+    return c.redirect(redirectTo, 302);
   } catch (err) {
+    console.error("OAuth authorization error:", err);
     return c.html(
       loginPage({
         clientName: "AI Assistant",
+        consentId,
         queryParams: oauthParams,
-        error: err.message || "Failed to authenticate with Things Cloud.",
+        error: `Authorization error: ${err.message || "An unexpected error occurred."}`,
       }),
-      401
+      500
     );
   }
-
-  // Construct fake request for parseAuthRequest from original parameters
-  const authUrl = new URL(`${c.env.CONNECTOR_BASE_URL || "https://things3mcp.org"}/authorize`);
-  for (const [k, v] of Object.entries(oauthParams)) {
-    authUrl.searchParams.set(k, v);
-  }
-
-  const dummyReq = new Request(authUrl.toString(), {
-    headers: c.req.raw.headers,
-  });
-
-  const oauthReqInfo = await c.env.OAUTH_PROVIDER.parseAuthRequest(dummyReq);
-  const grantId = crypto.randomUUID();
-
-  // Store credentials securely in Durable Object
-  const credDO = c.env.OAUTH_CREDENTIALS.get(c.env.OAUTH_CREDENTIALS.idFromName(grantId));
-  await credDO.setCredentials({
-    email,
-    password,
-    historyKey: accountInfo.historyKey,
-    mailDropEmail: accountInfo.mailDropEmail,
-  });
-
-  // Complete OAuth flow and redirect back to client (Claude / ChatGPT / etc.)
-  const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuth(oauthReqInfo, {
-    props: {
-      grantId,
-      email,
-      historyKey: accountInfo.historyKey,
-    },
-    userId: email,
-    scope: oauthReqInfo.scope || "read write",
-  });
-
-  return c.redirect(redirectTo, 302);
 });
 
 export { app as ThingsHandler };

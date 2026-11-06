@@ -690,6 +690,34 @@ export class ThingsCloudClient {
 
   // --- Batch Operations ---
 
+  async duplicateTodo(uuid) {
+    const db = await this.syncDatabase();
+    const orig = db.tasks.get(uuid);
+    if (!orig) throw new Error(`To-do not found: ${uuid}`);
+    const checklist = db.resolveChecklistItems(uuid).map((c) => c.title);
+    return this.createTodo({
+      title: `${orig.title || "Untitled"} (Copy)`,
+      notes: orig.notes || "",
+      when: orig.start === 0 ? "inbox" : (orig.startBucket === 1 ? "today" : (orig.start === 2 ? "someday" : "anytime")),
+      deadline: decodeFADay(orig.deadline),
+      reminderTime: decodeFATime(orig.reminderTime),
+      project: orig.project,
+      heading: orig.heading,
+      area: orig.area,
+      tags: orig.tags || [],
+      checklist,
+    });
+  }
+
+  async emptyTrash() {
+    const db = await this.syncDatabase();
+    const trashedTasks = Array.from(db.tasks.values()).filter((t) => t.trashed === 1);
+    if (!trashedTasks.length) return { purgedCount: 0 };
+    const changes = trashedTasks.map((t) => ({ [t.uuid]: { t: 2 } }));
+    await this.stageAndCommitChanges(changes);
+    return { purgedCount: trashedTasks.length };
+  }
+
   async batchUpdateTodos(uuids, operation, options = {}) {
     const nowUnix = toUnixTimestamp();
     const changes = [];
@@ -898,6 +926,12 @@ export class ThingsDatabase {
         ...this.formatTask(t),
         stopDate: t.stopDate ? new Date(t.stopDate * 1000).toISOString() : null,
       }));
+  }
+
+  getRepeatingTodos() {
+    return Array.from(this.tasks.values())
+      .filter((t) => !t.trashed && (t.rt1_recurrenceRule || t.rt1_repeatingTemplate || t.repeater))
+      .map((t) => this.formatTask(t));
   }
 
   getTrash() {

@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://things3mcp.org/sitemap.xml

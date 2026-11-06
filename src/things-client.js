@@ -965,6 +965,27 @@ export class ThingsCloudClient {
     return { projectsCreated, todosCreated, totalEntities: changes.length };
   }
 
+  async addTagsToTask(taskUUID, tagNames) {
+    const db = await this.syncDatabase();
+    const task = db.tasks.get(taskUUID);
+    if (!task) throw new Error(`Task not found: ${taskUUID}`);
+
+    const existingTags = task.tags || [];
+    const newTags = Array.from(new Set([...existingTags, ...tagNames]));
+    return this.updateTodo(taskUUID, { tags: newTags });
+  }
+
+  async removeTagsFromTask(taskUUID, tagNames) {
+    const db = await this.syncDatabase();
+    const task = db.tasks.get(taskUUID);
+    if (!task) throw new Error(`Task not found: ${taskUUID}`);
+
+    const tagsToRemove = new Set(tagNames);
+    const existingTags = task.tags || [];
+    const newTags = existingTags.filter((t) => !tagsToRemove.has(t));
+    return this.updateTodo(taskUUID, { tags: newTags });
+  }
+
   async batchUpdateTodos(uuids, operation, options = {}) {
     const nowUnix = toUnixTimestamp();
     const changes = [];
@@ -1094,6 +1115,7 @@ export class ThingsDatabase {
       area: areaName,
       areaId: t.area || null,
       tags: t.tags || [],
+      deepLink: `things:///show?id=${t.uuid}`,
       checklistCount: checklist.length,
       checklistCompletedCount: checklist.filter((c) => c.status === "completed").length,
       checklist: checklist.length ? checklist : undefined,
@@ -1428,6 +1450,24 @@ export class ThingsDatabase {
     }
 
     throw new Error(`Target not found for markdown export: ${target}`);
+  }
+
+  getSettings() {
+    return {
+      groupTodayByParent: true,
+      logInterval: "daily",
+    };
+  }
+
+  getDeepLink(id) {
+    const task = this.tasks.get(id);
+    const area = this.areas.get(id);
+    const title = task?.title || area?.title || id;
+    return {
+      id,
+      title,
+      url: `things:///show?id=${encodeURIComponent(id)}`,
+    };
   }
 
   getStats() {

@@ -611,6 +611,30 @@ export class ThingsMCP extends McpAgent {
       }
     );
 
+    // things_get_deep_link
+    server.registerTool(
+      "things_get_deep_link",
+      {
+        title: "Get Things Deep Link URL",
+        description: "Generate a native macOS/iOS 'things:///show?id=...' URL scheme deep link to open and reveal any task, project, or list directly in the native Things 3 app.",
+        inputSchema: {
+          id: z.string().describe("UUID of the to-do, project, or area"),
+        },
+        annotations: {
+          title: "Get Deep Link URL",
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ id }) => {
+        const client = await getClient();
+        const db = await client.syncDatabase();
+        return textResult(db.getDeepLink(id));
+      }
+    );
+
     // ==========================================
     // MUTATING / WRITE TOOLS (readOnlyHint: false)
     // ==========================================
@@ -1121,6 +1145,56 @@ export class ThingsMCP extends McpAgent {
         const client = await getClient();
         const result = await client.importJson(payload);
         return textResult(`Imported Things JSON: created ${result.projectsCreated} projects and ${result.todosCreated} to-dos (${result.totalEntities} total entities).`);
+      }
+    );
+
+    // things_add_tags
+    server.registerTool(
+      "things_add_tags",
+      {
+        title: "Add Tags to Task",
+        description: "Attach one or more tags to an existing to-do or project without replacing existing tags.",
+        inputSchema: {
+          id: z.string().describe("UUID of the task or project"),
+          tags: z.array(z.string()).describe("Array of tag names to add"),
+        },
+        annotations: {
+          title: "Add Tags",
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ id, tags }) => {
+        const client = await getClient();
+        await client.addTagsToTask(id, tags);
+        return textResult(`Added tags [${tags.join(", ")}] to ${id}.`);
+      }
+    );
+
+    // things_remove_tags
+    server.registerTool(
+      "things_remove_tags",
+      {
+        title: "Remove Tags from Task",
+        description: "Remove specific tags from an existing to-do or project.",
+        inputSchema: {
+          id: z.string().describe("UUID of the task or project"),
+          tags: z.array(z.string()).describe("Array of tag names to remove"),
+        },
+        annotations: {
+          title: "Remove Tags",
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ id, tags }) => {
+        const client = await getClient();
+        await client.removeTagsFromTask(id, tags);
+        return textResult(`Removed tags [${tags.join(", ")}] from ${id}.`);
       }
     );
 

@@ -718,6 +718,253 @@ export class ThingsCloudClient {
     return { purgedCount: trashedTasks.length };
   }
 
+  // Move to-do between lists, projects, headings, or areas
+  async moveTodo(uuid, { when, project, heading, area }) {
+    const updates = {};
+    if (when !== undefined) updates.when = when;
+    if (project !== undefined) updates.project = project;
+    if (heading !== undefined) updates.heading = heading;
+    if (area !== undefined) updates.area = area;
+    return this.updateTodo(uuid, updates);
+  }
+
+  // Convert an existing to-do into a Project, turning checklist items into standalone to-dos
+  async convertTodoToProject(uuid) {
+    const db = await this.syncDatabase();
+    const task = db.tasks.get(uuid);
+    if (!task) throw new Error(`To-do not found: ${uuid}`);
+
+    const checklistItems = db.resolveChecklistItems(uuid);
+    const nowUnix = toUnixTimestamp();
+    const changes = [];
+
+    // 1. Convert task to project (type = 1)
+    changes.push({
+      [uuid]: {
+        t: 1,
+        e: "Task",
+        p: {
+          type: 1, // Project
+          userModificationDate: nowUnix,
+        },
+      },
+    });
+
+    // 2. Convert checklist items into to-dos inside new project
+    let idx = 0;
+    for (const item of checklistItems) {
+      const newTodoUUID = generateUUID();
+      changes.push({
+        [newTodoUUID]: {
+          t: 0,
+          e: "Task",
+          p: {
+            title: item.title,
+            type: 0,
+            status: item.status === "completed" ? 3 : (item.status === "canceled" ? 2 : 0),
+            project: uuid,
+            start: 1,
+            startBucket: 0,
+            index: idx++,
+            creationDate: nowUnix,
+            userModificationDate: nowUnix,
+          },
+        },
+      });
+
+      // Delete old checklist item
+      changes.push({
+        [item.id]: {
+          t: 2,
+        },
+      });
+    }
+
+    await this.stageAndCommitChanges(changes);
+    return {
+      id: uuid,
+      title: task.title,
+      type: "project",
+      tasksCreated: checklistItems.length,
+    };
+  }
+
+  // Import Things 3 JSON format
+  async importJson(payload) {
+    const items = Array.isArray(payload) ? payload : [payload];
+    const nowUnix = toUnixTimestamp();
+    const changes = [];
+    let projectsCreated = 0;
+    let todosCreated = 0;
+
+    for (const item of items) {
+      const type = item.type || "to-do";
+      const attrs = item.attributes || {};
+
+      if (type === "project") {
+        const projectUUID = generateUUID();
+        const projectProps = {
+          title: attrs.title || "Untitled Project",
+          notes: attrs.notes || "",
+          type: 1,
+          status: 0,
+          trashed: 0,
+          start: 1,
+          startBucket: 0,
+          creationDate: nowUnix,
+          userModificationDate: nowUnix,
+        };
+        if (attrs.deadline) projectProps.deadline = encodeFADay(attrs.deadline);
+        if (attrs.when) {
+          if (attrs.when === "today") {
+            projectProps.startBucket = 1;
+            const todayStr = new Date().toISOString().slice(0, 10);
+            projectProps.startDate = encodeFADay(todayStr);
+          } else if (attrs.when === "someday") {
+            projectProps.start = 2;
+          } else if (/^\d{4}-\d{2}-\d{2}$/.test(attrs.when)) {
+            projectProps.startDate = encodeFADay(attrs.when);
+          }
+        }
+        if (attrs.area) projectProps.area = attrs.area;
+        if (attrs.tags) projectProps.tags = attrs.tags;
+
+        changes.push({
+          [projectUUID]: {
+            t: 0,
+            e: "Task",
+            p: projectProps,
+          },
+        });
+        projectsCreated++;
+
+        // Process nested headings and items
+        let currentHeadingUUID = null;
+        if (Array.isArray(attrs.items)) {
+          let taskIdx = 0;
+          for (const subItem of attrs.items) {
+            const subType = subItem.type || "to-do";
+            const subAttrs = subItem.attributes || {};
+
+            if (subType === "heading") {
+              currentHeadingUUID = generateUUID();
+              changes.push({
+                [currentHeadingUUID]: {
+                  t: 0,
+                  e: "Task",
+                  p: {
+                    title: subAttrs.title || "Section",
+                    type: 2, // Heading
+                    project: projectUUID,
+                    status: 0,
+                    trashed: 0,
+                    creationDate: nowUnix,
+                    userModificationDate: nowUnix,
+                  },
+                },
+              });
+            } else if (subType === "to-do") {
+              const subTodoUUID = generateUUID();
+              const subTodoProps = {
+                title: subAttrs.title || "To-do",
+                notes: subAttrs.notes || "",
+                type: 0,
+                status: 0,
+                trashed: 0,
+                project: projectUUID,
+                heading: currentHeadingUUID,
+                start: 1,
+                startBucket: 0,
+                index: taskIdx++,
+                creationDate: nowUnix,
+                userModificationDate: nowUnix,
+              };
+              if (subAttrs.deadline) subTodoProps.deadline = encodeFADay(subAttrs.deadline);
+              if (subAttrs.tags) subTodoProps.tags = subAttrs.tags;
+
+              changes.push({
+                [subTodoUUID]: {
+                  t: 0,
+                  e: "Task",
+                  p: subTodoProps,
+                },
+              });
+              todosCreated++;
+
+              // Checklist inside sub-todo
+              const rawChecklist = subAttrs["checklist-items"] || subAttrs.checklist || [];
+              let clIdx = 0;
+              for (const cl of rawChecklist) {
+                const clUUID = generateUUID();
+                changes.push({
+                  [clUUID]: {
+                    t: 0,
+                    e: "ChecklistItem",
+                    p: {
+                      title: typeof cl === "string" ? cl : cl.title,
+                      status: 0,
+                      task: subTodoUUID,
+                      index: clIdx++,
+                      creationDate: nowUnix,
+                      userModificationDate: nowUnix,
+                    },
+                  },
+                });
+              }
+            }
+          }
+        }
+      } else if (type === "to-do") {
+        const todoUUID = generateUUID();
+        const todoProps = {
+          title: attrs.title || "Untitled",
+          notes: attrs.notes || "",
+          type: 0,
+          status: 0,
+          trashed: 0,
+          start: attrs.when ? 1 : 0,
+          startBucket: attrs.when === "today" ? 1 : 0,
+          creationDate: nowUnix,
+          userModificationDate: nowUnix,
+        };
+        if (attrs.deadline) todoProps.deadline = encodeFADay(attrs.deadline);
+        if (attrs.tags) todoProps.tags = attrs.tags;
+
+        changes.push({
+          [todoUUID]: {
+            t: 0,
+            e: "Task",
+            p: todoProps,
+          },
+        });
+        todosCreated++;
+
+        const rawChecklist = attrs["checklist-items"] || attrs.checklist || [];
+        let clIdx = 0;
+        for (const cl of rawChecklist) {
+          const clUUID = generateUUID();
+          changes.push({
+            [clUUID]: {
+              t: 0,
+              e: "ChecklistItem",
+              p: {
+                title: typeof cl === "string" ? cl : cl.title,
+                status: 0,
+                task: todoUUID,
+                index: clIdx++,
+                creationDate: nowUnix,
+                userModificationDate: nowUnix,
+              },
+            },
+          });
+        }
+      }
+    }
+
+    await this.stageAndCommitChanges(changes);
+    return { projectsCreated, todosCreated, totalEntities: changes.length };
+  }
+
   async batchUpdateTodos(uuids, operation, options = {}) {
     const nowUnix = toUnixTimestamp();
     const changes = [];
@@ -1061,6 +1308,126 @@ export class ThingsDatabase {
         return matchTitle || matchNotes;
       })
       .map((t) => (t.type === 1 ? { ...this.formatTask(t), isProject: true } : this.formatTask(t)));
+  }
+
+  getDeadlines() {
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayFADay = encodeFADay(todayStr);
+
+    const openItems = Array.from(this.tasks.values()).filter(
+      (t) => !t.trashed && t.status === 0 && t.deadline
+    );
+
+    const overdue = [];
+    const dueToday = [];
+    const dueSoon = []; // next 7 days
+    const future = [];
+
+    const weekFromNowFADay = todayFADay + (7 << 7);
+
+    for (const t of openItems) {
+      const item = this.formatTask(t);
+      if (t.deadline < todayFADay) overdue.push(item);
+      else if (t.deadline === todayFADay) dueToday.push(item);
+      else if (t.deadline <= weekFromNowFADay) dueSoon.push(item);
+      else future.push(item);
+    }
+
+    return {
+      overdue: overdue.sort((a, b) => (a.deadline || "").localeCompare(b.deadline || "")),
+      dueToday,
+      dueSoon: dueSoon.sort((a, b) => (a.deadline || "").localeCompare(b.deadline || "")),
+      future: future.sort((a, b) => (a.deadline || "").localeCompare(b.deadline || "")),
+    };
+  }
+
+  getDailySummary() {
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayStartUnix = new Date(todayStr).getTime() / 1000;
+    const todayFADay = encodeFADay(todayStr);
+
+    const allTasks = Array.from(this.tasks.values()).filter((t) => !t.trashed && t.type === 0);
+
+    const completedToday = allTasks.filter((t) => t.status === 3 && t.stopDate && t.stopDate >= todayStartUnix).map((t) => this.formatTask(t));
+    const dueToday = allTasks.filter((t) => t.status === 0 && t.deadline === todayFADay).map((t) => this.formatTask(t));
+    const overdue = allTasks.filter((t) => t.status === 0 && t.deadline && t.deadline < todayFADay).map((t) => this.formatTask(t));
+    const todayList = this.getToday();
+
+    return {
+      date: todayStr,
+      todayAgendaCount: todayList.length,
+      completedTodayCount: completedToday.length,
+      overdueCount: overdue.length,
+      dueTodayCount: dueToday.length,
+      completedToday,
+      dueToday,
+      overdue,
+      todayAgenda: todayList,
+    };
+  }
+
+  exportMarkdown(target) {
+    if (target === "today") {
+      const tasks = this.getToday();
+      let md = `# Today (${new Date().toISOString().slice(0, 10)})\n\n`;
+      for (const t of tasks) {
+        md += `- [ ] **${t.title}**${t.project ? ` (*${t.project}*)` : ""}${t.deadline ? ` — Due: ${t.deadline}` : ""}\n`;
+        if (t.notes) md += `  > ${t.notes.replace(/\n/g, "\n  > ")}\n`;
+        if (t.checklist) {
+          for (const cl of t.checklist) {
+            md += `  - [${cl.status === "completed" ? "x" : " "}] ${cl.title}\n`;
+          }
+        }
+      }
+      return md;
+    }
+
+    if (target === "inbox") {
+      const tasks = this.getInbox();
+      let md = `# Inbox\n\n`;
+      for (const t of tasks) {
+        md += `- [ ] **${t.title}**\n`;
+        if (t.notes) md += `  > ${t.notes.replace(/\n/g, "\n  > ")}\n`;
+      }
+      return md;
+    }
+
+    const project = this.getProject(target);
+    if (project) {
+      let md = `# ${project.title}\n`;
+      if (project.area) md += `*Area: ${project.area}*\n`;
+      if (project.deadline) md += `*Deadline: ${project.deadline}*\n`;
+      if (project.notes) md += `\n${project.notes}\n`;
+      md += `\n`;
+
+      if (project.ungroupedTasks && project.ungroupedTasks.length) {
+        for (const t of project.ungroupedTasks) {
+          md += `- [${t.status === "completed" ? "x" : " "}] **${t.title}**\n`;
+          if (t.checklist) {
+            for (const cl of t.checklist) {
+              md += `  - [${cl.status === "completed" ? "x" : " "}] ${cl.title}\n`;
+            }
+          }
+        }
+        md += `\n`;
+      }
+
+      for (const h of project.headings || []) {
+        md += `### ${h.title}\n`;
+        for (const t of h.tasks || []) {
+          md += `- [${t.status === "completed" ? "x" : " "}] **${t.title}**\n`;
+          if (t.checklist) {
+            for (const cl of t.checklist) {
+              md += `  - [${cl.status === "completed" ? "x" : " "}] ${cl.title}\n`;
+            }
+          }
+        }
+        md += `\n`;
+      }
+      return md;
+    }
+
+    throw new Error(`Target not found for markdown export: ${target}`);
   }
 
   getStats() {

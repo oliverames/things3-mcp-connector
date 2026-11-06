@@ -57,6 +57,124 @@ export class ThingsMCP extends McpAgent {
     });
 
     // ==========================================
+    // MCP RESOURCES (Subscribed Context)
+    // ==========================================
+
+    server.resource(
+      "today",
+      "things://today",
+      { description: "Real-time list of Today's tasks in Things 3", mimeType: "application/json" },
+      async () => {
+        const client = await getClient();
+        const db = await client.syncDatabase();
+        return {
+          contents: [
+            {
+              uri: "things://today",
+              mimeType: "application/json",
+              text: JSON.stringify(db.getToday(), null, 2),
+            },
+          ],
+        };
+      }
+    );
+
+    server.resource(
+      "inbox",
+      "things://inbox",
+      { description: "Real-time list of Inbox tasks in Things 3", mimeType: "application/json" },
+      async () => {
+        const client = await getClient();
+        const db = await client.syncDatabase();
+        return {
+          contents: [
+            {
+              uri: "things://inbox",
+              mimeType: "application/json",
+              text: JSON.stringify(db.getInbox(), null, 2),
+            },
+          ],
+        };
+      }
+    );
+
+    server.resource(
+      "upcoming",
+      "things://upcoming",
+      { description: "Upcoming scheduled tasks and deadlines in Things 3", mimeType: "application/json" },
+      async () => {
+        const client = await getClient();
+        const db = await client.syncDatabase();
+        return {
+          contents: [
+            {
+              uri: "things://upcoming",
+              mimeType: "application/json",
+              text: JSON.stringify(db.getUpcoming(14), null, 2),
+            },
+          ],
+        };
+      }
+    );
+
+    server.resource(
+      "projects",
+      "things://projects",
+      { description: "List of active Projects in Things 3 with progress", mimeType: "application/json" },
+      async () => {
+        const client = await getClient();
+        const db = await client.syncDatabase();
+        return {
+          contents: [
+            {
+              uri: "things://projects",
+              mimeType: "application/json",
+              text: JSON.stringify(db.getProjects(), null, 2),
+            },
+          ],
+        };
+      }
+    );
+
+    server.resource(
+      "areas",
+      "things://areas",
+      { description: "Areas of Responsibility in Things 3", mimeType: "application/json" },
+      async () => {
+        const client = await getClient();
+        const db = await client.syncDatabase();
+        return {
+          contents: [
+            {
+              uri: "things://areas",
+              mimeType: "application/json",
+              text: JSON.stringify(db.getAreas(), null, 2),
+            },
+          ],
+        };
+      }
+    );
+
+    server.resource(
+      "stats",
+      "things://stats",
+      { description: "Live aggregate database statistics (counts of todos, projects, tags)", mimeType: "application/json" },
+      async () => {
+        const client = await getClient();
+        const db = await client.syncDatabase();
+        return {
+          contents: [
+            {
+              uri: "things://stats",
+              mimeType: "application/json",
+              text: JSON.stringify(db.getStats(), null, 2),
+            },
+          ],
+        };
+      }
+    );
+
+    // ==========================================
     // READ-ONLY TOOLS (readOnlyHint: true)
     // ==========================================
 
@@ -422,6 +540,74 @@ export class ThingsMCP extends McpAgent {
           latestServerSyncIndex: db.latestServerIndex,
           stats: db.getStats(),
         });
+      }
+    );
+
+    // things_get_daily_summary
+    server.registerTool(
+      "things_get_daily_summary",
+      {
+        title: "Get Daily Summary",
+        description: "Fetch a complete productivity briefing for today: tasks completed today, tasks due today, overdue tasks, and remaining Today items.",
+        inputSchema: {},
+        annotations: {
+          title: "Get Daily Summary",
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async () => {
+        const client = await getClient();
+        const db = await client.syncDatabase();
+        return textResult(db.getDailySummary());
+      }
+    );
+
+    // things_get_deadlines
+    server.registerTool(
+      "things_get_deadlines",
+      {
+        title: "Get Deadlines Briefing",
+        description: "Fetch all active tasks and projects with deadlines, categorized into Overdue, Due Today, Due This Week, and Future.",
+        inputSchema: {},
+        annotations: {
+          title: "Get Deadlines Briefing",
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async () => {
+        const client = await getClient();
+        const db = await client.syncDatabase();
+        return textResult(db.getDeadlines());
+      }
+    );
+
+    // things_export_markdown
+    server.registerTool(
+      "things_export_markdown",
+      {
+        title: "Export List or Project as Markdown",
+        description: "Export any project, or smart list ('today', 'inbox') formatted as clean GitHub-flavored Markdown with checkboxes and headings.",
+        inputSchema: {
+          target: z.string().describe("Target to export: 'today', 'inbox', or a Project title / UUID"),
+        },
+        annotations: {
+          title: "Export as Markdown",
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ target }) => {
+        const client = await getClient();
+        const db = await client.syncDatabase();
+        return textResult(db.exportMarkdown(target));
       }
     );
 
@@ -859,6 +1045,82 @@ export class ThingsMCP extends McpAgent {
           await client.clearMaildropEmail();
           return textResult("Maildrop email disabled.");
         }
+      }
+    );
+
+    // things_move_todo
+    server.registerTool(
+      "things_move_todo",
+      {
+        title: "Move To-Do",
+        description: "Move a to-do to a different list ('inbox', 'today', 'anytime', 'someday', or date), or reassign to a project, heading, or area.",
+        inputSchema: {
+          id: z.string().describe("To-do UUID"),
+          when: z.enum(["inbox", "today", "evening", "anytime", "someday"]).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional().describe("Move to list or schedule for date"),
+          project: z.string().optional().describe("Reassign to Project UUID"),
+          heading: z.string().optional().describe("Reassign to Heading UUID inside project"),
+          area: z.string().optional().describe("Reassign to Area UUID"),
+        },
+        annotations: {
+          title: "Move To-Do",
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ id, when, project, heading, area }) => {
+        const client = await getClient();
+        await client.moveTodo(id, { when, project, heading, area });
+        return textResult(`To-do ${id} moved successfully.`);
+      }
+    );
+
+    // things_convert_todo_to_project
+    server.registerTool(
+      "things_convert_todo_to_project",
+      {
+        title: "Convert To-Do to Project",
+        description: "Promote an existing to-do into a full Project, converting its checklist items into standalone tasks.",
+        inputSchema: {
+          id: z.string().describe("UUID of the to-do to promote to a project"),
+        },
+        annotations: {
+          title: "Convert To-Do to Project",
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      async ({ id }) => {
+        const client = await getClient();
+        const result = await client.convertTodoToProject(id);
+        return textResult(`Successfully converted "${result.title}" into a project with ${result.tasksCreated} tasks.`);
+      }
+    );
+
+    // things_import_json
+    server.registerTool(
+      "things_import_json",
+      {
+        title: "Import Things JSON",
+        description: "Batch import complex structured projects, headings, to-dos, checklists, and tags using Things 3 JSON format in a single atomic sync commit.",
+        inputSchema: {
+          payload: z.any().describe("Things JSON array or object containing projects or to-dos"),
+        },
+        annotations: {
+          title: "Import Things JSON",
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      async ({ payload }) => {
+        const client = await getClient();
+        const result = await client.importJson(payload);
+        return textResult(`Imported Things JSON: created ${result.projectsCreated} projects and ${result.todosCreated} to-dos (${result.totalEntities} total entities).`);
       }
     );
 

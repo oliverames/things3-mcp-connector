@@ -30,21 +30,31 @@ export class ThingsMCP extends McpAgent {
   async init() {
     const server = new McpServer(remoteServerInfo(this.env.CONNECTOR_BASE_URL || "https://things3mcp.org"));
 
-    const getClient = async () => {
-      let creds = null;
-      if (this.props?.credentials) {
-        creds = this.props.credentials;
-      } else if (this.props?.encryptedCredentials && this.env.DATA_ENCRYPTION_KEY) {
-        creds = await decryptJson(this.props.encryptedCredentials, this.env.DATA_ENCRYPTION_KEY);
-      } else if (this.props?.grantId) {
-        const credDO = this.env.OAUTH_CREDENTIALS.get(this.env.OAUTH_CREDENTIALS.idFromName(this.props.grantId));
-        creds = await credDO.getCredentials();
-      }
+    // One client per session: it holds the synced database, so repeated tool calls reuse it
+    // instead of re-downloading the whole history.
+    const getClient = () => {
+      if (!this._clientPromise) {
+        this._clientPromise = (async () => {
+          let creds = null;
+          if (this.props?.credentials) {
+            creds = this.props.credentials;
+          } else if (this.props?.encryptedCredentials && this.env.DATA_ENCRYPTION_KEY) {
+            creds = await decryptJson(this.props.encryptedCredentials, this.env.DATA_ENCRYPTION_KEY);
+          } else if (this.props?.grantId) {
+            const credDO = this.env.OAUTH_CREDENTIALS.get(this.env.OAUTH_CREDENTIALS.idFromName(this.props.grantId));
+            creds = await credDO.getCredentials();
+          }
 
-      if (!creds || !creds.email || !creds.password) {
-        throw new Error("Things Cloud credentials not found for this session. Please re-authenticate.");
+          if (!creds || !creds.email || !creds.password) {
+            throw new Error("Things Cloud credentials not found for this session. Please re-authenticate.");
+          }
+          return new ThingsCloudClient({ ...creds, timeZone: this.env.USER_TIMEZONE });
+        })();
+        this._clientPromise.catch(() => {
+          this._clientPromise = null;
+        });
       }
-      return new ThingsCloudClient(creds);
+      return this._clientPromise;
     };
 
     const textResult = (data) => ({
@@ -654,7 +664,7 @@ export class ThingsMCP extends McpAgent {
           project: z.string().optional().describe("UUID of parent project"),
           heading: z.string().optional().describe("UUID of parent heading inside project"),
           area: z.string().optional().describe("UUID of parent area"),
-          tags: z.array(z.string()).optional().describe("Tags to attach"),
+          tags: z.array(z.string()).optional().describe("Tag names or IDs to attach (tags must already exist)"),
           checklist: z.array(z.string()).optional().describe("List of checklist item titles"),
         },
         annotations: {
@@ -699,7 +709,7 @@ export class ThingsMCP extends McpAgent {
           project: z.string().optional().describe("Move to project UUID"),
           heading: z.string().optional().describe("Move to heading UUID inside project"),
           area: z.string().optional().describe("Move to area UUID"),
-          tags: z.array(z.string()).optional().describe("Updated list of tags"),
+          tags: z.array(z.string()).optional().describe("Full list of tag names or IDs (replaces existing; tags must already exist)"),
           status: z.enum(["open", "completed", "canceled"]).optional().describe("Set status"),
           trashed: z.boolean().optional().describe("Set true to trash"),
         },
@@ -814,7 +824,7 @@ export class ThingsMCP extends McpAgent {
           area: z.string().optional().describe("UUID of parent Area"),
           when: z.enum(["today", "anytime", "someday"]).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional().default("anytime").describe("When to schedule project"),
           deadline: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Deadline (YYYY-MM-DD)"),
-          tags: z.array(z.string()).optional().describe("Tags to attach"),
+          tags: z.array(z.string()).optional().describe("Tag names or IDs to attach (tags must already exist)"),
         },
         annotations: {
           title: "Create Project",
@@ -920,7 +930,7 @@ export class ThingsMCP extends McpAgent {
         description: "Create a new Area of Responsibility in Things 3.",
         inputSchema: {
           title: z.string().describe("Area title (e.g. 'Work', 'Personal', 'Health')"),
-          tags: z.array(z.string()).optional().describe("Tags to associate with this Area"),
+          tags: z.array(z.string()).optional().describe("Tag names or IDs to associate with this Area (must already exist)"),
         },
         annotations: {
           title: "Create Area",
@@ -942,11 +952,10 @@ export class ThingsMCP extends McpAgent {
       "things_update_area",
       {
         title: "Update Area",
-        description: "Rename or update visibility of an Area of Responsibility.",
+        description: "Rename an Area of Responsibility.",
         inputSchema: {
           id: z.string().describe("Area UUID"),
-          title: z.string().optional().describe("New title"),
-          visible: z.boolean().optional().describe("Area visibility in sidebar"),
+          title: z.string().describe("New title"),
         },
         annotations: {
           title: "Update Area",
@@ -956,9 +965,9 @@ export class ThingsMCP extends McpAgent {
           openWorldHint: false,
         },
       },
-      async ({ id, title, visible }) => {
+      async ({ id, title }) => {
         const client = await getClient();
-        await client.updateArea(id, { title, visible });
+        await client.updateArea(id, { title });
         return textResult(`Area ${id} updated.`);
       }
     );

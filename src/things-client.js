@@ -1,105 +1,316 @@
-// Things Cloud Client & Syncrony Database Protocol Implementation
-// Reverse-engineered from Cultured Code Things 3 Syncrony.framework & ThingsModel.framework
+// Things Cloud client and in-memory database.
+//
+// Wire format verified against Things 3.21 (Syncrony.framework decompilation) and a live
+// history (schema 301): entities are versioned (Task6, Area3, Tag4, ChecklistItem3), property
+// keys are short ("tt", "ss", "st", ...), calendar dates are unix timestamps at midnight UTC,
+// relations are arrays of UUIDs, and a commit is a single POST whose body maps UUID -> change.
 
 const THINGS_CLOUD_BASE = "https://cloud.culturedcode.com";
+const SCHEMA_VERSION = 301;
+const APP_ID = "com.culturedcode.ThingsMac";
+const APP_INSTANCE_ID = "-things3-mcp-connector";
+const PUSH_PRIORITY = 5;
 
-// FADay Date Format: (year << 16) | (month << 12) | (day << 7)
-export function encodeFADay(dateInput) {
-  if (!dateInput) return null;
-  if (typeof dateInput === "number") return dateInput;
-  const match = String(dateInput).match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (!match) return null;
-  const year = parseInt(match[1], 10);
-  const month = parseInt(match[2], 10);
-  const day = parseInt(match[3], 10);
-  return (year << 16) | (month << 12) | (day << 7);
+const ENTITY = {
+  task: "Task6",
+  area: "Area3",
+  tag: "Tag4",
+  checklist: "ChecklistItem3",
+};
+
+// A cached database is trusted this long before asking Things Cloud for its head index again.
+const CACHE_TTL_MS = 15000;
+const DEFAULT_TIME_ZONE = "America/New_York";
+
+// ---------------------------------------------------------------------------
+// Dates, times, ids, checksums
+// ---------------------------------------------------------------------------
+
+const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+export function isDateString(value) {
+  return typeof value === "string" && DATE_RE.test(value);
 }
 
-export function decodeFADay(val) {
-  if (val === null || val === undefined) return null;
-  const year = val >> 16;
-  const month = (val >> 12) & 0x0f;
-  const day = (val >> 7) & 0x1f;
-  if (year <= 0 || month <= 0 || day <= 0) return null;
-  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+// "YYYY-MM-DD" -> unix seconds at midnight UTC (the form Things stores for sr, tir, dd).
+export function dateToTimestamp(dateStr) {
+  if (!dateStr) return null;
+  const m = String(dateStr).match(DATE_RE);
+  if (!m) throw new Error(`Invalid date "${dateStr}". Use YYYY-MM-DD.`);
+  return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) / 1000;
 }
 
-// FATime Format: (hour << 26) | (minute << 20) | (second << 14)
-export function encodeFATime(timeInput) {
-  if (!timeInput) return null;
-  if (typeof timeInput === "number") return timeInput;
-  const match = String(timeInput).match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?/);
-  if (!match) return null;
-  const hour = parseInt(match[1], 10);
-  const minute = parseInt(match[2], 10);
-  const second = match[3] ? parseInt(match[3], 10) : 0;
-  return (hour << 26) | (minute << 20) | (second << 14);
+export function timestampToDate(ts) {
+  if (ts === null || ts === undefined) return null;
+  return new Date(ts * 1000).toISOString().slice(0, 10);
 }
 
-export function decodeFATime(val) {
-  if (val === null || val === undefined) return null;
-  const hour = (val >> 26) & 0x3f;
-  const minute = (val >> 20) & 0x3f;
-  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+// Calendar date in a time zone, as YYYY-MM-DD. Accepts a Date or unix seconds.
+export function localDate(timeZone = DEFAULT_TIME_ZONE, when = new Date()) {
+  const date = typeof when === "number" ? new Date(when * 1000) : when;
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+export function addDays(dateStr, days) {
+  return timestampToDate(dateToTimestamp(dateStr) + days * 86400);
+}
+
+// Reminder time is stored as seconds after midnight in the "ato" key.
+export function timeToSeconds(timeStr) {
+  if (timeStr === null || timeStr === undefined || timeStr === "") return null;
+  if (typeof timeStr === "number") return timeStr;
+  const m = String(timeStr).match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m || Number(m[1]) > 23 || Number(m[2]) > 59) {
+    throw new Error(`Invalid time "${timeStr}". Use HH:MM (24-hour).`);
+  }
+  return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3] || 0);
+}
+
+export function secondsToTime(seconds) {
+  if (seconds === null || seconds === undefined) return null;
+  const h = Math.floor(seconds / 3600);
+  const mi = Math.floor((seconds % 3600) / 60);
+  return `${String(h).padStart(2, "0")}:${String(mi).padStart(2, "0")}`;
 }
 
 export function toUnixTimestamp(date = new Date()) {
-  return parseFloat((date.getTime() / 1000).toFixed(5));
+  return date.getTime() / 1000;
 }
 
-// Things 3 standard 22-character alphanumeric UUID generator
-const ALPHANUM = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+// Things identifiers are 22-character base58 strings.
+const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 export function generateUUID() {
   const bytes = crypto.getRandomValues(new Uint8Array(22));
-  let result = "";
-  for (let i = 0; i < 22; i++) {
-    result += ALPHANUM[bytes[i] % ALPHANUM.length];
-  }
-  return result;
+  let out = "";
+  for (let i = 0; i < 22; i++) out += BASE58[bytes[i] % BASE58.length];
+  return out;
 }
 
+// CRC-32 of the UTF-8 text; Things stores it as "ch" on note objects.
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+export function crc32(text) {
+  const bytes = new TextEncoder().encode(text);
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+export function noteObject(text) {
+  const v = text || "";
+  return { _t: "tx", t: 1, ch: v ? crc32(v) : 0, v };
+}
+
+function applyNotePatches(text, patches) {
+  let out = text || "";
+  for (const patch of patches) {
+    const start = patch.p || 0;
+    out = out.slice(0, start) + (patch.r || "") + out.slice(start + (patch.l || 0));
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Change builders (the wire format lives here and only here)
+// ---------------------------------------------------------------------------
+
+// Resolve a "when" value into the scheduling fields: st (0 inbox, 1 anytime, 2 someday),
+// sb (1 = this evening), sr (scheduled date) and tir (today index reference date).
+export function schedulingFields(when, timeZone) {
+  const today = localDate(timeZone);
+  const clear = { st: 1, sb: 0, sr: null, tir: null };
+  switch (when) {
+    case "inbox":
+      return { st: 0, sb: 0, sr: null, tir: null };
+    case "anytime":
+      return clear;
+    case "someday":
+      return { st: 2, sb: 0, sr: null, tir: null };
+    case "today":
+      return { st: 1, sb: 0, sr: dateToTimestamp(today), tir: dateToTimestamp(today) };
+    case "evening":
+      return { st: 1, sb: 1, sr: dateToTimestamp(today), tir: dateToTimestamp(today) };
+    default: {
+      if (!isDateString(when)) {
+        throw new Error(`Invalid "when" value "${when}". Use inbox, today, evening, anytime, someday, or YYYY-MM-DD.`);
+      }
+      const ts = dateToTimestamp(when);
+      // A date in the future is "Upcoming" (start = someday + scheduled date); today or earlier is Today.
+      return { st: when > today ? 2 : 1, sb: 0, sr: ts, tir: ts };
+    }
+  }
+}
+
+// A reminder needs a date; with no scheduled date it is attached to today.
+function withReminder(fields, reminderTime, timeZone) {
+  const ato = timeToSeconds(reminderTime);
+  if (ato === null) return { ...fields, ato: null };
+  if (fields.sr === null || fields.sr === undefined) {
+    const today = dateToTimestamp(localDate(timeZone));
+    return { ...fields, st: 1, sr: today, tir: today, ato };
+  }
+  return { ...fields, ato };
+}
+
+const EMPTY_XX = () => ({ sn: {}, _t: "oo" });
+
+export function buildTaskCreate({
+  title,
+  notes = "",
+  type = 0,
+  when = "inbox",
+  reminderTime = null,
+  deadline = null,
+  project = null,
+  heading = null,
+  area = null,
+  tags = [],
+  status = 0,
+  now = toUnixTimestamp(),
+  timeZone,
+}) {
+  const sched = withReminder(schedulingFields(when, timeZone), reminderTime, timeZone);
+  return {
+    t: 0,
+    e: ENTITY.task,
+    p: {
+      tt: title,
+      nt: noteObject(notes),
+      tp: type,
+      ss: status,
+      sp: status === 0 ? null : now,
+      tr: false,
+      st: sched.st,
+      sb: sched.sb,
+      sr: sched.sr,
+      tir: sched.tir,
+      ato: sched.ato ?? null,
+      dd: deadline ? dateToTimestamp(deadline) : null,
+      // A to-do inside a heading belongs to the project through that heading.
+      pr: heading ? [] : project ? [project] : [],
+      agr: heading ? [heading] : [],
+      ar: project || heading ? [] : area ? [area] : [],
+      tg: tags,
+      ix: 0,
+      ti: 0,
+      cd: now,
+      md: now,
+      // Defaults Things writes on every new task.
+      dds: null,
+      rt: [],
+      rmd: null,
+      dl: [],
+      icp: false,
+      do: 0,
+      lai: null,
+      lt: false,
+      icc: 0,
+      icsd: null,
+      rp: null,
+      acrd: null,
+      rr: null,
+      xx: EMPTY_XX(),
+    },
+  };
+}
+
+export function buildChecklistCreate({ title, task, index = 0, status = 0, now = toUnixTimestamp() }) {
+  return {
+    t: 0,
+    e: ENTITY.checklist,
+    p: {
+      tt: title,
+      ss: status,
+      sp: status === 0 ? null : now,
+      ts: [task],
+      ix: index,
+      cd: now,
+      md: now,
+      lt: false,
+      xx: EMPTY_XX(),
+    },
+  };
+}
+
+function statusFields(status, now) {
+  if (status === "completed") return { ss: 3, sp: now };
+  if (status === "canceled") return { ss: 2, sp: now };
+  if (status === "open") return { ss: 0, sp: null };
+  return {};
+}
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
 export class ThingsCloudClient {
-  constructor({ email, password, historyKey = null }) {
+  constructor({ email, password, historyKey = null, timeZone = DEFAULT_TIME_ZONE, fetchImpl = null }) {
     this.email = email.trim().toLowerCase();
     this.password = password;
     this.historyKey = historyKey;
+    this.timeZone = timeZone || DEFAULT_TIME_ZONE;
+    this.fetch = fetchImpl || ((...args) => fetch(...args));
+    this._db = null;
+    this._dbCheckedAt = 0;
   }
 
   static encodePassword(rawPassword) {
-    return encodeURIComponent(rawPassword)
-      .replace(/[!*'();:@&=+$,/?%#\[\]]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+    return encodeURIComponent(rawPassword).replace(
+      /[!*'();:@&=+$,/?%#\[\]]/g,
+      (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`
+    );
   }
 
   static commonHeaders(password) {
     return {
       "Content-Type": "application/json; charset=UTF-8",
-      "Accept": "application/json",
+      "Content-Encoding": "UTF-8",
+      Accept: "application/json",
       "User-Agent": "ThingsMac/3.21.3",
       "things-client-info": JSON.stringify({
         nativeAppVersion: "3.21.3",
         preferredLanguage: "en",
         uiWritingDirection: "LTR",
       }),
-      "Authorization": `Password ${ThingsCloudClient.encodePassword(password)}`,
+      Authorization: `Password ${ThingsCloudClient.encodePassword(password)}`,
     };
+  }
+
+  // fetch with a bounded retry on 429 (honouring Retry-After).
+  async request(url, init = {}, { retries = 2 } = {}) {
+    for (let attempt = 0; ; attempt++) {
+      const res = await this.fetch(url, {
+        ...init,
+        headers: { ...ThingsCloudClient.commonHeaders(this.password), ...(init.headers || {}) },
+      });
+      if (res.status !== 429 || attempt >= retries) return res;
+      const retryAfter = Number(res.headers.get("Retry-After"));
+      const waitMs = Math.min(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 1500 * (attempt + 1), 6000);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
   }
 
   async validateAndFetchAccount() {
     const url = `${THINGS_CLOUD_BASE}/version/1/account/${encodeURIComponent(this.email)}`;
-    const response = await fetch(url, {
-      method: "GET",
-      headers: ThingsCloudClient.commonHeaders(this.password),
-    });
+    const response = await this.request(url, { method: "GET" });
 
-    if (response.status === 401) {
-      throw new Error("Invalid Things Cloud password.");
-    }
-    if (response.status === 404) {
-      throw new Error("Things Cloud account not found for this email.");
-    }
+    if (response.status === 401) throw new Error("Invalid Things Cloud password.");
+    if (response.status === 404) throw new Error("Things Cloud account not found for this email.");
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Things Cloud error (${response.status}): ${text}`);
+      throw new Error(`Things Cloud error (${response.status}): ${await response.text()}`);
     }
 
     const data = await response.json();
@@ -115,67 +326,45 @@ export class ThingsCloudClient {
   }
 
   async getMaildropEmail() {
-    const acct = await this.validateAndFetchAccount();
-    return acct.mailDropEmail;
+    return (await this.validateAndFetchAccount()).mailDropEmail;
   }
 
   async resetMaildropEmail() {
     const url = `${THINGS_CLOUD_BASE}/version/1/account/${encodeURIComponent(this.email)}/maildrop`;
-    const response = await fetch(url, {
-      method: "POST",
-      headers: ThingsCloudClient.commonHeaders(this.password),
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to reset maildrop: ${response.status} ${await response.text()}`);
-    }
-    const data = await response.json();
-    return data["maildrop-email"] || null;
+    const response = await this.request(url, { method: "POST" });
+    if (!response.ok) throw new Error(`Failed to reset maildrop: ${response.status} ${await response.text()}`);
+    return (await response.json())["maildrop-email"] || null;
   }
 
   async clearMaildropEmail() {
     const url = `${THINGS_CLOUD_BASE}/version/1/account/${encodeURIComponent(this.email)}/maildrop`;
-    const response = await fetch(url, {
-      method: "DELETE",
-      headers: ThingsCloudClient.commonHeaders(this.password),
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to clear maildrop: ${response.status} ${await response.text()}`);
-    }
+    const response = await this.request(url, { method: "DELETE" });
+    if (!response.ok) throw new Error(`Failed to clear maildrop: ${response.status} ${await response.text()}`);
     return true;
   }
 
+  async ensureHistoryKey() {
+    if (!this.historyKey) await this.validateAndFetchAccount();
+    return this.historyKey;
+  }
+
   async getHistoryMetadata() {
-    if (!this.historyKey) {
-      await this.validateAndFetchAccount();
-    }
-    const url = `${THINGS_CLOUD_BASE}/version/1/history/${this.historyKey}`;
-    const response = await fetch(url, {
-      method: "GET",
-      headers: ThingsCloudClient.commonHeaders(this.password),
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to fetch history metadata: ${response.status}`);
-    }
+    await this.ensureHistoryKey();
+    const response = await this.request(`${THINGS_CLOUD_BASE}/version/1/history/${this.historyKey}`, { method: "GET" });
+    if (!response.ok) throw new Error(`Failed to fetch history metadata: ${response.status}`);
     const data = await response.json();
     return {
-      historyKey: data["history-key"],
+      historyKey: this.historyKey,
       latestServerIndex: data["latest-server-index"] || 0,
-      latestSchemaVersion: data["latest-schema-version"] || 1,
+      latestSchemaVersion: data["latest-schema-version"] || SCHEMA_VERSION,
     };
   }
 
   async pullItems(startIndex = 0) {
-    if (!this.historyKey) {
-      await this.validateAndFetchAccount();
-    }
+    await this.ensureHistoryKey();
     const url = `${THINGS_CLOUD_BASE}/version/1/history/${this.historyKey}/items?start-index=${startIndex}`;
-    const response = await fetch(url, {
-      method: "GET",
-      headers: ThingsCloudClient.commonHeaders(this.password),
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to pull history items: ${response.status}`);
-    }
+    const response = await this.request(url, { method: "GET" });
+    if (!response.ok) throw new Error(`Failed to pull history items: ${response.status}`);
     const data = await response.json();
     return {
       schema: data.schema,
@@ -184,62 +373,93 @@ export class ThingsCloudClient {
     };
   }
 
-  async syncDatabase() {
-    const meta = await this.getHistoryMetadata();
-    const db = new ThingsDatabase();
-    let startIndex = 0;
+  // Cached database. Within CACHE_TTL_MS it costs no requests; after that it asks for the head
+  // index (one request) and pulls only items added since the last sync.
+  async syncDatabase({ force = false } = {}) {
+    if (!force && this._db && Date.now() - this._dbCheckedAt < CACHE_TTL_MS) return this._db;
 
-    while (startIndex < meta.latestServerIndex) {
-      const page = await this.pullItems(startIndex);
-      for (const itemMap of page.items) {
-        db.applyChangeMap(itemMap);
-      }
-      if (page.currentItemIndex <= startIndex || !page.items.length) {
-        break;
-      }
-      startIndex = page.currentItemIndex;
+    const meta = await this.getHistoryMetadata();
+    if (this._db && meta.latestServerIndex < this._db.latestServerIndex) this._db = null; // history was reset
+    if (!this._db) this._db = new ThingsDatabase(this.timeZone);
+    const db = this._db;
+
+    let start = db.latestServerIndex;
+    while (start < meta.latestServerIndex) {
+      const page = await this.pullItems(start);
+      for (const itemMap of page.items) db.applyChangeMap(itemMap);
+      if (page.currentItemIndex <= start) break;
+      start = page.currentItemIndex;
     }
 
-    db.latestServerIndex = meta.latestServerIndex;
+    db.latestServerIndex = Math.max(start, db.latestServerIndex);
+    this._dbCheckedAt = Date.now();
     return db;
   }
 
-  async stageAndCommitChanges(changes) {
-    if (!this.historyKey) {
-      await this.validateAndFetchAccount();
-    }
-    const meta = await this.getHistoryMetadata();
-    const ancestorIndex = meta.latestServerIndex;
-    const count = changes.length;
-
-    // 1. Stage changes
-    for (let idx = 0; idx < count; idx++) {
-      const stageUrl = `${THINGS_CLOUD_BASE}/version/1/history/${this.historyKey}/stage?ancestor-index=${ancestorIndex}&_idx=${idx}&_cnt=${count}`;
-      const stageRes = await fetch(stageUrl, {
-        method: "POST",
-        headers: ThingsCloudClient.commonHeaders(this.password),
-        body: JSON.stringify(changes[idx]),
-      });
-      if (!stageRes.ok) {
-        throw new Error(`Stage failed for item ${idx}: ${stageRes.status} ${await stageRes.text()}`);
-      }
-    }
-
-    // 2. Commit changes
-    const commitUrl = `${THINGS_CLOUD_BASE}/version/1/history/${this.historyKey}/commit?ancestor-index=${ancestorIndex}&_cnt=${count}`;
-    const commitRes = await fetch(commitUrl, {
-      method: "POST",
-      headers: ThingsCloudClient.commonHeaders(this.password),
-      body: JSON.stringify([]),
-    });
-    if (!commitRes.ok) {
-      throw new Error(`Commit failed: ${commitRes.status} ${await commitRes.text()}`);
-    }
-
-    return await commitRes.json();
+  invalidateCache() {
+    this._dbCheckedAt = 0;
   }
 
-  // --- CRUD: To-Dos ---
+  // Things Cloud takes the changes inside the commit request itself: one POST whose body maps
+  // each UUID to its change. (The separate /stage endpoint is only for oversized objects.)
+  async commitChanges(changes) {
+    const body = {};
+    for (const change of changes) Object.assign(body, change);
+    if (!Object.keys(body).length) return { serverHeadIndex: null };
+
+    await this.ensureHistoryKey();
+    // A fresh cached database already knows the head index, so a write costs one request.
+    let ancestor =
+      this._db && Date.now() - this._dbCheckedAt < CACHE_TTL_MS ? this._db.latestServerIndex : null;
+
+    for (let attempt = 0; ; attempt++) {
+      if (ancestor === null) ancestor = (await this.getHistoryMetadata()).latestServerIndex;
+      const url = `${THINGS_CLOUD_BASE}/version/1/history/${this.historyKey}/commit?ancestor-index=${ancestor}&_cnt=1`;
+      const res = await this.request(url, {
+        method: "POST",
+        headers: {
+          Schema: String(SCHEMA_VERSION),
+          "App-Id": APP_ID,
+          "App-Instance-Id": APP_INSTANCE_ID,
+          "Push-Priority": String(PUSH_PRIORITY),
+        },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const head = data["server-head-index"] ?? null;
+        if (this._db && head === ancestor + 1 && this._db.latestServerIndex === ancestor) {
+          // Only our commit landed since the last sync: apply it locally instead of re-pulling.
+          this._db.applyChangeMap(body);
+          this._db.latestServerIndex = head;
+          this._dbCheckedAt = Date.now();
+        } else {
+          this.invalidateCache();
+        }
+        return { serverHeadIndex: head };
+      }
+      // The index was stale (another client committed): fetch the real head and retry once.
+      if ((res.status === 409 || res.status === 412) && attempt < 1) {
+        ancestor = null;
+        this.invalidateCache();
+        continue;
+      }
+      throw new Error(`Commit failed: ${res.status} ${await res.text()}`);
+    }
+  }
+
+  // Backwards-compatible name used by older callers.
+  async stageAndCommitChanges(changes) {
+    return this.commitChanges(changes);
+  }
+
+  // --- Reference resolution -------------------------------------------------
+
+  resolveTagIds(db, tags = []) {
+    return [...new Set(tags.map((tag) => db.resolveRef("tag", tag)))];
+  }
+
+  // --- To-dos ---------------------------------------------------------------
 
   async createTodo({
     title,
@@ -253,185 +473,111 @@ export class ThingsCloudClient {
     tags = [],
     checklist = [],
   }) {
+    const db = await this.syncDatabase();
     const taskUUID = generateUUID();
-    const nowUnix = toUnixTimestamp();
+    const now = toUnixTimestamp();
 
-    let start = 0;
-    let startBucket = 0;
-    let startDateFADay = null;
-    let todayIndex = null;
-
-    const todayDate = new Date();
-    const todayStr = `${todayDate.getFullYear()}-${String(todayDate.getMonth() + 1).padStart(2, "0")}-${String(todayDate.getDate()).padStart(2, "0")}`;
-
-    if (when === "inbox") {
-      start = 0;
-    } else if (when === "today" || when === "evening") {
-      start = 1;
-      startBucket = 1;
-      startDateFADay = encodeFADay(todayStr);
-      todayIndex = 1;
-    } else if (when === "anytime") {
-      start = 1;
-      startBucket = 0;
-    } else if (when === "someday") {
-      start = 2;
-      startBucket = 0;
-    } else if (typeof when === "string" && /^\d{4}-\d{2}-\d{2}$/.test(when)) {
-      start = 1;
-      startDateFADay = encodeFADay(when);
-      if (when <= todayStr) {
-        startBucket = 1;
-        todayIndex = 1;
-      }
-    }
-
-    const taskProps = {
+    const change = buildTaskCreate({
       title,
       notes,
-      type: 0,
-      status: 0,
-      trashed: 0,
-      start,
-      startBucket,
-      creationDate: nowUnix,
-      userModificationDate: nowUnix,
-    };
+      when,
+      reminderTime,
+      deadline,
+      project: project ? db.resolveRef("project", project) : null,
+      heading: heading ? db.resolveRef("heading", heading) : null,
+      area: area ? db.resolveRef("area", area) : null,
+      tags: this.resolveTagIds(db, tags),
+      now,
+      timeZone: this.timeZone,
+    });
+    const changes = [{ [taskUUID]: change }];
 
-    if (startDateFADay !== null) taskProps.startDate = startDateFADay;
-    if (todayIndex !== null) taskProps.todayIndex = todayIndex;
-    if (deadline) taskProps.deadline = encodeFADay(deadline);
-    if (reminderTime) taskProps.reminderTime = encodeFATime(reminderTime);
-    if (project) taskProps.project = project;
-    if (heading) taskProps.heading = heading;
-    if (area) taskProps.area = area;
-    if (Array.isArray(tags) && tags.length) taskProps.tags = tags;
+    (checklist || []).forEach((item, idx) => {
+      changes.push({
+        [generateUUID()]: buildChecklistCreate({
+          title: typeof item === "string" ? item : item.title,
+          task: taskUUID,
+          index: idx,
+          now,
+        }),
+      });
+    });
 
-    const changes = [
-      {
-        [taskUUID]: {
-          t: 0,
-          e: "Task",
-          p: taskProps,
-        },
-      },
-    ];
-
-    if (Array.isArray(checklist) && checklist.length > 0) {
-      let idx = 0;
-      for (const item of checklist) {
-        const itemUUID = generateUUID();
-        const itemTitle = typeof item === "string" ? item : item.title;
-        changes.push({
-          [itemUUID]: {
-            t: 0,
-            e: "ChecklistItem",
-            p: {
-              title: itemTitle,
-              status: 0,
-              task: taskUUID,
-              index: idx++,
-              creationDate: nowUnix,
-              userModificationDate: nowUnix,
-            },
-          },
-        });
-      }
-      taskProps.checklistItemsCount = checklist.length;
-      taskProps.openChecklistItemsCount = checklist.length;
-    }
-
-    await this.stageAndCommitChanges(changes);
+    await this.commitChanges(changes);
     return {
       id: taskUUID,
       title,
       when,
       status: "open",
-      deadline: decodeFADay(taskProps.deadline),
-      reminderTime: decodeFATime(taskProps.reminderTime),
+      deadline: deadline || null,
+      reminderTime: reminderTime || null,
     };
   }
 
-  async updateTodo(uuid, updates = {}) {
-    const nowUnix = toUnixTimestamp();
-    const taskProps = {
-      userModificationDate: nowUnix,
-    };
+  // Build the property patch for an update. Throws on unknown references or bad dates.
+  buildTaskPatch(db, updates, now = toUnixTimestamp()) {
+    const p = { md: now, ...statusFields(updates.status, now) };
 
-    if (updates.status === "completed") {
-      taskProps.status = 3;
-      taskProps.stopDate = nowUnix;
-    } else if (updates.status === "canceled") {
-      taskProps.status = 2;
-      taskProps.stopDate = nowUnix;
-    } else if (updates.status === "open") {
-      taskProps.status = 0;
-      taskProps.stopDate = null;
-    }
+    if (updates.title !== undefined) p.tt = updates.title;
+    if (updates.notes !== undefined) p.nt = noteObject(updates.notes);
 
-    if (updates.title !== undefined) taskProps.title = updates.title;
-    if (updates.notes !== undefined) taskProps.notes = updates.notes;
+    if (updates.when !== undefined) Object.assign(p, withReminder(schedulingFields(updates.when, this.timeZone), null, this.timeZone), { ato: undefined });
+    if (updates.when !== undefined && p.ato === undefined) delete p.ato;
 
-    if (updates.when !== undefined) {
-      const todayDate = new Date();
-      const todayStr = `${todayDate.getFullYear()}-${String(todayDate.getMonth() + 1).padStart(2, "0")}-${String(todayDate.getDate()).padStart(2, "0")}`;
-
-      if (updates.when === "inbox") {
-        taskProps.start = 0;
-        taskProps.startBucket = 0;
-        taskProps.startDate = null;
-        taskProps.todayIndex = null;
-      } else if (updates.when === "today" || updates.when === "evening") {
-        taskProps.start = 1;
-        taskProps.startBucket = 1;
-        taskProps.startDate = encodeFADay(todayStr);
-        taskProps.todayIndex = 1;
-      } else if (updates.when === "anytime") {
-        taskProps.start = 1;
-        taskProps.startBucket = 0;
-        taskProps.startDate = null;
-        taskProps.todayIndex = null;
-      } else if (updates.when === "someday") {
-        taskProps.start = 2;
-        taskProps.startBucket = 0;
-        taskProps.startDate = null;
-        taskProps.todayIndex = null;
-      } else if (typeof updates.when === "string" && /^\d{4}-\d{2}-\d{2}$/.test(updates.when)) {
-        taskProps.start = 1;
-        taskProps.startDate = encodeFADay(updates.when);
-        if (updates.when <= todayStr) {
-          taskProps.startBucket = 1;
-          taskProps.todayIndex = 1;
+    if (updates.reminderTime !== undefined) {
+      const existingSr = p.sr !== undefined ? p.sr : db.tasks.get(updates.__uuid)?.startDate ? dateToTimestamp(db.tasks.get(updates.__uuid).startDate) : null;
+      Object.assign(p, withReminder({ st: p.st ?? 1, sb: p.sb ?? 0, sr: existingSr, tir: p.tir ?? null }, updates.reminderTime, this.timeZone));
+      if (updates.reminderTime) {
+        if (p.st === undefined) delete p.st;
+      }
+      if (updates.when === undefined) {
+        if (existingSr === null && updates.reminderTime) {
+          // sr/tir/st were set by withReminder
         } else {
-          taskProps.startBucket = 0;
-          taskProps.todayIndex = null;
+          delete p.sr;
+          delete p.tir;
+          delete p.st;
+          delete p.sb;
         }
       }
     }
 
-    if (updates.deadline !== undefined) {
-      taskProps.deadline = updates.deadline ? encodeFADay(updates.deadline) : null;
-    }
-    if (updates.reminderTime !== undefined) {
-      taskProps.reminderTime = updates.reminderTime ? encodeFATime(updates.reminderTime) : null;
-    }
-    if (updates.project !== undefined) taskProps.project = updates.project;
-    if (updates.heading !== undefined) taskProps.heading = updates.heading;
-    if (updates.area !== undefined) taskProps.area = updates.area;
-    if (updates.tags !== undefined) taskProps.tags = updates.tags;
-    if (updates.trashed !== undefined) taskProps.trashed = updates.trashed ? 1 : 0;
+    if (updates.deadline !== undefined) p.dd = updates.deadline ? dateToTimestamp(updates.deadline) : null;
 
-    const changes = [
-      {
-        [uuid]: {
-          t: 1,
-          e: "Task",
-          p: taskProps,
-        },
-      },
-    ];
+    // Containers: null or "" clears; a heading implies its project.
+    if (updates.project !== undefined) {
+      p.pr = updates.project ? [db.resolveRef("project", updates.project)] : [];
+      p.agr = [];
+      if (updates.project) p.ar = [];
+    }
+    if (updates.heading !== undefined) {
+      if (updates.heading) {
+        p.agr = [db.resolveRef("heading", updates.heading)];
+        p.pr = [];
+        p.ar = [];
+      } else {
+        p.agr = [];
+      }
+    }
+    if (updates.area !== undefined) {
+      p.ar = updates.area ? [db.resolveRef("area", updates.area)] : [];
+      if (updates.area) {
+        p.pr = [];
+        p.agr = [];
+      }
+    }
+    if (updates.tags !== undefined) p.tg = this.resolveTagIds(db, updates.tags);
+    if (updates.trashed !== undefined) p.tr = Boolean(updates.trashed);
+    if (updates.type !== undefined) p.tp = updates.type;
 
-    await this.stageAndCommitChanges(changes);
+    return p;
+  }
+
+  async updateTodo(uuid, updates = {}) {
+    const db = await this.syncDatabase();
+    if (!db.tasks.has(uuid)) throw new Error(`No to-do, project, or heading with id ${uuid}.`);
+    const patch = this.buildTaskPatch(db, { ...updates, __uuid: uuid });
+    await this.commitChanges([{ [uuid]: { t: 1, e: ENTITY.task, p: patch } }]);
     return { id: uuid, updated: true };
   }
 
@@ -439,248 +585,125 @@ export class ThingsCloudClient {
     return this.updateTodo(uuid, { trashed: true });
   }
 
+  // Permanently remove an item. The entity name is taken from the database.
   async deleteEntity(uuid) {
-    const changes = [
-      {
-        [uuid]: {
-          t: 2,
-        },
-      },
-    ];
-    await this.stageAndCommitChanges(changes);
+    const db = await this.syncDatabase();
+    const entity = db.entityOf(uuid);
+    if (!entity) throw new Error(`No item with id ${uuid}.`);
+    await this.commitChanges([{ [uuid]: { t: 2, e: entity, p: {} } }]);
     return { id: uuid, deleted: true };
   }
 
-  // --- CRUD: Projects & Headings ---
+  // --- Projects and headings --------------------------------------------------
 
-  async createProject({
-    title,
-    notes = "",
-    area = null,
-    when = "anytime",
-    deadline = null,
-    tags = [],
-  }) {
-    const projectUUID = generateUUID();
-    const nowUnix = toUnixTimestamp();
-
-    let start = 1;
-    let startBucket = 0;
-    let startDateFADay = null;
-
-    if (when === "today") {
-      const todayDate = new Date();
-      const todayStr = `${todayDate.getFullYear()}-${String(todayDate.getMonth() + 1).padStart(2, "0")}-${String(todayDate.getDate()).padStart(2, "0")}`;
-      start = 1;
-      startBucket = 1;
-      startDateFADay = encodeFADay(todayStr);
-    } else if (when === "someday") {
-      start = 2;
-    } else if (typeof when === "string" && /^\d{4}-\d{2}-\d{2}$/.test(when)) {
-      start = 1;
-      startDateFADay = encodeFADay(when);
-    }
-
-    const projectProps = {
+  async createProject({ title, notes = "", area = null, when = "anytime", deadline = null, tags = [] }) {
+    const db = await this.syncDatabase();
+    const uuid = generateUUID();
+    const change = buildTaskCreate({
       title,
       notes,
       type: 1,
-      status: 0,
-      trashed: 0,
-      start,
-      startBucket,
-      creationDate: nowUnix,
-      userModificationDate: nowUnix,
-    };
-
-    if (area) projectProps.area = area;
-    if (startDateFADay !== null) projectProps.startDate = startDateFADay;
-    if (deadline) projectProps.deadline = encodeFADay(deadline);
-    if (Array.isArray(tags) && tags.length) projectProps.tags = tags;
-
-    const changes = [
-      {
-        [projectUUID]: {
-          t: 0,
-          e: "Task",
-          p: projectProps,
-        },
-      },
-    ];
-
-    await this.stageAndCommitChanges(changes);
-    return { id: projectUUID, title, type: "project", status: "open" };
+      when,
+      deadline,
+      area: area ? db.resolveRef("area", area) : null,
+      tags: this.resolveTagIds(db, tags),
+      timeZone: this.timeZone,
+    });
+    await this.commitChanges([{ [uuid]: change }]);
+    return { id: uuid, title, type: "project", status: "open" };
   }
 
   async updateProject(uuid, updates = {}) {
+    const db = await this.syncDatabase();
+    const task = db.tasks.get(uuid);
+    if (!task || task.type !== 1) throw new Error(`No project with id ${uuid}.`);
     return this.updateTodo(uuid, updates);
   }
 
   async createHeading({ project, title }) {
-    const headingUUID = generateUUID();
-    const nowUnix = toUnixTimestamp();
-
-    const headingProps = {
-      title,
-      type: 2,
-      project,
-      status: 0,
-      trashed: 0,
-      creationDate: nowUnix,
-      userModificationDate: nowUnix,
-    };
-
-    const changes = [
-      {
-        [headingUUID]: {
-          t: 0,
-          e: "Task",
-          p: headingProps,
-        },
-      },
-    ];
-
-    await this.stageAndCommitChanges(changes);
-    return { id: headingUUID, title, project, type: "heading" };
+    const db = await this.syncDatabase();
+    const projectId = db.resolveRef("project", project);
+    const uuid = generateUUID();
+    const change = buildTaskCreate({ title, type: 2, when: "anytime", project: projectId, timeZone: this.timeZone });
+    await this.commitChanges([{ [uuid]: change }]);
+    return { id: uuid, title, project: projectId, type: "heading" };
   }
 
   async updateHeading(uuid, { title, deleted = false }) {
-    if (deleted) {
-      return this.deleteEntity(uuid);
-    }
-    const changes = [
-      {
-        [uuid]: {
-          t: 1,
-          e: "Task",
-          p: {
-            title,
-            userModificationDate: toUnixTimestamp(),
-          },
-        },
-      },
-    ];
-    await this.stageAndCommitChanges(changes);
+    if (deleted) return this.deleteEntity(uuid);
+    const db = await this.syncDatabase();
+    if (db.tasks.get(uuid)?.type !== 2) throw new Error(`No heading with id ${uuid}.`);
+    await this.commitChanges([{ [uuid]: { t: 1, e: ENTITY.task, p: { tt: title, md: toUnixTimestamp() } } }]);
     return { id: uuid, title, updated: true };
   }
 
-  // --- CRUD: Areas ---
+  // --- Areas and tags ---------------------------------------------------------
 
   async createArea({ title, tags = [] }) {
-    const areaUUID = generateUUID();
-    const changes = [
-      {
-        [areaUUID]: {
-          t: 0,
-          e: "Area",
-          p: {
-            title,
-            visible: 1,
-            tags: tags,
-          },
-        },
-      },
-    ];
-    await this.stageAndCommitChanges(changes);
-    return { id: areaUUID, title };
+    const db = await this.syncDatabase();
+    const uuid = generateUUID();
+    await this.commitChanges([
+      { [uuid]: { t: 0, e: ENTITY.area, p: { tt: title, tg: this.resolveTagIds(db, tags), ix: 0, xx: EMPTY_XX() } } },
+    ]);
+    return { id: uuid, title };
   }
 
-  async updateArea(uuid, { title, visible = 1 }) {
-    const changes = [
-      {
-        [uuid]: {
-          t: 1,
-          e: "Area",
-          p: {
-            title,
-            visible: visible ? 1 : 0,
-          },
-        },
-      },
-    ];
-    await this.stageAndCommitChanges(changes);
+  async updateArea(uuid, { title }) {
+    const db = await this.syncDatabase();
+    if (!db.areas.has(uuid)) throw new Error(`No area with id ${uuid}.`);
+    await this.commitChanges([{ [uuid]: { t: 1, e: ENTITY.area, p: { tt: title } } }]);
     return { id: uuid, title, updated: true };
   }
 
-  // --- CRUD: Tags ---
-
   async createTag({ title, shortcut = null, parent = null }) {
-    const tagUUID = generateUUID();
-    const tagProps = { title };
-    if (shortcut) tagProps.shortcut = shortcut;
-    if (parent) tagProps.parent = parent;
-
-    const changes = [
+    const db = await this.syncDatabase();
+    const uuid = generateUUID();
+    await this.commitChanges([
       {
-        [tagUUID]: {
+        [uuid]: {
           t: 0,
-          e: "Tag",
-          p: tagProps,
-        },
-      },
-    ];
-    await this.stageAndCommitChanges(changes);
-    return { id: tagUUID, title, shortcut, parent };
-  }
-
-  // --- CRUD: Checklist Items ---
-
-  async addChecklistItems(taskUUID, items) {
-    const nowUnix = toUnixTimestamp();
-    const changes = [];
-    const created = [];
-
-    let idx = 0;
-    for (const item of items) {
-      const itemUUID = generateUUID();
-      const title = typeof item === "string" ? item : item.title;
-      changes.push({
-        [itemUUID]: {
-          t: 0,
-          e: "ChecklistItem",
+          e: ENTITY.tag,
           p: {
-            title,
-            status: 0,
-            task: taskUUID,
-            index: idx++,
-            creationDate: nowUnix,
-            userModificationDate: nowUnix,
+            tt: title,
+            sh: shortcut || null,
+            pn: parent ? [db.resolveRef("tag", parent)] : [],
+            ix: 0,
+            xx: EMPTY_XX(),
           },
         },
-      });
-      created.push({ id: itemUUID, title, status: "open" });
-    }
+      },
+    ]);
+    return { id: uuid, title, shortcut, parent };
+  }
 
-    await this.stageAndCommitChanges(changes);
+  // --- Checklist items --------------------------------------------------------
+
+  async addChecklistItems(taskUUID, items) {
+    const db = await this.syncDatabase();
+    const task = db.tasks.get(taskUUID);
+    if (!task || task.type !== 0) throw new Error(`No to-do with id ${taskUUID}.`);
+    const now = toUnixTimestamp();
+    let nextIndex = db.checklistItemsFor(taskUUID).reduce((max, c) => Math.max(max, c.index ?? 0), -1) + 1;
+
+    const changes = [];
+    const created = [];
+    for (const item of items) {
+      const id = generateUUID();
+      const title = typeof item === "string" ? item : item.title;
+      changes.push({ [id]: buildChecklistCreate({ title, task: taskUUID, index: nextIndex++, now }) });
+      created.push({ id, title, status: "open" });
+    }
+    await this.commitChanges(changes);
     return created;
   }
 
   async updateChecklistItem(uuid, { title, status }) {
-    const itemProps = {
-      userModificationDate: toUnixTimestamp(),
-    };
-    if (title !== undefined) itemProps.title = title;
-    if (status === "completed") {
-      itemProps.status = 3;
-      itemProps.stopDate = toUnixTimestamp();
-    } else if (status === "canceled") {
-      itemProps.status = 2;
-      itemProps.stopDate = toUnixTimestamp();
-    } else if (status === "open") {
-      itemProps.status = 0;
-      itemProps.stopDate = null;
-    }
-
-    const changes = [
-      {
-        [uuid]: {
-          t: 1,
-          e: "ChecklistItem",
-          p: itemProps,
-        },
-      },
-    ];
-    await this.stageAndCommitChanges(changes);
+    const db = await this.syncDatabase();
+    if (!db.checklists.has(uuid)) throw new Error(`No checklist item with id ${uuid}.`);
+    const now = toUnixTimestamp();
+    const p = { md: now, ...statusFields(status, now) };
+    if (title !== undefined) p.tt = title;
+    await this.commitChanges([{ [uuid]: { t: 1, e: ENTITY.checklist, p } }]);
     return { id: uuid, updated: true };
   }
 
@@ -688,37 +711,34 @@ export class ThingsCloudClient {
     return this.deleteEntity(uuid);
   }
 
-  // --- Batch Operations ---
+  // --- Compound operations -----------------------------------------------------
 
   async duplicateTodo(uuid) {
     const db = await this.syncDatabase();
     const orig = db.tasks.get(uuid);
     if (!orig) throw new Error(`To-do not found: ${uuid}`);
-    const checklist = db.resolveChecklistItems(uuid).map((c) => c.title);
     return this.createTodo({
       title: `${orig.title || "Untitled"} (Copy)`,
       notes: orig.notes || "",
-      when: orig.start === 0 ? "inbox" : (orig.startBucket === 1 ? "today" : (orig.start === 2 ? "someday" : "anytime")),
-      deadline: decodeFADay(orig.deadline),
-      reminderTime: decodeFATime(orig.reminderTime),
+      when: db.whenOf(orig),
+      deadline: orig.deadline,
+      reminderTime: secondsToTime(orig.reminderSeconds),
       project: orig.project,
       heading: orig.heading,
       area: orig.area,
       tags: orig.tags || [],
-      checklist,
+      checklist: db.checklistItemsFor(uuid).map((c) => c.title),
     });
   }
 
   async emptyTrash() {
     const db = await this.syncDatabase();
-    const trashedTasks = Array.from(db.tasks.values()).filter((t) => t.trashed === 1);
-    if (!trashedTasks.length) return { purgedCount: 0 };
-    const changes = trashedTasks.map((t) => ({ [t.uuid]: { t: 2 } }));
-    await this.stageAndCommitChanges(changes);
-    return { purgedCount: trashedTasks.length };
+    const trashed = [...db.tasks.values()].filter((t) => t.trashed);
+    if (!trashed.length) return { purgedCount: 0 };
+    await this.commitChanges(trashed.map((t) => ({ [t.uuid]: { t: 2, e: ENTITY.task, p: {} } })));
+    return { purgedCount: trashed.length };
   }
 
-  // Move to-do between lists, projects, headings, or areas
   async moveTodo(uuid, { when, project, heading, area }) {
     const updates = {};
     if (when !== undefined) updates.when = when;
@@ -728,74 +748,60 @@ export class ThingsCloudClient {
     return this.updateTodo(uuid, updates);
   }
 
-  // Convert an existing to-do into a Project, turning checklist items into standalone to-dos
+  // Turn a to-do into a project; its checklist items become to-dos inside it.
   async convertTodoToProject(uuid) {
     const db = await this.syncDatabase();
     const task = db.tasks.get(uuid);
-    if (!task) throw new Error(`To-do not found: ${uuid}`);
+    if (!task || task.type !== 0) throw new Error(`To-do not found: ${uuid}`);
 
-    const checklistItems = db.resolveChecklistItems(uuid);
-    const nowUnix = toUnixTimestamp();
-    const changes = [];
+    const checklistItems = db.checklistItemsFor(uuid);
+    const now = toUnixTimestamp();
+    const changes = [{ [uuid]: { t: 1, e: ENTITY.task, p: { tp: 1, md: now } } }];
 
-    // 1. Convert task to project (type = 1)
-    changes.push({
-      [uuid]: {
-        t: 1,
-        e: "Task",
-        p: {
-          type: 1, // Project
-          userModificationDate: nowUnix,
-        },
-      },
+    checklistItems.forEach((item, idx) => {
+      const todo = buildTaskCreate({
+        title: item.title,
+        when: "anytime",
+        project: uuid,
+        status: item.status === 3 ? 3 : item.status === 2 ? 2 : 0,
+        now,
+        timeZone: this.timeZone,
+      });
+      todo.p.ix = idx;
+      changes.push({ [generateUUID()]: todo });
+      changes.push({ [item.uuid]: { t: 2, e: ENTITY.checklist, p: {} } });
     });
 
-    // 2. Convert checklist items into to-dos inside new project
-    let idx = 0;
-    for (const item of checklistItems) {
-      const newTodoUUID = generateUUID();
-      changes.push({
-        [newTodoUUID]: {
-          t: 0,
-          e: "Task",
-          p: {
-            title: item.title,
-            type: 0,
-            status: item.status === "completed" ? 3 : (item.status === "canceled" ? 2 : 0),
-            project: uuid,
-            start: 1,
-            startBucket: 0,
-            index: idx++,
-            creationDate: nowUnix,
-            userModificationDate: nowUnix,
-          },
-        },
-      });
-
-      // Delete old checklist item
-      changes.push({
-        [item.id]: {
-          t: 2,
-        },
-      });
-    }
-
-    await this.stageAndCommitChanges(changes);
-    return {
-      id: uuid,
-      title: task.title,
-      type: "project",
-      tasksCreated: checklistItems.length,
-    };
+    await this.commitChanges(changes);
+    return { id: uuid, title: task.title, type: "project", tasksCreated: checklistItems.length };
   }
 
-  // Import Things 3 JSON format
+  // Import Things JSON (https://culturedcode.com/things/support/articles/2803573/).
   async importJson(payload) {
+    const db = await this.syncDatabase();
     const items = Array.isArray(payload) ? payload : [payload];
-    const nowUnix = toUnixTimestamp();
+    const now = toUnixTimestamp();
     const changes = [];
     let projectsCreated = 0;
     let todosCreated = 0;
+
+    const taskFields = (attrs) => ({
+      title: attrs.title || "Untitled",
+      notes: attrs.notes || "",
+      when: attrs.when || "anytime",
+      deadline: attrs.deadline || null,
+      reminderTime: attrs.reminder || attrs["reminder-time"] || null,
+      tags: this.resolveTagIds(db, attrs.tags || []),
+      now,
+      timeZone: this.timeZone,
+    });
+
+    const addChecklist = (attrs, todoUUID) => {
+      (attrs["checklist-items"] || attrs.checklist || []).forEach((cl, idx) => {
+        const title = typeof cl === "string" ? cl : cl.title || cl.attributes?.title;
+        changes.push({ [generateUUID()]: buildChecklistCreate({ title, task: todoUUID, index: idx, now }) });
+      });
+    };
 
     for (const item of items) {
       const type = item.type || "to-do";
@@ -803,165 +809,59 @@ export class ThingsCloudClient {
 
       if (type === "project") {
         const projectUUID = generateUUID();
-        const projectProps = {
-          title: attrs.title || "Untitled Project",
-          notes: attrs.notes || "",
-          type: 1,
-          status: 0,
-          trashed: 0,
-          start: 1,
-          startBucket: 0,
-          creationDate: nowUnix,
-          userModificationDate: nowUnix,
-        };
-        if (attrs.deadline) projectProps.deadline = encodeFADay(attrs.deadline);
-        if (attrs.when) {
-          if (attrs.when === "today") {
-            projectProps.startBucket = 1;
-            const todayStr = new Date().toISOString().slice(0, 10);
-            projectProps.startDate = encodeFADay(todayStr);
-          } else if (attrs.when === "someday") {
-            projectProps.start = 2;
-          } else if (/^\d{4}-\d{2}-\d{2}$/.test(attrs.when)) {
-            projectProps.startDate = encodeFADay(attrs.when);
-          }
-        }
-        if (attrs.area) projectProps.area = attrs.area;
-        if (attrs.tags) projectProps.tags = attrs.tags;
-
         changes.push({
-          [projectUUID]: {
-            t: 0,
-            e: "Task",
-            p: projectProps,
-          },
+          [projectUUID]: buildTaskCreate({
+            ...taskFields({ ...attrs, title: attrs.title || "Untitled Project" }),
+            type: 1,
+            area: attrs.area ? db.resolveRef("area", attrs.area) : null,
+          }),
         });
         projectsCreated++;
 
-        // Process nested headings and items
-        let currentHeadingUUID = null;
-        if (Array.isArray(attrs.items)) {
-          let taskIdx = 0;
-          for (const subItem of attrs.items) {
-            const subType = subItem.type || "to-do";
-            const subAttrs = subItem.attributes || {};
-
-            if (subType === "heading") {
-              currentHeadingUUID = generateUUID();
-              changes.push({
-                [currentHeadingUUID]: {
-                  t: 0,
-                  e: "Task",
-                  p: {
-                    title: subAttrs.title || "Section",
-                    type: 2, // Heading
-                    project: projectUUID,
-                    status: 0,
-                    trashed: 0,
-                    creationDate: nowUnix,
-                    userModificationDate: nowUnix,
-                  },
-                },
-              });
-            } else if (subType === "to-do") {
-              const subTodoUUID = generateUUID();
-              const subTodoProps = {
-                title: subAttrs.title || "To-do",
-                notes: subAttrs.notes || "",
-                type: 0,
-                status: 0,
-                trashed: 0,
+        let headingUUID = null;
+        let idx = 0;
+        for (const sub of attrs.items || []) {
+          const subType = sub.type || "to-do";
+          const subAttrs = sub.attributes || {};
+          if (subType === "heading") {
+            headingUUID = generateUUID();
+            changes.push({
+              [headingUUID]: buildTaskCreate({
+                title: subAttrs.title || "Section",
+                type: 2,
+                when: "anytime",
                 project: projectUUID,
-                heading: currentHeadingUUID,
-                start: 1,
-                startBucket: 0,
-                index: taskIdx++,
-                creationDate: nowUnix,
-                userModificationDate: nowUnix,
-              };
-              if (subAttrs.deadline) subTodoProps.deadline = encodeFADay(subAttrs.deadline);
-              if (subAttrs.tags) subTodoProps.tags = subAttrs.tags;
-
-              changes.push({
-                [subTodoUUID]: {
-                  t: 0,
-                  e: "Task",
-                  p: subTodoProps,
-                },
-              });
-              todosCreated++;
-
-              // Checklist inside sub-todo
-              const rawChecklist = subAttrs["checklist-items"] || subAttrs.checklist || [];
-              let clIdx = 0;
-              for (const cl of rawChecklist) {
-                const clUUID = generateUUID();
-                changes.push({
-                  [clUUID]: {
-                    t: 0,
-                    e: "ChecklistItem",
-                    p: {
-                      title: typeof cl === "string" ? cl : cl.title,
-                      status: 0,
-                      task: subTodoUUID,
-                      index: clIdx++,
-                      creationDate: nowUnix,
-                      userModificationDate: nowUnix,
-                    },
-                  },
-                });
-              }
-            }
+                now,
+                timeZone: this.timeZone,
+              }),
+            });
+          } else if (subType === "to-do") {
+            const todoUUID = generateUUID();
+            const change = buildTaskCreate({
+              ...taskFields(subAttrs),
+              project: headingUUID ? null : projectUUID,
+              heading: headingUUID,
+            });
+            change.p.ix = idx++;
+            changes.push({ [todoUUID]: change });
+            todosCreated++;
+            addChecklist(subAttrs, todoUUID);
           }
         }
       } else if (type === "to-do") {
         const todoUUID = generateUUID();
-        const todoProps = {
-          title: attrs.title || "Untitled",
-          notes: attrs.notes || "",
-          type: 0,
-          status: 0,
-          trashed: 0,
-          start: attrs.when ? 1 : 0,
-          startBucket: attrs.when === "today" ? 1 : 0,
-          creationDate: nowUnix,
-          userModificationDate: nowUnix,
-        };
-        if (attrs.deadline) todoProps.deadline = encodeFADay(attrs.deadline);
-        if (attrs.tags) todoProps.tags = attrs.tags;
-
         changes.push({
-          [todoUUID]: {
-            t: 0,
-            e: "Task",
-            p: todoProps,
-          },
+          [todoUUID]: buildTaskCreate({
+            ...taskFields({ ...attrs, when: attrs.when || "inbox" }),
+            project: attrs["list-id"] ? db.resolveRef("project", attrs["list-id"]) : attrs.list ? db.resolveRef("project", attrs.list) : null,
+          }),
         });
         todosCreated++;
-
-        const rawChecklist = attrs["checklist-items"] || attrs.checklist || [];
-        let clIdx = 0;
-        for (const cl of rawChecklist) {
-          const clUUID = generateUUID();
-          changes.push({
-            [clUUID]: {
-              t: 0,
-              e: "ChecklistItem",
-              p: {
-                title: typeof cl === "string" ? cl : cl.title,
-                status: 0,
-                task: todoUUID,
-                index: clIdx++,
-                creationDate: nowUnix,
-                userModificationDate: nowUnix,
-              },
-            },
-          });
-        }
+        addChecklist(attrs, todoUUID);
       }
     }
 
-    await this.stageAndCommitChanges(changes);
+    await this.commitChanges(changes);
     return { projectsCreated, todosCreated, totalEntities: changes.length };
   }
 
@@ -969,76 +869,49 @@ export class ThingsCloudClient {
     const db = await this.syncDatabase();
     const task = db.tasks.get(taskUUID);
     if (!task) throw new Error(`Task not found: ${taskUUID}`);
-
-    const existingTags = task.tags || [];
-    const newTags = Array.from(new Set([...existingTags, ...tagNames]));
-    return this.updateTodo(taskUUID, { tags: newTags });
+    const merged = [...new Set([...(task.tags || []), ...this.resolveTagIds(db, tagNames)])];
+    return this.updateTodo(taskUUID, { tags: merged });
   }
 
   async removeTagsFromTask(taskUUID, tagNames) {
     const db = await this.syncDatabase();
     const task = db.tasks.get(taskUUID);
     if (!task) throw new Error(`Task not found: ${taskUUID}`);
-
-    const tagsToRemove = new Set(tagNames);
-    const existingTags = task.tags || [];
-    const newTags = existingTags.filter((t) => !tagsToRemove.has(t));
-    return this.updateTodo(taskUUID, { tags: newTags });
+    const remove = new Set(this.resolveTagIds(db, tagNames));
+    return this.updateTodo(taskUUID, { tags: (task.tags || []).filter((id) => !remove.has(id)) });
   }
 
   async batchUpdateTodos(uuids, operation, options = {}) {
-    const nowUnix = toUnixTimestamp();
+    const db = await this.syncDatabase();
+    const now = toUnixTimestamp();
     const changes = [];
 
     for (const uuid of uuids) {
-      const p = { userModificationDate: nowUnix };
-      if (operation === "complete") {
-        p.status = 3;
-        p.stopDate = nowUnix;
-      } else if (operation === "cancel") {
-        p.status = 2;
-        p.stopDate = nowUnix;
-      } else if (operation === "trash") {
-        p.trashed = 1;
-      } else if (operation === "reschedule" && options.when) {
-        if (options.when === "today") {
-          const todayDate = new Date();
-          const todayStr = `${todayDate.getFullYear()}-${String(todayDate.getMonth() + 1).padStart(2, "0")}-${String(todayDate.getDate()).padStart(2, "0")}`;
-          p.start = 1;
-          p.startBucket = 1;
-          p.startDate = encodeFADay(todayStr);
-          p.todayIndex = 1;
-        } else if (options.when === "someday") {
-          p.start = 2;
-          p.startBucket = 0;
-          p.startDate = null;
-        } else if (options.when === "anytime") {
-          p.start = 1;
-          p.startBucket = 0;
-          p.startDate = null;
-        } else if (/^\d{4}-\d{2}-\d{2}$/.test(options.when)) {
-          p.start = 1;
-          p.startDate = encodeFADay(options.when);
-        }
+      if (!db.tasks.has(uuid)) throw new Error(`Task not found: ${uuid}`);
+      const p = { md: now };
+      if (operation === "complete") Object.assign(p, statusFields("completed", now));
+      else if (operation === "cancel") Object.assign(p, statusFields("canceled", now));
+      else if (operation === "trash") p.tr = true;
+      else if (operation === "reschedule" && options.when) {
+        Object.assign(p, schedulingFields(options.when, this.timeZone));
       }
-
-      changes.push({
-        [uuid]: {
-          t: 1,
-          e: "Task",
-          p,
-        },
-      });
+      changes.push({ [uuid]: { t: 1, e: ENTITY.task, p } });
     }
 
-    await this.stageAndCommitChanges(changes);
+    await this.commitChanges(changes);
     return { count: uuids.length, operation, updated: true };
   }
 }
 
-// In-Memory Database synchronized with Things Cloud
+// ---------------------------------------------------------------------------
+// In-memory database built from the history
+// ---------------------------------------------------------------------------
+
+const first = (arr) => (Array.isArray(arr) && arr.length ? arr[0] : null);
+
 export class ThingsDatabase {
-  constructor() {
+  constructor(timeZone = DEFAULT_TIME_ZONE) {
+    this.timeZone = timeZone;
     this.tasks = new Map();
     this.areas = new Map();
     this.tags = new Map();
@@ -1046,13 +919,13 @@ export class ThingsDatabase {
     this.latestServerIndex = 0;
   }
 
+  today() {
+    return localDate(this.timeZone);
+  }
+
   applyChangeMap(changeMap) {
     for (const [uuid, op] of Object.entries(changeMap)) {
-      const type = op.t;
-      const entity = op.e;
-      const props = op.p || {};
-
-      if (type === 2) {
+      if (op.t === 2) {
         this.tasks.delete(uuid);
         this.areas.delete(uuid);
         this.tags.delete(uuid);
@@ -1060,61 +933,162 @@ export class ThingsDatabase {
         continue;
       }
 
-      if (entity === "Task") {
-        const existing = this.tasks.get(uuid) || { uuid };
-        this.tasks.set(uuid, { ...existing, ...props, uuid });
-      } else if (entity === "Area") {
-        const existing = this.areas.get(uuid) || { uuid };
-        this.areas.set(uuid, { ...existing, ...props, uuid });
-      } else if (entity === "Tag") {
-        const existing = this.tags.get(uuid) || { uuid };
-        this.tags.set(uuid, { ...existing, ...props, uuid });
-      } else if (entity === "ChecklistItem") {
-        const existing = this.checklists.get(uuid) || { uuid };
-        this.checklists.set(uuid, { ...existing, ...props, uuid });
+      const entity = op.e || "";
+      const props = op.p || {};
+      if (entity.startsWith("Task")) {
+        this.tasks.set(uuid, this.mergeTask(this.tasks.get(uuid) || { uuid }, props));
+      } else if (entity.startsWith("ChecklistItem")) {
+        this.checklists.set(uuid, this.mergeChecklist(this.checklists.get(uuid) || { uuid }, props));
+      } else if (entity.startsWith("Area")) {
+        this.areas.set(uuid, this.mergeArea(this.areas.get(uuid) || { uuid }, props));
+      } else if (entity.startsWith("Tag")) {
+        this.tags.set(uuid, this.mergeTag(this.tags.get(uuid) || { uuid }, props));
       }
     }
   }
 
-  resolveChecklistItems(taskUUID) {
-    return Array.from(this.checklists.values())
+  static mergeNotes(existing, nt) {
+    if (nt === null || nt === undefined) return existing;
+    if (typeof nt.v === "string") return nt.v;
+    if (Array.isArray(nt.ps)) return applyNotePatches(existing, nt.ps);
+    return existing;
+  }
+
+  mergeTask(t, p) {
+    const out = { ...t };
+    if ("tt" in p) out.title = p.tt ?? "";
+    if ("nt" in p) out.notes = ThingsDatabase.mergeNotes(out.notes || "", p.nt);
+    if ("tp" in p) out.type = p.tp;
+    if ("ss" in p) out.status = p.ss;
+    if ("tr" in p) out.trashed = Boolean(p.tr);
+    if ("st" in p) out.start = p.st;
+    if ("sb" in p) out.startBucket = p.sb;
+    if ("sr" in p) out.startDate = timestampToDate(p.sr);
+    if ("tir" in p) out.todayRefDate = timestampToDate(p.tir);
+    if ("dd" in p) out.deadline = timestampToDate(p.dd);
+    if ("ato" in p) out.reminderSeconds = p.ato;
+    if ("pr" in p) out.project = first(p.pr);
+    if ("agr" in p) out.heading = first(p.agr);
+    if ("ar" in p) out.area = first(p.ar);
+    if ("tg" in p) out.tags = p.tg || [];
+    if ("ix" in p) out.index = p.ix;
+    if ("ti" in p) out.todayIndex = p.ti;
+    if ("cd" in p) out.creationDate = p.cd;
+    if ("md" in p) out.modificationDate = p.md;
+    if ("sp" in p) out.stopDate = p.sp;
+    if ("rr" in p) out.recurrenceRule = p.rr;
+    if ("rt" in p) out.repeatingTemplates = p.rt || [];
+    return out;
+  }
+
+  mergeChecklist(c, p) {
+    const out = { ...c };
+    if ("tt" in p) out.title = p.tt ?? "";
+    if ("ss" in p) out.status = p.ss;
+    if ("ts" in p) out.task = first(p.ts);
+    if ("ix" in p) out.index = p.ix;
+    if ("sp" in p) out.stopDate = p.sp;
+    return out;
+  }
+
+  mergeArea(a, p) {
+    const out = { ...a };
+    if ("tt" in p) out.title = p.tt ?? "";
+    if ("tg" in p) out.tags = p.tg || [];
+    if ("ix" in p) out.index = p.ix;
+    return out;
+  }
+
+  mergeTag(t, p) {
+    const out = { ...t };
+    if ("tt" in p) out.title = p.tt ?? "";
+    if ("sh" in p) out.shortcut = p.sh;
+    if ("pn" in p) out.parent = first(p.pn);
+    if ("ix" in p) out.index = p.ix;
+    return out;
+  }
+
+  // --- Lookups ----------------------------------------------------------------
+
+  entityOf(uuid) {
+    if (this.tasks.has(uuid)) return ENTITY.task;
+    if (this.areas.has(uuid)) return ENTITY.area;
+    if (this.tags.has(uuid)) return ENTITY.tag;
+    if (this.checklists.has(uuid)) return ENTITY.checklist;
+    return null;
+  }
+
+  // Turn an id or a (case-insensitive) title into an id; throws if nothing or several match.
+  resolveRef(kind, value) {
+    const wanted = String(value).trim();
+    const pools = {
+      tag: [this.tags, (t) => true],
+      area: [this.areas, () => true],
+      project: [this.tasks, (t) => t.type === 1 && !t.trashed],
+      heading: [this.tasks, (t) => t.type === 2 && !t.trashed],
+    };
+    const [map, accept] = pools[kind];
+    const byId = map.get(wanted);
+    if (byId && accept(byId)) return wanted;
+
+    const matches = [...map.values()].filter((item) => accept(item) && (item.title || "").toLowerCase() === wanted.toLowerCase());
+    if (matches.length === 1) return matches[0].uuid;
+    if (matches.length > 1) {
+      throw new Error(`More than one ${kind} is named "${wanted}". Use its id instead: ${matches.map((m) => m.uuid).join(", ")}.`);
+    }
+    const hint = kind === "tag" ? " Create it with create_tag first." : "";
+    throw new Error(`No ${kind} found for "${wanted}".${hint}`);
+  }
+
+  tagTitles(ids = []) {
+    return ids.map((id) => this.tags.get(id)?.title || id);
+  }
+
+  projectIdOf(t) {
+    return t.project || (t.heading ? this.tasks.get(t.heading)?.project : null) || null;
+  }
+
+  checklistItemsFor(taskUUID) {
+    return [...this.checklists.values()]
       .filter((c) => c.task === taskUUID)
-      .sort((a, b) => (a.index || 0) - (b.index || 0))
-      .map((c) => ({
-        id: c.uuid,
-        title: c.title,
-        status: c.status === 3 ? "completed" : c.status === 2 ? "canceled" : "open",
-      }));
+      .sort((a, b) => (a.index || 0) - (b.index || 0));
+  }
+
+  resolveChecklistItems(taskUUID) {
+    return this.checklistItemsFor(taskUUID).map((c) => ({
+      id: c.uuid,
+      title: c.title,
+      status: c.status === 3 ? "completed" : c.status === 2 ? "canceled" : "open",
+    }));
+  }
+
+  whenOf(t) {
+    if (t.start === 0) return "inbox";
+    if (t.start === 2) return t.startDate || "someday";
+    if (t.startDate && t.startDate <= this.today()) return t.startBucket === 1 ? "evening" : "today";
+    return t.startDate || "anytime";
   }
 
   formatTask(t) {
-    const projectName = t.project ? this.tasks.get(t.project)?.title || t.project : null;
-    const headingName = t.heading ? this.tasks.get(t.heading)?.title || t.heading : null;
-    const areaName = t.area ? this.areas.get(t.area)?.title || t.area : null;
+    const projectId = this.projectIdOf(t);
     const checklist = this.resolveChecklistItems(t.uuid);
-
-    let when = "anytime";
-    if (t.start === 0) when = "inbox";
-    else if (t.startBucket === 1) when = "today";
-    else if (t.start === 2) when = "someday";
-    else if (t.startDate) when = decodeFADay(t.startDate);
 
     return {
       id: t.uuid,
       title: t.title,
       notes: t.notes || "",
       status: t.status === 3 ? "completed" : t.status === 2 ? "canceled" : "open",
-      when,
-      scheduledDate: decodeFADay(t.startDate),
-      deadline: decodeFADay(t.deadline),
-      reminderTime: decodeFATime(t.reminderTime),
-      project: projectName,
-      projectId: t.project || null,
-      heading: headingName,
+      when: this.whenOf(t),
+      scheduledDate: t.startDate || null,
+      deadline: t.deadline || null,
+      reminderTime: secondsToTime(t.reminderSeconds),
+      project: projectId ? this.tasks.get(projectId)?.title || projectId : null,
+      projectId,
+      heading: t.heading ? this.tasks.get(t.heading)?.title || t.heading : null,
       headingId: t.heading || null,
-      area: areaName,
+      area: t.area ? this.areas.get(t.area)?.title || t.area : null,
       areaId: t.area || null,
-      tags: t.tags || [],
+      tags: this.tagTitles(t.tags),
       deepLink: `things:///show?id=${t.uuid}`,
       checklistCount: checklist.length,
       checklistCompletedCount: checklist.filter((c) => c.status === "completed").length,
@@ -1122,74 +1096,71 @@ export class ThingsDatabase {
     };
   }
 
+  // To-dos that can appear in lists: not trashed, not a repeating template.
+  isLive(t) {
+    return !t.trashed && !t.recurrenceRule;
+  }
+
   getOpenTasks() {
-    return Array.from(this.tasks.values()).filter(
-      (t) => t.type === 0 && t.status === 0 && !t.trashed
-    );
+    return [...this.tasks.values()].filter((t) => t.type === 0 && t.status === 0 && this.isLive(t));
   }
 
   getInbox() {
-    return Array.from(this.tasks.values())
-      .filter((t) => t.type === 0 && t.status === 0 && !t.trashed && t.start === 0)
+    return this.getOpenTasks()
+      .filter((t) => t.start === 0)
       .map((t) => this.formatTask(t));
   }
 
   getToday() {
-    const todayDate = new Date();
-    const todayFADay = encodeFADay(`${todayDate.getFullYear()}-${String(todayDate.getMonth() + 1).padStart(2, "0")}-${String(todayDate.getDate()).padStart(2, "0")}`);
-
+    const today = this.today();
     return this.getOpenTasks()
-      .filter((t) => {
-        if (t.startBucket === 1) return true;
-        if (t.todayIndex !== undefined && t.todayIndex !== null) return true;
-        if (t.startDate && t.startDate <= todayFADay) return true;
-        return false;
-      })
+      .filter((t) => t.start === 1 && t.startDate && t.startDate <= today)
+      .sort((a, b) => (a.startBucket || 0) - (b.startBucket || 0) || (a.todayIndex || 0) - (b.todayIndex || 0))
       .map((t) => this.formatTask(t));
   }
 
   getUpcoming(days = 14) {
-    const todayDate = new Date();
-    const todayFADay = encodeFADay(`${todayDate.getFullYear()}-${String(todayDate.getMonth() + 1).padStart(2, "0")}-${String(todayDate.getDate()).padStart(2, "0")}`);
-    const futureDate = new Date(todayDate.getTime() + days * 86400000);
-    const futureFADay = encodeFADay(`${futureDate.getFullYear()}-${String(futureDate.getMonth() + 1).padStart(2, "0")}-${String(futureDate.getDate()).padStart(2, "0")}`);
-
+    const today = this.today();
+    const last = addDays(today, days);
     return this.getOpenTasks()
       .filter((t) => {
-        const isScheduled = t.startDate && t.startDate > todayFADay && t.startDate <= futureFADay;
-        const hasDeadline = t.deadline && t.deadline <= futureFADay;
-        return isScheduled || hasDeadline;
+        const scheduled = t.startDate && t.startDate > today && t.startDate <= last;
+        const hasDeadline = t.deadline && t.deadline <= last;
+        return scheduled || hasDeadline;
       })
-      .sort((a, b) => (a.startDate || a.deadline || 0) - (b.startDate || b.deadline || 0))
+      .sort((a, b) => (a.startDate || a.deadline || "").localeCompare(b.startDate || b.deadline || ""))
       .map((t) => this.formatTask(t));
+  }
+
+  matchesArea(t, area) {
+    return !area || t.area === area || this.areas.get(t.area)?.title === area;
+  }
+
+  matchesTag(t, tag) {
+    return !tag || (t.tags || []).some((id) => id === tag || this.tags.get(id)?.title === tag);
   }
 
   getAnytime({ area = null, tag = null } = {}) {
     return this.getOpenTasks()
-      .filter((t) => {
-        if (t.start !== 1 || t.startBucket === 1) return false;
-        if (area && t.area !== area && this.areas.get(t.area)?.title !== area) return false;
-        if (tag && (!t.tags || !t.tags.includes(tag))) return false;
-        return true;
-      })
+      .filter((t) => t.start === 1 && this.matchesArea(t, area) && this.matchesTag(t, tag))
       .map((t) => this.formatTask(t));
   }
 
   getSomeday() {
-    return Array.from(this.tasks.values())
-      .filter((t) => t.type === 0 && t.status === 0 && !t.trashed && t.start === 2)
+    return this.getOpenTasks()
+      .filter((t) => t.start === 2 && !t.startDate)
       .map((t) => this.formatTask(t));
   }
 
   getLogbook(limit = 50, statusFilter = "all") {
-    return Array.from(this.tasks.values())
+    return [...this.tasks.values()]
       .filter((t) => {
-        if (t.trashed) return false;
+        if (t.trashed || t.type === 2) return false;
         if (statusFilter === "completed") return t.status === 3;
         if (statusFilter === "canceled") return t.status === 2;
         return t.status === 3 || t.status === 2;
       })
-      .sort((a, b) => (b.stopDate || b.userModificationDate || 0) - (a.stopDate || a.userModificationDate || 0))
+      .sort((a, b) => (b.stopDate || b.modificationDate || 0) - (a.stopDate || a.modificationDate || 0))
       .slice(0, limit)
       .map((t) => ({
         ...this.formatTask(t),
@@ -1198,31 +1169,26 @@ export class ThingsDatabase {
   }
 
   getRepeatingTodos() {
-    return Array.from(this.tasks.values())
-      .filter((t) => !t.trashed && (t.rt1_recurrenceRule || t.rt1_repeatingTemplate || t.repeater))
+    return [...this.tasks.values()]
+      .filter((t) => !t.trashed && t.recurrenceRule)
       .map((t) => this.formatTask(t));
   }
 
   getTrash() {
-    return Array.from(this.tasks.values())
-      .filter((t) => t.trashed === 1)
-      .map((t) => this.formatTask(t));
+    return [...this.tasks.values()].filter((t) => t.trashed).map((t) => this.formatTask(t));
   }
 
   getProjects({ status = "open", area = null } = {}) {
-    return Array.from(this.tasks.values())
+    return [...this.tasks.values()]
       .filter((t) => {
         if (t.type !== 1 || t.trashed) return false;
         if (status === "open" && t.status !== 0) return false;
         if (status === "completed" && t.status !== 3) return false;
-        if (area && t.area !== area && this.areas.get(t.area)?.title !== area) return false;
-        return true;
+        return this.matchesArea(t, area);
       })
       .map((p) => {
-        const projectTasks = Array.from(this.tasks.values()).filter((t) => t.project === p.uuid && !t.trashed);
-        const completedTasks = projectTasks.filter((t) => t.status === 3).length;
-        const totalTasks = projectTasks.filter((t) => t.type === 0).length;
-
+        const todos = [...this.tasks.values()].filter((t) => t.type === 0 && !t.trashed && this.projectIdOf(t) === p.uuid);
+        const completed = todos.filter((t) => t.status === 3).length;
         return {
           id: p.uuid,
           title: p.title,
@@ -1230,33 +1196,38 @@ export class ThingsDatabase {
           status: p.status === 3 ? "completed" : p.status === 2 ? "canceled" : "open",
           area: p.area ? this.areas.get(p.area)?.title || p.area : null,
           areaId: p.area || null,
-          deadline: decodeFADay(p.deadline),
-          scheduledDate: decodeFADay(p.startDate),
-          totalTasks,
-          completedTasks,
-          openTasks: totalTasks - completedTasks,
-          tags: p.tags || [],
+          deadline: p.deadline || null,
+          scheduledDate: p.startDate || null,
+          totalTasks: todos.length,
+          completedTasks: completed,
+          openTasks: todos.length - completed,
+          tags: this.tagTitles(p.tags),
         };
       });
   }
 
-  getProject(projectIdentifier) {
-    const p = Array.from(this.tasks.values()).find(
-      (t) => t.type === 1 && (t.uuid === projectIdentifier || (t.title && t.title.toLowerCase() === projectIdentifier.toLowerCase()))
+  findProject(identifier) {
+    const wanted = String(identifier).toLowerCase();
+    return [...this.tasks.values()].find(
+      (t) => t.type === 1 && (t.uuid === identifier || (t.title && t.title.toLowerCase() === wanted))
     );
+  }
+
+  getProject(projectIdentifier) {
+    const p = this.findProject(projectIdentifier);
     if (!p) return null;
 
-    const headings = Array.from(this.tasks.values())
+    const all = [...this.tasks.values()];
+    const headings = all
       .filter((t) => t.type === 2 && t.project === p.uuid && !t.trashed)
+      .sort((a, b) => (a.index || 0) - (b.index || 0))
       .map((h) => ({
         id: h.uuid,
         title: h.title,
-        tasks: Array.from(this.tasks.values())
-          .filter((t) => t.type === 0 && t.heading === h.uuid && !t.trashed)
-          .map((t) => this.formatTask(t)),
+        tasks: all.filter((t) => t.type === 0 && t.heading === h.uuid && !t.trashed).map((t) => this.formatTask(t)),
       }));
 
-    const ungroupedTasks = Array.from(this.tasks.values())
+    const ungroupedTasks = all
       .filter((t) => t.type === 0 && t.project === p.uuid && !t.heading && !t.trashed)
       .map((t) => this.formatTask(t));
 
@@ -1267,36 +1238,33 @@ export class ThingsDatabase {
       status: p.status === 3 ? "completed" : p.status === 2 ? "canceled" : "open",
       area: p.area ? this.areas.get(p.area)?.title || p.area : null,
       areaId: p.area || null,
-      deadline: decodeFADay(p.deadline),
-      scheduledDate: decodeFADay(p.startDate),
-      tags: p.tags || [],
+      deadline: p.deadline || null,
+      scheduledDate: p.startDate || null,
+      tags: this.tagTitles(p.tags),
       headings,
       ungroupedTasks,
     };
   }
 
   getAreas() {
-    return Array.from(this.areas.values()).map((a) => {
-      const projects = Array.from(this.tasks.values())
-        .filter((t) => t.type === 1 && t.area === a.uuid && t.status === 0 && !t.trashed)
-        .map((p) => ({ id: p.uuid, title: p.title }));
-      const openTasks = Array.from(this.tasks.values())
-        .filter((t) => t.type === 0 && t.area === a.uuid && !t.project && t.status === 0 && !t.trashed)
-        .map((t) => ({ id: t.uuid, title: t.title }));
-
+    return [...this.areas.values()].map((a) => {
+      const all = [...this.tasks.values()];
       return {
         id: a.uuid,
         title: a.title,
-        visible: a.visible !== 0,
-        tags: a.tags || [],
-        activeProjects: projects,
-        unprojectedTasks: openTasks,
+        tags: this.tagTitles(a.tags),
+        activeProjects: all
+          .filter((t) => t.type === 1 && t.area === a.uuid && t.status === 0 && !t.trashed)
+          .map((p) => ({ id: p.uuid, title: p.title })),
+        unprojectedTasks: all
+          .filter((t) => t.type === 0 && t.area === a.uuid && !this.projectIdOf(t) && t.status === 0 && this.isLive(t))
+          .map((t) => ({ id: t.uuid, title: t.title })),
       };
     });
   }
 
   getTags() {
-    return Array.from(this.tags.values()).map((t) => ({
+    return [...this.tags.values()].map((t) => ({
       id: t.uuid,
       title: t.title,
       shortcut: t.shortcut || null,
@@ -1306,77 +1274,65 @@ export class ThingsDatabase {
   }
 
   getTask(taskIdentifier) {
-    const t = Array.from(this.tasks.values()).find(
-      (task) => task.uuid === taskIdentifier || (task.title && task.title.toLowerCase() === taskIdentifier.toLowerCase())
-    );
-    if (!t) return null;
-    return this.formatTask(t);
+    const wanted = String(taskIdentifier).toLowerCase();
+    const t =
+      this.tasks.get(taskIdentifier) ||
+      [...this.tasks.values()].find((task) => task.title && task.title.toLowerCase() === wanted);
+    return t ? this.formatTask(t) : null;
   }
 
   search(query, { status = "open", includeNotes = true, area = null, project = null, tag = null } = {}) {
     const q = query.toLowerCase();
-    return Array.from(this.tasks.values())
+    return [...this.tasks.values()]
       .filter((t) => {
-        if (t.trashed) return false;
+        if (t.trashed || t.type === 2) return false;
         if (status === "open" && t.status !== 0) return false;
         if (status === "completed" && t.status !== 3) return false;
-
-        if (area && t.area !== area && this.areas.get(t.area)?.title !== area) return false;
-        if (project && t.project !== project && this.tasks.get(t.project)?.title !== project) return false;
-        if (tag && (!t.tags || !t.tags.includes(tag))) return false;
-
-        const matchTitle = t.title && t.title.toLowerCase().includes(q);
-        const matchNotes = includeNotes && t.notes && t.notes.toLowerCase().includes(q);
-        return matchTitle || matchNotes;
+        if (!this.matchesArea(t, area)) return false;
+        if (project) {
+          const pid = this.projectIdOf(t);
+          if (pid !== project && this.tasks.get(pid)?.title !== project) return false;
+        }
+        if (!this.matchesTag(t, tag)) return false;
+        return (t.title || "").toLowerCase().includes(q) || (includeNotes && (t.notes || "").toLowerCase().includes(q));
       })
       .map((t) => (t.type === 1 ? { ...this.formatTask(t), isProject: true } : this.formatTask(t)));
   }
 
   getDeadlines() {
-    const todayStr = new Date().toISOString().slice(0, 10);
-    const todayFADay = encodeFADay(todayStr);
-
-    const openItems = Array.from(this.tasks.values()).filter(
-      (t) => !t.trashed && t.status === 0 && t.deadline
-    );
-
+    const today = this.today();
+    const weekOut = addDays(today, 7);
     const overdue = [];
     const dueToday = [];
-    const dueSoon = []; // next 7 days
+    const dueSoon = [];
     const future = [];
 
-    const weekFromNowFADay = todayFADay + (7 << 7);
-
-    for (const t of openItems) {
+    for (const t of this.tasks.values()) {
+      if (!this.isLive(t) || t.status !== 0 || !t.deadline || t.type === 2) continue;
       const item = this.formatTask(t);
-      if (t.deadline < todayFADay) overdue.push(item);
-      else if (t.deadline === todayFADay) dueToday.push(item);
-      else if (t.deadline <= weekFromNowFADay) dueSoon.push(item);
+      if (t.deadline < today) overdue.push(item);
+      else if (t.deadline === today) dueToday.push(item);
+      else if (t.deadline <= weekOut) dueSoon.push(item);
       else future.push(item);
     }
 
-    return {
-      overdue: overdue.sort((a, b) => (a.deadline || "").localeCompare(b.deadline || "")),
-      dueToday,
-      dueSoon: dueSoon.sort((a, b) => (a.deadline || "").localeCompare(b.deadline || "")),
-      future: future.sort((a, b) => (a.deadline || "").localeCompare(b.deadline || "")),
-    };
+    const byDeadline = (a, b) => (a.deadline || "").localeCompare(b.deadline || "");
+    return { overdue: overdue.sort(byDeadline), dueToday, dueSoon: dueSoon.sort(byDeadline), future: future.sort(byDeadline) };
   }
 
   getDailySummary() {
-    const todayStr = new Date().toISOString().slice(0, 10);
-    const todayStartUnix = new Date(todayStr).getTime() / 1000;
-    const todayFADay = encodeFADay(todayStr);
+    const today = this.today();
+    const todos = [...this.tasks.values()].filter((t) => this.isLive(t) && t.type === 0);
 
-    const allTasks = Array.from(this.tasks.values()).filter((t) => !t.trashed && t.type === 0);
-
-    const completedToday = allTasks.filter((t) => t.status === 3 && t.stopDate && t.stopDate >= todayStartUnix).map((t) => this.formatTask(t));
-    const dueToday = allTasks.filter((t) => t.status === 0 && t.deadline === todayFADay).map((t) => this.formatTask(t));
-    const overdue = allTasks.filter((t) => t.status === 0 && t.deadline && t.deadline < todayFADay).map((t) => this.formatTask(t));
+    const completedToday = todos
+      .filter((t) => t.status === 3 && t.stopDate && localDate(this.timeZone, t.stopDate) === today)
+      .map((t) => this.formatTask(t));
+    const dueToday = todos.filter((t) => t.status === 0 && t.deadline === today).map((t) => this.formatTask(t));
+    const overdue = todos.filter((t) => t.status === 0 && t.deadline && t.deadline < today).map((t) => this.formatTask(t));
     const todayList = this.getToday();
 
     return {
-      date: todayStr,
+      date: today,
       todayAgendaCount: todayList.length,
       completedTodayCount: completedToday.length,
       overdueCount: overdue.length,
@@ -1390,24 +1346,18 @@ export class ThingsDatabase {
 
   exportMarkdown(target) {
     if (target === "today") {
-      const tasks = this.getToday();
-      let md = `# Today (${new Date().toISOString().slice(0, 10)})\n\n`;
-      for (const t of tasks) {
+      let md = `# Today (${this.today()})\n\n`;
+      for (const t of this.getToday()) {
         md += `- [ ] **${t.title}**${t.project ? ` (*${t.project}*)` : ""}${t.deadline ? ` — Due: ${t.deadline}` : ""}\n`;
         if (t.notes) md += `  > ${t.notes.replace(/\n/g, "\n  > ")}\n`;
-        if (t.checklist) {
-          for (const cl of t.checklist) {
-            md += `  - [${cl.status === "completed" ? "x" : " "}] ${cl.title}\n`;
-          }
-        }
+        for (const cl of t.checklist || []) md += `  - [${cl.status === "completed" ? "x" : " "}] ${cl.title}\n`;
       }
       return md;
     }
 
     if (target === "inbox") {
-      const tasks = this.getInbox();
       let md = `# Inbox\n\n`;
-      for (const t of tasks) {
+      for (const t of this.getInbox()) {
         md += `- [ ] **${t.title}**\n`;
         if (t.notes) md += `  > ${t.notes.replace(/\n/g, "\n  > ")}\n`;
       }
@@ -1415,65 +1365,38 @@ export class ThingsDatabase {
     }
 
     const project = this.getProject(target);
-    if (project) {
-      let md = `# ${project.title}\n`;
-      if (project.area) md += `*Area: ${project.area}*\n`;
-      if (project.deadline) md += `*Deadline: ${project.deadline}*\n`;
-      if (project.notes) md += `\n${project.notes}\n`;
-      md += `\n`;
+    if (!project) throw new Error(`Target not found for markdown export: ${target}`);
 
-      if (project.ungroupedTasks && project.ungroupedTasks.length) {
-        for (const t of project.ungroupedTasks) {
-          md += `- [${t.status === "completed" ? "x" : " "}] **${t.title}**\n`;
-          if (t.checklist) {
-            for (const cl of t.checklist) {
-              md += `  - [${cl.status === "completed" ? "x" : " "}] ${cl.title}\n`;
-            }
-          }
-        }
-        md += `\n`;
-      }
+    const lines = (t) => {
+      let out = `- [${t.status === "completed" ? "x" : " "}] **${t.title}**\n`;
+      for (const cl of t.checklist || []) out += `  - [${cl.status === "completed" ? "x" : " "}] ${cl.title}\n`;
+      return out;
+    };
 
-      for (const h of project.headings || []) {
-        md += `### ${h.title}\n`;
-        for (const t of h.tasks || []) {
-          md += `- [${t.status === "completed" ? "x" : " "}] **${t.title}**\n`;
-          if (t.checklist) {
-            for (const cl of t.checklist) {
-              md += `  - [${cl.status === "completed" ? "x" : " "}] ${cl.title}\n`;
-            }
-          }
-        }
-        md += `\n`;
-      }
-      return md;
-    }
-
-    throw new Error(`Target not found for markdown export: ${target}`);
+    let md = `# ${project.title}\n`;
+    if (project.area) md += `*Area: ${project.area}*\n`;
+    if (project.deadline) md += `*Deadline: ${project.deadline}*\n`;
+    if (project.notes) md += `\n${project.notes}\n`;
+    md += `\n`;
+    if (project.ungroupedTasks.length) md += project.ungroupedTasks.map(lines).join("") + "\n";
+    for (const h of project.headings) md += `### ${h.title}\n${h.tasks.map(lines).join("")}\n`;
+    return md;
   }
 
   getSettings() {
-    return {
-      groupTodayByParent: true,
-      logInterval: "daily",
-    };
+    return { groupTodayByParent: true, logInterval: "daily", timeZone: this.timeZone };
   }
 
   getDeepLink(id) {
-    const task = this.tasks.get(id);
-    const area = this.areas.get(id);
-    const title = task?.title || area?.title || id;
-    return {
-      id,
-      title,
-      url: `things:///show?id=${encodeURIComponent(id)}`,
-    };
+    const item = this.tasks.get(id) || this.areas.get(id) || this.tags.get(id);
+    if (!item) throw new Error(`No to-do, project, heading, area, or tag with id ${id}.`);
+    return { id, title: item.title, url: `things:///show?id=${encodeURIComponent(id)}` };
   }
 
   getStats() {
-    const allTasks = Array.from(this.tasks.values());
-    const todos = allTasks.filter((t) => t.type === 0 && !t.trashed);
-    const projects = allTasks.filter((t) => t.type === 1 && !t.trashed);
+    const all = [...this.tasks.values()];
+    const todos = all.filter((t) => t.type === 0 && this.isLive(t));
+    const projects = all.filter((t) => t.type === 1 && !t.trashed);
 
     return {
       totalTodos: todos.length,
@@ -1484,7 +1407,7 @@ export class ThingsDatabase {
       totalAreas: this.areas.size,
       totalTags: this.tags.size,
       totalChecklistItems: this.checklists.size,
-      trashedItems: allTasks.filter((t) => t.trashed === 1).length,
+      trashedItems: all.filter((t) => t.trashed).length,
     };
   }
 }

@@ -28,7 +28,10 @@ export class ThingsMCP extends McpAgent {
   }
 
   async init() {
-    const server = new McpServer(remoteServerInfo(this.env.CONNECTOR_BASE_URL || "https://things3mcp.org"));
+    const server = new McpServer(remoteServerInfo(this.env.CONNECTOR_BASE_URL || "https://things3mcp.org"), {
+      instructions:
+        "Things 3 to-dos. If a things-3 skill is available, load it before reading or changing data: it covers titles, scheduling, tags, reviews, and this server's quirks. Search before creating, tags must already exist, and never call things_empty_trash or permanent deletes without explicit confirmation.",
+    });
 
     // One client per session: it holds the synced database, so repeated tool calls reuse it
     // instead of re-downloading the whole history.

@@ -96,3 +96,16 @@ test("a capped history page does not skip the items after it", async () => {
   assert.equal(db.tasks.size, 5);
   assert.equal(db.latestServerIndex, 5);
 });
+
+test("Upcoming lists future start dates and deadlines, not undated Today items", () => {
+  const db = new ThingsDatabase("UTC");
+  const day = (n) => Math.floor(Date.now() / 86400000) * 86400 + n * 86400;
+  const task = (title, extra) => ({ t: 0, e: "Task6", p: { tt: title, tp: 0, ss: 0, st: 1, tr: false, ...extra } });
+  db.applyChangeMap({
+    TODAY: task("today only", { st: 1, sr: day(0), tir: day(0) }),
+    TODAYDL: task("today with deadline", { st: 1, sr: day(0), tir: day(0), dd: day(5) }),
+    LATER: task("scheduled", { st: 2, sr: day(3), tir: day(3) }),
+  });
+  const titles = db.getUpcoming().map((t) => t.title).sort();
+  assert.deepEqual(titles, ["scheduled", "today with deadline"]);
+});

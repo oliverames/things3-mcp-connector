@@ -240,7 +240,7 @@ export class ThingsMCP extends McpAgent {
       "things_get_upcoming",
       {
         title: "Get Upcoming To-Dos & Deadlines",
-        description: "Fetch upcoming scheduled to-dos and deadlines in Things 3 in chronological order.",
+        description: "Fetch to-dos with a future start date and to-dos with a deadline in the window, in chronological order. Matches Things' Upcoming list, so a to-do scheduled for today still appears when its deadline falls in the window.",
         inputSchema: {
           days: z.number().optional().default(14).describe("Number of days ahead to look (default: 14)"),
         },

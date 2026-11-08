@@ -1193,7 +1193,7 @@ export class ThingsDatabase {
       })
       .map((p) => {
         const todos = [...this.tasks.values()].filter((t) => t.type === 0 && !t.trashed && this.projectIdOf(t) === p.uuid);
-        const completed = todos.filter((t) => t.status === 3).length;
+        const completed = todos.filter((t) => t.status === 3 || t.status === 2).length; // canceled counts as done, as in Things
         return {
           id: p.uuid,
           title: p.title,
@@ -1373,7 +1373,7 @@ export class ThingsDatabase {
     if (!project) throw new Error(`Target not found for markdown export: ${target}`);
 
     const lines = (t) => {
-      let out = `- [${t.status === "completed" ? "x" : " "}] **${t.title}**\n`;
+      let out = t.status === "canceled" ? `- [x] ~~${t.title}~~\n` : `- [${t.status === "completed" ? "x" : " "}] **${t.title}**\n`;
       for (const cl of t.checklist || []) out += `  - [${cl.status === "completed" ? "x" : " "}] ${cl.title}\n`;
       return out;
     };

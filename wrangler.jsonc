@@ -29,8 +29,6 @@
   "vars": {
     "CONNECTOR_BASE_URL": "https://things3mcp.org",
     "USER_TIMEZONE": "America/New_York",
-    "MCP_ALLOWED_ORIGINS": "https://chatgpt.com,https://claude.ai,https://claude.com,https://chat.mistral.ai,https://lechat.mistral.ai",
-    "COOKIE_ENCRYPTION_KEY": "REMOVED_SECRET",
-    "DATA_ENCRYPTION_KEY": "REMOVED_SECRET"
+    "MCP_ALLOWED_ORIGINS": "https://chatgpt.com,https://claude.ai,https://claude.com,https://chat.mistral.ai,https://lechat.mistral.ai"
   }
 }

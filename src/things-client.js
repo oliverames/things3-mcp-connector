@@ -387,8 +387,13 @@ export class ThingsCloudClient {
     while (start < meta.latestServerIndex) {
       const page = await this.pullItems(start);
       for (const itemMap of page.items) db.applyChangeMap(itemMap);
-      if (page.currentItemIndex <= start) break;
-      start = page.currentItemIndex;
+      // current-item-index is the server head, not the end of this page: a long history comes back
+      // in capped pages, so advance by the number of items actually received.
+      if (page.items.length === 0) {
+        start = Math.max(start, page.currentItemIndex);
+        break;
+      }
+      start += page.items.length;
     }
 
     db.latestServerIndex = Math.max(start, db.latestServerIndex);

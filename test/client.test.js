@@ -81,3 +81,18 @@ test("the decoder reads versioned entities, short keys, and note patches", () =>
   assert.equal(db.getToday().length, 1);
   assert.throws(() => db.getDeepLink("missing"));
 });
+
+test("a capped history page does not skip the items after it", async () => {
+  // The server reports its head (5) as current-item-index but returns only 3 items per page.
+  const all = [1, 2, 3, 4, 5].map((n) => ({ [`T${n}`]: { t: 0, e: "Task6", p: { tt: `task ${n}`, tp: 0, ss: 0, st: 1, tr: false } } }));
+  const fetchImpl = async (url) => {
+    const json = (data) => new Response(JSON.stringify(data), { status: 200 });
+    if (String(url).endsWith("/history/KEY")) return json({ "latest-server-index": 5, "latest-schema-version": 301 });
+    const start = Number(new URL(url).searchParams.get("start-index"));
+    return json({ schema: 301, "current-item-index": 5, items: all.slice(start, start + 3) });
+  };
+  const client = new ThingsCloudClient({ email: "a@b.c", password: "pw", historyKey: "KEY", fetchImpl });
+  const db = await client.syncDatabase();
+  assert.equal(db.tasks.size, 5);
+  assert.equal(db.latestServerIndex, 5);
+});

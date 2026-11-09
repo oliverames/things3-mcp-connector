@@ -60,6 +60,11 @@ export class ThingsMCP extends McpAgent {
       return this._clientPromise;
     };
 
+    // Batches are one atomic commit: either every listed item was written, or the call fails and none were.
+    const batchSummary = (result, noun) =>
+      `Batch ${result.operation} committed atomically for ${result.count} ${noun} (all written together).\n` +
+      result.items.map((item) => `- ${item.title || "Untitled"} (${item.id}): ${item.result}`).join("\n");
+
     const textResult = (data) => ({
       content: [
         {
@@ -663,7 +668,7 @@ export class ThingsMCP extends McpAgent {
         inputSchema: {
           title: z.string().describe("Title of the to-do"),
           notes: z.string().optional().describe("Notes / Markdown description"),
-          when: z.enum(["inbox", "today", "tomorrow", "evening", "anytime", "someday"]).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional().default("inbox").describe("Where or when to schedule: 'inbox', 'today', 'tomorrow', 'evening', 'anytime', 'someday', or date 'YYYY-MM-DD'"),
+          when: z.enum(["inbox", "today", "tomorrow", "evening", "anytime", "someday"]).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional().describe("Where or when to schedule: 'inbox', 'today', 'tomorrow', 'evening', 'anytime', 'someday', or date 'YYYY-MM-DD'. Defaults to 'inbox', or 'anytime' when a project, heading, or area is given (those cannot be in the Inbox)."),
           reminder_time: z.string().regex(/^\d{1,2}:\d{2}$/).optional().describe("Time for reminder alert (e.g. '09:00', '14:30')"),
           deadline: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Due date / deadline (YYYY-MM-DD)"),
           project: z.string().optional().describe("UUID of parent project"),
@@ -1349,7 +1354,7 @@ export class ThingsMCP extends McpAgent {
           completionDate: completion_date,
           creationDate: creation_date,
         });
-        return textResult(`Batch ${operation} applied to ${result.count} to-dos.`);
+        return textResult(batchSummary(result, "to-dos"));
       }
     );
 
@@ -1494,7 +1499,7 @@ export class ThingsMCP extends McpAgent {
           completionDate: completion_date,
           creationDate: creation_date,
         });
-        return textResult(`Batch ${operation} applied to ${result.count} projects.`);
+        return textResult(batchSummary(result, "projects"));
       }
     );
 

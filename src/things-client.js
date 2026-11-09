@@ -146,38 +146,295 @@ export function generateUUID() {
 // Property keys that hold arrays of ids, and keys that hold unix-second timestamps.
 const ID_LIST_KEYS = ["pr", "agr", "ar", "tg", "ts", "rt", "dl", "pn"];
 const TIMESTAMP_KEYS = ["cd", "md", "sp", "lai"];
-const CALENDAR_DATE_KEYS = ["sr", "tir", "dd"];
+const CALENDAR_DATE_KEYS = ["sr", "tir", "dd", "icsd"];
 const LATEST_TIMESTAMP = 4102444800; // 2100-01-01; anything later is milliseconds or garbage
 
-// Throws before anything reaches Things Cloud if a change carries an id or date that the Things
-// apps cannot decode. Every write funnels through commitChanges, which calls this.
-export function validateChangeMap(body) {
-  const problems = [];
-  for (const [id, change] of Object.entries(body)) {
-    if (!isThingsId(id)) problems.push(`entity id "${id}" is not a Things id`);
-    if (![0, 1, 2].includes(change?.t)) problems.push(`${id}: change type ${change?.t} is not 0, 1, or 2`);
-    if (typeof change?.e !== "string" || !/^[A-Za-z]+\d+$/.test(change.e)) {
-      problems.push(`${id}: entity "${change?.e}" is not a versioned entity name`);
+// Entities and property keys the connector writes (Things 3.24.2 shapes). A key outside these is a
+// typo or an unverified shape, so it is refused instead of sent. Creates must carry every key.
+const ENTITY_KEYS = {
+  Task: ["tt", "nt", "tp", "ss", "sp", "tr", "st", "sb", "sr", "tir", "ato", "dd", "pr", "agr", "ar", "tg", "ix", "ti", "cd", "md", "dds", "rt", "rmd", "dl", "icp", "do", "lai", "lt", "icc", "icsd", "rp", "acrd", "rr", "xx"],
+  ChecklistItem: ["tt", "ss", "sp", "ix", "ts", "lt", "cd", "md", "xx"],
+  Area: ["tt", "tg", "ix", "xx", "md"],
+  Tag: ["tt", "sh", "pn", "ix", "xx", "md"],
+};
+const CREATE_OPTIONAL_KEYS = { Area: ["md"], Tag: ["md"] };
+const KNOWN_ENTITY_NAMES = new Set(Object.values(ENTITY));
+const entityFamily = (name) => String(name).replace(/\d+$/, "");
+
+// A repeating template may only change these; scheduling and rule keys belong to the Things apps.
+const TEMPLATE_SAFE_KEYS = new Set(["tt", "nt", "tg", "tr", "md", "pr", "agr", "ar", "ix"]);
+
+const isNum = (v) => typeof v === "number" && Number.isFinite(v);
+const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const sameKeys = (o, keys) => isPlainObject(o) && Object.keys(o).length === keys.length && keys.every((k) => k in o);
+
+// Things repeat rules (rr). Only the shapes Things 3.24.2 itself wrote are accepted (see
+// things-reminders-sync docs/RECURRENCE.md); this is a port of its ThingsRepeat.problems(in:).
+const RR_FAR_FUTURE = 64092211200;
+const RR_KEYS = ["fu", "fa", "of", "tp", "ia", "sr", "rc", "ts", "rrv", "ed"];
+const RR_UNITS = { 16: "daily", 256: "weekly", 8: "monthly", 4: "yearly" };
+const rrMidnight = (v) => (isNum(v) && v >= 0 && v <= RR_FAR_FUTURE && v % 86400 === 0 ? v : null);
+const inRange = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
+
+export function repeatRuleProblems(rr) {
+  if (!isPlainObject(rr)) return ["rr must be an object"];
+  const out = [];
+  const extra = Object.keys(rr).filter((k) => !RR_KEYS.includes(k));
+  if (extra.length) out.push(`unknown keys ${JSON.stringify(extra.sort())}`);
+  for (const key of RR_KEYS) if (key !== "ed" && !(key in rr)) out.push(`missing key ${key}`);
+  if (out.length) return out;
+
+  const freq = RR_UNITS[rr.fu];
+  if (!Number.isInteger(rr.fu) || !freq) return ["fu must be 16, 256, 8, or 4"];
+  if (!inRange(rr.fa, 1, 999)) out.push("fa must be an integer 1...999");
+  if (rr.tp !== 0 && rr.tp !== 1) return [...out, "tp must be 0 or 1"];
+  if (rr.rrv !== 4) out.push("rrv must be 4");
+  if (rr.ts !== 0) out.push("ts must be 0");
+  if (!Number.isInteger(rr.rc) || rr.rc < 0) return [...out, "rc must be an integer >= 0"];
+  if (rrMidnight(rr.sr) === null || rr.sr <= 0) out.push("sr must be a midnight-UTC day");
+  const ia = rrMidnight(rr.ia);
+  if (rr.tp === 1) {
+    if (ia !== 0) out.push("ia must be 0 for an after-completion rule");
+  } else if (ia === null || ia <= 0) out.push("ia must be a midnight-UTC day");
+  if (rr.rc > 0) {
+    if ("ed" in rr) out.push("ed must be absent when rc > 0");
+  } else if ("ed" in rr) {
+    if (rr.ed !== RR_FAR_FUTURE && rrMidnight(rr.ed) === null) out.push("ed must be 64092211200 or a midnight-UTC day");
+  } else out.push("ed is required when rc is 0");
+
+  if (!Array.isArray(rr.of)) return [...out, "of must be an array"];
+  if (rr.tp === 1) {
+    if (rr.of.length) out.push("of must be empty for an after-completion rule");
+  } else if (!rr.of.length) out.push("of must not be empty");
+  else out.push(...offsetProblems(rr.of, freq));
+  return out;
+}
+
+function offsetProblems(entries, freq) {
+  const wdoOK = (v) => v === -1 || inRange(v, 1, 5);
+  const wdOK = (v) => inRange(v, 0, 6);
+  const moOK = (v) => inRange(v, 0, 11);
+  const dyOK = (v) => v === -1 || inRange(v, 0, 30);
+  const unique = (list) => new Set(list).size === list.length;
+  const bad = ["of entry is not one of the observed shapes for this unit"];
+  const ok = [];
+  switch (freq) {
+    case "daily":
+      return entries.length === 1 && sameKeys(entries[0], ["dy"]) && entries[0].dy === 0 ? ok : bad;
+    case "weekly": {
+      const wds = entries.map((e) => (sameKeys(e, ["wd"]) ? e.wd : null));
+      return wds.every(wdOK) && unique(wds) ? ok : bad;
     }
-    const p = change?.p || {};
+    case "monthly": {
+      if (entries.length === 1 && sameKeys(entries[0], ["wdo", "wd"])) return wdoOK(entries[0].wdo) && wdOK(entries[0].wd) ? ok : bad;
+      const dys = entries.map((e) => (sameKeys(e, ["dy"]) ? e.dy : null));
+      return dys.every(dyOK) && unique(dys) ? ok : bad;
+    }
+    default: {
+      if (entries.length !== 1) return bad;
+      const e = entries[0];
+      if (sameKeys(e, ["dy", "mo"])) return dyOK(e.dy) && moOK(e.mo) ? ok : bad;
+      if (sameKeys(e, ["wdo", "mo", "wd"])) return wdoOK(e.wdo) && moOK(e.mo) && wdOK(e.wd) ? ok : bad;
+      return bad;
+    }
+  }
+}
+
+const NOTE_KEYS = ["_t", "ch", "v", "t"];
+const EMPTY_XX_KEYS = ["_t", "sn"];
+
+function noteProblems(nt) {
+  if (!sameKeys(nt, NOTE_KEYS)) return ["nt must be exactly {_t, ch, v, t}"];
+  const out = [];
+  if (nt._t !== "tx") out.push('nt._t must be "tx"');
+  if (nt.t !== 1) out.push("nt.t must be 1 (a full note)");
+  if (typeof nt.v !== "string") out.push("nt.v must be a string");
+  else if (nt.ch !== crc32(nt.v)) out.push(`nt.ch ${JSON.stringify(nt.ch)} is not the CRC-32 of the text (${crc32(nt.v)})`);
+  return out;
+}
+
+const xxOK = (xx) => sameKeys(xx, EMPTY_XX_KEYS) && xx._t === "oo" && isPlainObject(xx.sn) && !Object.keys(xx.sn).length;
+
+// Throws before anything reaches Things Cloud if a change carries an id, date, shape, or reference
+// that the Things apps cannot handle. Every write funnels through commitChanges, which calls this.
+// Without `db` only the shape of each change is checked; with it, references must resolve to live
+// entities of the right type (or be created in the same commit) and cross-field rules use the
+// merged state of each touched entity.
+export function validateChangeMap(body, db = null) {
+  const problems = [];
+  const entries = Object.entries(body);
+  for (const [id, change] of entries) {
+    const add = (msg) => problems.push(`${id}: ${msg}`);
+    if (!isThingsId(id)) problems.push(`entity id "${id}" is not a Things id`);
+    if (![0, 1, 2].includes(change?.t)) add(`change type ${change?.t} is not 0, 1, or 2`);
+    if (!KNOWN_ENTITY_NAMES.has(change?.e)) {
+      add(`entity "${change?.e}" is not one of ${[...KNOWN_ENTITY_NAMES].join(", ")}`);
+      continue;
+    }
+    if (!isPlainObject(change.p)) {
+      add("p must be an object");
+      continue;
+    }
+    const p = change.p;
+    const family = entityFamily(change.e);
+    if (change.t === 2) {
+      if (Object.keys(p).length) add("a delete must carry an empty p");
+      continue;
+    }
+    const allowed = ENTITY_KEYS[family];
+    for (const key of Object.keys(p)) {
+      if (!allowed.includes(key)) add(`unknown ${change.e} key "${key}"`);
+      else if (p[key] === undefined) add(`${key} is undefined and would be silently dropped`);
+    }
+    if (change.t === 0) {
+      const optional = CREATE_OPTIONAL_KEYS[family] || [];
+      for (const key of allowed) if (!(key in p) && !optional.includes(key)) add(`a create is missing ${key}`);
+    }
     for (const key of ID_LIST_KEYS) {
       if (!(key in p)) continue;
-      if (!Array.isArray(p[key])) problems.push(`${id}: ${key} must be an array of ids`);
-      else for (const ref of p[key]) if (!isThingsId(ref)) problems.push(`${id}: ${key} reference "${ref}" is not a Things id`);
+      if (!Array.isArray(p[key])) add(`${key} must be an array of ids`);
+      else for (const ref of p[key]) if (!isThingsId(ref)) add(`${key} reference "${ref}" is not a Things id`);
     }
     for (const key of [...TIMESTAMP_KEYS, ...CALENDAR_DATE_KEYS]) {
       const v = p[key];
       if (v === null || v === undefined) continue;
       if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > LATEST_TIMESTAMP) {
-        problems.push(`${id}: ${key} must be unix seconds, got ${JSON.stringify(v)}`);
+        add(`${key} must be unix seconds, got ${JSON.stringify(v)}`);
       } else if (CALENDAR_DATE_KEYS.includes(key) && v % 86400 !== 0) {
-        problems.push(`${id}: ${key} must be midnight UTC, got ${v}`);
+        add(`${key} must be midnight UTC, got ${v}`);
       }
     }
+    if ("tt" in p && typeof p.tt !== "string") add("tt must be a string");
+    if ("xx" in p && !xxOK(p.xx)) add('xx must be {"_t":"oo","sn":{}}');
+    if ("ix" in p && !isNum(p.ix)) add("ix must be a finite number");
+    if ("ss" in p && ![0, 2, 3].includes(p.ss)) add("ss must be 0, 2, or 3");
+    for (const key of ["lt", "tr"]) if (key in p && typeof p[key] !== "boolean") add(`${key} must be a boolean`);
+
+    if (family === "Task") {
+      // "No date" is null; 0 would be 1970-01-01.
+      for (const key of ["sr", "tir", "dd", "sp", "icsd", "ato"]) {
+        if (p[key] === 0) add(`${key} is 0; "no date" must be null`);
+      }
+      if ("ato" in p && p.ato !== null && !inRange(p.ato, 0, 86399)) add(`ato must be null or whole seconds after midnight, got ${JSON.stringify(p.ato)}`);
+      if ("tp" in p && ![0, 1, 2].includes(p.tp)) add("tp must be 0, 1, or 2");
+      if ("st" in p && ![0, 1, 2].includes(p.st)) add("st must be 0, 1, or 2");
+      if ("sb" in p && ![0, 1].includes(p.sb)) add("sb must be 0 or 1");
+      if ("nt" in p) for (const m of noteProblems(p.nt)) add(m);
+      if ("icc" in p && p.icc !== null && !inRange(p.icc, 0, Number.MAX_SAFE_INTEGER)) add("icc must be an integer >= 0");
+      if ("rr" in p && p.rr !== null) for (const m of repeatRuleProblems(p.rr)) add(`rr ${m}`);
+      for (const key of ["pr", "agr", "ar"]) if (Array.isArray(p[key]) && p[key].length > 1) add(`${key} may hold at most one id`);
+      if (typeof p.tt === "string" && typeof p.tt.isWellFormed === "function" && !p.tt.isWellFormed()) add("tt contains a lone surrogate");
+    } else if (family === "ChecklistItem") {
+      if ("ts" in p && !(Array.isArray(p.ts) && p.ts.length === 1)) add("a checklist item needs exactly one parent task in ts");
+      if ("sp" in p && "ss" in p && (p.ss === 0) !== (p.sp === null)) add("sp must be null exactly when ss is 0");
+      if ("nt" in p) add("a checklist item has no note");
+    } else if (family === "Tag" && "sh" in p && p.sh !== null && typeof p.sh !== "string") add("sh must be a string or null");
+    if ((family === "Area" || family === "Tag") && change.t === 0 && !p.tt) add("a new area or tag needs a title");
   }
-  if (problems.length) {
-    throw new Error(`Refusing to write data Things cannot decode:\n- ${problems.slice(0, 20).join("\n- ")}`);
+  if (problems.length) throw new Error(`Refusing to write data Things cannot decode:\n- ${problems.slice(0, 20).join("\n- ")}`);
+  if (db) validateAgainstDatabase(body, db);
+}
+
+// State-aware checks. `body` already passed the shape checks above.
+function validateAgainstDatabase(body, db) {
+  const problems = [];
+  const shadow = db.clone();
+  shadow.applyChangeMap(body);
+  const todayTs = dateToTimestamp(db.today());
+  const deleted = new Set();
+
+  for (const [id, change] of Object.entries(body)) {
+    const add = (msg) => problems.push(`${id}: ${msg}`);
+    const p = change.p;
+    const family = entityFamily(change.e);
+    const existing = db.entityOf(id);
+    if (change.t === 0 && existing) add("a create would overwrite an existing item");
+    if (change.t !== 0 && !existing) add(`${change.t === 1 ? "update" : "delete"} of an item that does not exist`);
+    if (existing && entityFamily(existing) !== family) add(`${change.e} does not match the existing ${existing}`);
+    if (change.t === 2) {
+      deleted.add(id);
+      continue;
+    }
+    const taskOf = (ref) => shadow.tasks.get(ref);
+    const refs = (key) => (Array.isArray(p[key]) ? p[key] : []);
+    const refMust = (key, ok, what) => {
+      for (const ref of refs(key)) if (!ok(ref)) add(`${key} reference ${ref} is not ${what}`);
+    };
+
+    if (family === "ChecklistItem") {
+      refMust("ts", (r) => taskOf(r)?.type === 0 && !taskOf(r).trashed, "an existing, untrashed to-do");
+      continue;
+    }
+    refMust("tg", (r) => shadow.tags.has(r), "an existing tag");
+    if (family === "Area") continue;
+    if (family === "Tag") {
+      refMust("pn", (r) => r !== id && shadow.tags.has(r), "an existing tag other than itself");
+      continue;
+    }
+
+    // Tasks, projects, and headings.
+    const t = shadow.tasks.get(id);
+    const before = db.tasks.get(id);
+    refMust("pr", (r) => taskOf(r)?.type === 1 && !taskOf(r).trashed, "an existing, untrashed project");
+    refMust("agr", (r) => taskOf(r)?.type === 2 && !taskOf(r).trashed, "an existing, untrashed heading");
+    refMust("ar", (r) => shadow.areas.has(r), "an existing area");
+    refMust("rt", (r) => Boolean(taskOf(r)?.recurrenceRule), "an existing repeating template");
+
+    if (change.t === 1 && before?.recurrenceRule) {
+      for (const key of Object.keys(p)) if (!TEMPLATE_SAFE_KEYS.has(key)) add(`${key} would change a repeating template; edit repeating to-dos in Things`);
+    }
+    if (change.t === 1 && before?.repeatingTemplates?.length) {
+      for (const key of ["rr", "rt", "tp"]) if (key in p) add(`${key} would change a repeating occurrence; edit repeating to-dos in Things`);
+    }
+
+    if (["pr", "agr", "ar", "tp"].some((k) => k in p) || change.t === 0) {
+      const heading = t.heading ? taskOf(t.heading) : null;
+      if (t.type === 0) {
+        if (t.area && (t.project || t.heading)) add("a to-do cannot be in both an area and a project");
+        if (heading && !heading.project) add(`heading ${t.heading} does not belong to a project`);
+        if (heading && t.project && heading.project !== t.project) add(`heading ${t.heading} belongs to project ${heading.project}, not ${t.project}`);
+      } else if (t.type === 1 && (t.project || t.heading)) add("a project cannot be inside a project or heading");
+      else if (t.type === 2 && (t.area || t.heading || !t.project)) add("a heading belongs to exactly one project and nothing else");
+    }
+
+    if (["st", "sr", "tp"].some((k) => k in p) && !t.recurrenceRule && typeof t.start === "number") {
+      const sr = t.startDate ? dateToTimestamp(t.startDate) : null;
+      if (t.type === 2 && t.start !== 1) add("a heading must have st 1");
+      if (sr !== null && sr > todayTs && t.start !== 2) add(`start date ${t.startDate} is in the future, so st must be 2 (got ${t.start})`);
+      if (sr !== null && sr <= todayTs && t.start === 2) add(`st 2 (someday) with start date ${t.startDate}, which is today or past, is inconsistent`);
+      if (t.start === 0 && sr !== null) add("an Inbox to-do (st 0) cannot have a start date");
+    }
+    if ("ato" in p && t.reminderSeconds !== null && t.reminderSeconds !== undefined && !t.startDate && !t.recurrenceRule) {
+      add("a reminder time needs a start date");
+    }
+    if (["st", "pr", "agr", "ar", "tp"].some((k) => k in p) && t.type === 0 && t.start === 0 && (t.project || t.heading || t.area)) {
+      add("a to-do in a project, heading, or area cannot be in the Inbox (st 0)");
+    }
+    if (("ss" in p || "sp" in p) && t.type !== undefined) {
+      const open = t.status === 0 || t.status === undefined;
+      if (open && t.stopDate) add("an open item cannot have a stop date (sp)");
+      if (!open && !t.stopDate) add("a completed or canceled item needs a stop date (sp)");
+    }
   }
+
+  // Deleting something that live items still point at leaves dangling references.
+  if (deleted.size) {
+    const dangling = (owner, what, list) => {
+      for (const ref of list || []) if (deleted.has(ref)) problems.push(`${owner}: ${what} still references deleted item ${ref}`);
+    };
+    for (const t of shadow.tasks.values()) {
+      dangling(t.uuid, "project", [t.project]);
+      dangling(t.uuid, "heading", [t.heading]);
+      dangling(t.uuid, "area", [t.area]);
+      dangling(t.uuid, "tag list", t.tags);
+      dangling(t.uuid, "repeat template", t.repeatingTemplates);
+    }
+    for (const c of shadow.checklists.values()) dangling(c.uuid, "parent task", [c.task]);
+    for (const a of shadow.areas.values()) dangling(a.uuid, "tag list", a.tags);
+    for (const g of shadow.tags.values()) dangling(g.uuid, "parent tag", [g.parent]);
+  }
+
+  if (problems.length) throw new Error(`Refusing to write data Things cannot handle:\n- ${problems.slice(0, 20).join("\n- ")}`);
 }
 
 // CRC-32 of the UTF-8 text; Things stores it as "ch" on note objects.
@@ -470,9 +727,14 @@ export class ThingsCloudClient {
     const response = await this.request(`${THINGS_CLOUD_BASE}/version/1/history/${this.historyKey}`, { method: "GET" });
     if (!response.ok) throw new Error(`Failed to fetch history metadata: ${response.status}`);
     const data = await response.json();
+    // A missing or malformed head must not read as "empty history": that would wipe the cache.
+    const head = data?.["latest-server-index"];
+    if (!Number.isInteger(head) || head < 0) {
+      throw new Error(`History metadata has no valid latest-server-index (got ${JSON.stringify(head)}); refusing to treat it as empty.`);
+    }
     return {
       historyKey: this.historyKey,
-      latestServerIndex: data["latest-server-index"] || 0,
+      latestServerIndex: head,
       latestSchemaVersion: data["latest-schema-version"] || SCHEMA_VERSION,
     };
   }
@@ -483,37 +745,54 @@ export class ThingsCloudClient {
     const response = await this.request(url, { method: "GET" });
     if (!response.ok) throw new Error(`Failed to pull history items: ${response.status}`);
     const data = await response.json();
+    if (!Array.isArray(data?.items) || !data.items.every(isPlainObject)) {
+      throw new Error(`History page at index ${startIndex} is malformed (items is not a list of change maps).`);
+    }
     return {
       schema: data.schema,
       currentItemIndex: data["current-item-index"] || 0,
-      items: data.items || [],
+      items: data.items,
     };
   }
 
+  // Every change map from `start` up to the server head, in order. current-item-index is the server
+  // head, not the end of a page: a long history comes back in capped pages, so advance by the
+  // number of items received. A page with no items before the head fails closed instead of ending
+  // the sync, which would mark data as read that never arrived.
+  async pullRange(start, head) {
+    const all = [];
+    while (start < head) {
+      const page = await this.pullItems(start);
+      if (page.items.length === 0) {
+        throw new Error(`History page at index ${start} was empty although the server head is ${head}; sync aborted.`);
+      }
+      all.push(...page.items);
+      start += page.items.length;
+    }
+    return all;
+  }
+
   // Cached database. Within CACHE_TTL_MS it costs no requests; after that it asks for the head
-  // index (one request) and pulls only items added since the last sync.
+  // index (one request) and pulls only items added since the last sync. New items are applied to
+  // a copy that replaces the cache only when the whole pull succeeded.
   async syncDatabase({ force = false } = {}) {
     if (!force && this._db && Date.now() - this._dbCheckedAt < CACHE_TTL_MS) return this._db;
 
     const meta = await this.getHistoryMetadata();
-    if (this._db && meta.latestServerIndex < this._db.latestServerIndex) this._db = null; // history was reset
-    if (!this._db) this._db = new ThingsDatabase(this.timeZone);
-    const db = this._db;
-
-    let start = db.latestServerIndex;
-    while (start < meta.latestServerIndex) {
-      const page = await this.pullItems(start);
-      for (const itemMap of page.items) db.applyChangeMap(itemMap);
-      // current-item-index is the server head, not the end of this page: a long history comes back
-      // in capped pages, so advance by the number of items actually received.
-      if (page.items.length === 0) {
-        start = Math.max(start, page.currentItemIndex);
-        break;
-      }
-      start += page.items.length;
+    let base = this._db;
+    if (base && meta.latestServerIndex < base.latestServerIndex) {
+      // The head went backwards. A real history reset is rebuilt from scratch below; a head of 0
+      // after we held data is far more likely a bad response, so fail closed.
+      if (meta.latestServerIndex === 0) throw new Error("History head is 0 although a synced history was cached; refusing to discard it.");
+      base = null;
     }
+    const db = base ? base.clone() : new ThingsDatabase(this.timeZone);
 
-    db.latestServerIndex = Math.max(start, db.latestServerIndex);
+    const itemMaps = await this.pullRange(db.latestServerIndex, meta.latestServerIndex);
+    for (const itemMap of itemMaps) db.applyChangeMap(itemMap);
+    db.latestServerIndex = Math.max(db.latestServerIndex + itemMaps.length, meta.latestServerIndex);
+
+    this._db = db;
     this._dbCheckedAt = Date.now();
     return db;
   }
@@ -522,52 +801,106 @@ export class ThingsCloudClient {
     this._dbCheckedAt = 0;
   }
 
+  // Did a commit whose outcome we never saw (5xx, dropped connection) land? Reads the history
+  // after `ancestor` and looks for every key of the body with the same change type. Returns true,
+  // false, or null when the history cannot be read either.
+  async commitLanded(body, ancestor) {
+    try {
+      const head = (await this.getHistoryMetadata()).latestServerIndex;
+      const seen = new Set();
+      for (const itemMap of await this.pullRange(ancestor, head)) {
+        for (const [id, ch] of Object.entries(body)) if (itemMap[id]?.t === ch.t) seen.add(id);
+      }
+      return seen.size === Object.keys(body).length;
+    } catch {
+      return null;
+    }
+  }
+
   // Things Cloud takes the changes inside the commit request itself: one POST whose body maps
   // each UUID to its change. (The separate /stage endpoint is only for oversized objects.)
+  // The body, and so every minted id, is built once: every retry resends the same ids, and a
+  // commit of unknown outcome is checked against the history before anything is resent, so a
+  // retry cannot duplicate a create. All changes in one call land together or not at all.
   async commitChanges(changes) {
     const body = {};
     for (const change of changes) Object.assign(body, change);
     if (!Object.keys(body).length) return { serverHeadIndex: null };
-    validateChangeMap(body);
 
     await this.ensureHistoryKey();
-    // A fresh cached database already knows the head index, so a write costs one request.
-    let ancestor =
-      this._db && Date.now() - this._dbCheckedAt < CACHE_TTL_MS ? this._db.latestServerIndex : null;
+    let db = await this.syncDatabase();
+    validateChangeMap(body, db);
+    const payload = JSON.stringify(body);
+    let ancestor = db.latestServerIndex;
+
+    // After a 409/412 or a verified miss, re-read the head and re-validate against the fresh state.
+    const refresh = async () => {
+      this.invalidateCache();
+      db = await this.syncDatabase({ force: true });
+      validateChangeMap(body, db);
+      ancestor = db.latestServerIndex;
+    };
 
     for (let attempt = 0; ; attempt++) {
-      if (ancestor === null) ancestor = (await this.getHistoryMetadata()).latestServerIndex;
       const url = `${THINGS_CLOUD_BASE}/version/1/history/${this.historyKey}/commit?ancestor-index=${ancestor}&_cnt=1`;
-      const res = await this.request(url, {
-        method: "POST",
-        headers: {
-          Schema: String(SCHEMA_VERSION),
-          "App-Id": APP_ID,
-          "App-Instance-Id": APP_INSTANCE_ID,
-          "Push-Priority": String(PUSH_PRIORITY),
-        },
-        body: JSON.stringify(body),
-      });
-      if (res.ok) {
+      let res = null;
+      let netError = null;
+      try {
+        res = await this.request(url, {
+          method: "POST",
+          headers: {
+            Schema: String(SCHEMA_VERSION),
+            "App-Id": APP_ID,
+            "App-Instance-Id": APP_INSTANCE_ID,
+            "Push-Priority": String(PUSH_PRIORITY),
+          },
+          body: payload,
+        });
+      } catch (err) {
+        netError = err;
+      }
+
+      if (res?.ok) {
         const data = await res.json().catch(() => ({}));
         const head = data["server-head-index"] ?? null;
         if (this._db && head === ancestor + 1 && this._db.latestServerIndex === ancestor) {
           // Only our commit landed since the last sync: apply it locally instead of re-pulling.
-          this._db.applyChangeMap(body);
-          this._db.latestServerIndex = head;
+          const next = this._db.clone();
+          next.applyChangeMap(JSON.parse(payload));
+          next.latestServerIndex = head;
+          this._db = next;
           this._dbCheckedAt = Date.now();
         } else {
           this.invalidateCache();
         }
         return { serverHeadIndex: head };
       }
-      // The index was stale (another client committed): fetch the real head and retry once.
-      if ((res.status === 409 || res.status === 412) && attempt < 1) {
-        ancestor = null;
-        this.invalidateCache();
+
+      // The index was stale (another client committed): nothing was written. Retry with the real head.
+      if (res && (res.status === 409 || res.status === 412) && attempt < 2) {
+        await refresh();
         continue;
       }
-      throw new Error(`Commit failed: ${res.status} ${await res.text()}`);
+
+      // 5xx or a dropped connection: the commit may or may not have been applied. Check before resending.
+      if (!res || res.status >= 500) {
+        const detail = res ? `${res.status} ${await res.text().catch(() => "")}` : `network error: ${netError?.message}`;
+        const landed = await this.commitLanded(body, ancestor);
+        this.invalidateCache();
+        if (landed === true) return { serverHeadIndex: null, recoveredAfterError: detail };
+        if (landed === false && attempt < 2) {
+          await refresh();
+          continue;
+        }
+        throw new Error(
+          landed === false
+            ? `Commit failed (${detail}); the history shows it was NOT applied.`
+            : `Commit failed (${detail}) and the history could not be read to check: the changes MAY have been applied. Re-read Things before retrying.`
+        );
+      }
+
+      this.invalidateCache();
+      throw new Error(`Commit failed (${res.status}); nothing was written. ${await res.text().catch(() => "")}`.trim());
     }
   }
 
@@ -587,7 +920,7 @@ export class ThingsCloudClient {
   async createTodo({
     title,
     notes = "",
-    when = "inbox",
+    when = undefined,
     reminderTime = null,
     deadline = null,
     project = null,
@@ -604,6 +937,8 @@ export class ThingsCloudClient {
     const db = await this.syncDatabase();
     const taskUUID = generateUUID();
     const now = toUnixTimestamp();
+    // A to-do in a project, heading, or area cannot sit in the Inbox; default to Anytime there.
+    if (when === undefined || when === null) when = project || heading || area ? "anytime" : "inbox";
 
     let ss = status;
     if (completed === true) ss = 3;
@@ -764,6 +1099,10 @@ export class ThingsCloudClient {
     if (updates.trashed !== undefined) p.tr = Boolean(updates.trashed);
     if (updates.type !== undefined) p.tp = updates.type;
 
+    // Moving an Inbox to-do into a project, heading, or area takes it out of the Inbox.
+    const movedIn = [p.pr, p.agr, p.ar].some((ids) => ids && ids.length);
+    if (movedIn && p.st === undefined && existing?.type === 0 && existing.start === 0) Object.assign(p, { st: 1, sb: 0 });
+
     return p;
   }
 
@@ -779,12 +1118,48 @@ export class ThingsCloudClient {
     return this.updateTodo(uuid, { trashed: true });
   }
 
+  // Tombstones for `ids` plus everything that would otherwise be left pointing at them: checklist
+  // items, headings, and trashed children of a purged project or heading, and tag or area
+  // references on items that stay. Live children of a purged project are left alone; the
+  // validator then refuses the commit and names them.
+  purgeChanges(db, ids) {
+    const purge = new Set(ids);
+    const now = toUnixTimestamp();
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const t of db.tasks.values()) {
+        if (purge.has(t.uuid) || !(purge.has(t.project) || purge.has(t.heading))) continue;
+        if (t.type === 2 || t.trashed) {
+          purge.add(t.uuid);
+          grew = true;
+        }
+      }
+    }
+    for (const c of db.checklists.values()) if (purge.has(c.task)) purge.add(c.uuid);
+
+    const changes = [...purge].map((id) => ({ [id]: { t: 2, e: db.entityOf(id), p: {} } }));
+    const keep = (list) => (list || []).filter((id) => !purge.has(id));
+    for (const t of db.tasks.values()) {
+      if (purge.has(t.uuid)) continue;
+      const p = {};
+      if ((t.tags || []).some((id) => purge.has(id))) p.tg = keep(t.tags);
+      if (purge.has(t.area)) p.ar = [];
+      if (Object.keys(p).length) changes.push({ [t.uuid]: { t: 1, e: ENTITY.task, p: { ...p, md: now } } });
+    }
+    for (const a of db.areas.values()) {
+      if (!purge.has(a.uuid) && (a.tags || []).some((id) => purge.has(id))) changes.push({ [a.uuid]: { t: 1, e: ENTITY.area, p: { tg: keep(a.tags), md: now } } });
+    }
+    for (const g of db.tags.values()) {
+      if (!purge.has(g.uuid) && purge.has(g.parent)) changes.push({ [g.uuid]: { t: 1, e: ENTITY.tag, p: { pn: [], md: now } } });
+    }
+    return changes;
+  }
+
   // Permanently remove an item. The entity name is taken from the database.
   async deleteEntity(uuid) {
     const db = await this.syncDatabase();
-    const entity = db.entityOf(uuid);
-    if (!entity) throw new Error(`No item with id ${uuid}.`);
-    await this.commitChanges([{ [uuid]: { t: 2, e: entity, p: {} } }]);
+    if (!db.entityOf(uuid)) throw new Error(`No item with id ${uuid}.`);
+    await this.commitChanges(this.purgeChanges(db, [uuid]));
     return { id: uuid, deleted: true };
   }
 
@@ -868,18 +1243,12 @@ export class ThingsCloudClient {
     const changes = [];
     const now = toUnixTimestamp();
 
-    if (deleteContents) {
-      for (const t of db.tasks.values()) {
-        if (t.area === uuid && !t.trashed) {
-          changes.push({ [t.uuid]: { t: 1, e: ENTITY.task, p: { tr: true, md: now } } });
-        }
-      }
-    } else {
-      for (const t of db.tasks.values()) {
-        if (t.area === uuid) {
-          changes.push({ [t.uuid]: { t: 1, e: ENTITY.task, p: { ar: [], md: now } } });
-        }
-      }
+    // Items always lose the reference to the deleted area; with deleteContents they are trashed too.
+    for (const t of db.tasks.values()) {
+      if (t.area !== uuid) continue;
+      const p = { ar: [], md: now };
+      if (deleteContents && !t.trashed) p.tr = true;
+      changes.push({ [t.uuid]: { t: 1, e: ENTITY.task, p } });
     }
 
     changes.push({ [uuid]: { t: 2, e: ENTITY.area, p: {} } });
@@ -923,7 +1292,7 @@ export class ThingsCloudClient {
   async deleteTag(uuid) {
     const db = await this.syncDatabase();
     if (!db.tags.has(uuid)) throw new Error(`No tag with id ${uuid}.`);
-    await this.commitChanges([{ [uuid]: { t: 2, e: ENTITY.tag, p: {} } }]);
+    await this.commitChanges(this.purgeChanges(db, [uuid]));
     return { id: uuid, deleted: true };
   }
 
@@ -1024,7 +1393,7 @@ export class ThingsCloudClient {
     const db = await this.syncDatabase();
     const trashed = [...db.tasks.values()].filter((t) => t.trashed);
     if (!trashed.length) return { purgedCount: 0 };
-    await this.commitChanges(trashed.map((t) => ({ [t.uuid]: { t: 2, e: ENTITY.task, p: {} } })));
+    await this.commitChanges(this.purgeChanges(db, trashed.map((t) => t.uuid)));
     return { purgedCount: trashed.length };
   }
 
@@ -1045,7 +1414,7 @@ export class ThingsCloudClient {
 
     const checklistItems = db.checklistItemsFor(uuid);
     const now = toUnixTimestamp();
-    const changes = [{ [uuid]: { t: 1, e: ENTITY.task, p: { tp: 1, md: now } } }];
+    const changes = [{ [uuid]: { t: 1, e: ENTITY.task, p: { tp: 1, pr: [], agr: [], md: now } } }];
 
     checklistItems.forEach((item, idx) => {
       const todo = buildTaskCreate({
@@ -1067,7 +1436,9 @@ export class ThingsCloudClient {
 
   // Import Things JSON (https://culturedcode.com/things/support/articles/2803573/).
   async importJson(payload) {
-    const db = await this.syncDatabase();
+    // Later items resolve titles of earlier ones, so created items are applied to a copy of the
+    // cache. A refused or failed commit then leaves the cached database untouched.
+    const db = (await this.syncDatabase()).clone();
     const items = Array.isArray(payload) ? payload : [payload];
     const now = toUnixTimestamp();
     const changes = [];
@@ -1104,6 +1475,16 @@ export class ThingsCloudClient {
         }
       }
     };
+    // Nothing may be dropped silently: an entry this importer cannot write is an error, not a no-op.
+    for (const item of items) {
+      if (!isPlainObject(item)) throw new Error("Each import entry must be an object with a type and attributes.");
+      if (!["to-do", "project", undefined].includes(item.type)) throw new Error(`Unsupported top-level type "${item.type}"; use "to-do" or "project".`);
+      for (const sub of item.attributes?.items || []) {
+        if (!isPlainObject(sub) || !["to-do", "heading", undefined].includes(sub.type)) {
+          throw new Error(`Unsupported project child type "${sub?.type}"; use "to-do" or "heading".`);
+        }
+      }
+    }
     rejectCallerIds(items, "Item");
     for (const item of items) rejectCallerIds(item.attributes?.items, "Project child");
 
@@ -1287,52 +1668,54 @@ export class ThingsCloudClient {
     return this.updateTodo(taskUUID, { tags: (task.tags || []).filter((id) => !remove.has(id)) });
   }
 
+  // One commit: every item lands or none does. The result lists each item so the caller can see
+  // exactly what was written; any unknown id refuses the whole batch and names every bad id.
   async batchUpdateTodos(uuids, operation, options = {}) {
+    if (operation === "reschedule" && !options.when) throw new Error('Operation "reschedule" needs "when".');
+    if (operation === "set_dates" && !(options.deadline || options.completionDate || options.completion_date || options.creationDate || options.creation_date)) {
+      throw new Error('Operation "set_dates" needs deadline, completion_date, or creation_date.');
+    }
     const db = await this.syncDatabase();
-    const now = toUnixTimestamp();
-    const changes = [];
-
-    for (const uuid of uuids) {
-      if (!db.tasks.has(uuid)) throw new Error(`Task not found: ${uuid}`);
-      const patch = this.buildTaskPatch(db, {
+    return this.commitBatch(db, uuids, operation, "Task", (uuid) => db.tasks.has(uuid), (uuid, now) =>
+      this.buildTaskPatch(db, {
         __uuid: uuid,
         status: operation === "complete" ? "completed" : operation === "cancel" ? "canceled" : undefined,
         trashed: operation === "trash" ? true : undefined,
-        when: operation === "reschedule" ? options.when : options.when,
+        when: options.when,
         deadline: options.deadline,
         completionDate: options.completionDate || options.completion_date,
         creationDate: options.creationDate || options.creation_date,
-      }, now);
-      changes.push({ [uuid]: { t: 1, e: ENTITY.task, p: patch } });
-    }
-
-    await this.commitChanges(changes);
-    return { count: uuids.length, operation, updated: true };
+      }, now)
+    );
   }
 
   async batchUpdateProjects(uuids, operation, options = {}) {
+    if (operation === "reschedule" && !options.when) throw new Error('Operation "reschedule" needs "when".');
+    if (operation === "set_area" && !options.area) throw new Error('Operation "set_area" needs "area".');
     const db = await this.syncDatabase();
-    const now = toUnixTimestamp();
-    const changes = [];
-
-    for (const uuid of uuids) {
-      const p = db.tasks.get(uuid);
-      if (!p || p.type !== 1) throw new Error(`Project not found: ${uuid}`);
-      const patch = this.buildTaskPatch(db, {
+    return this.commitBatch(db, uuids, operation, "Project", (uuid) => db.tasks.get(uuid)?.type === 1, (uuid, now) =>
+      this.buildTaskPatch(db, {
         __uuid: uuid,
         status: operation === "complete" ? "completed" : operation === "cancel" ? "canceled" : undefined,
         trashed: operation === "trash" ? true : undefined,
-        when: operation === "reschedule" ? options.when : options.when,
-        area: operation === "set_area" ? options.area : options.area,
+        when: options.when,
+        area: options.area,
         deadline: options.deadline,
         completionDate: options.completionDate || options.completion_date,
         creationDate: options.creationDate || options.creation_date,
-      }, now);
-      changes.push({ [uuid]: { t: 1, e: ENTITY.task, p: patch } });
-    }
+      }, now)
+    );
+  }
 
+  async commitBatch(db, uuids, operation, label, exists, patchFor) {
+    const ids = [...new Set(uuids)];
+    const missing = ids.filter((uuid) => !exists(uuid));
+    if (missing.length) throw new Error(`${label} not found: ${missing.join(", ")}. Nothing was written.`);
+    const now = toUnixTimestamp();
+    const changes = ids.map((uuid) => ({ [uuid]: { t: 1, e: ENTITY.task, p: patchFor(uuid, now) } }));
     await this.commitChanges(changes);
-    return { count: uuids.length, operation, updated: true };
+    const items = ids.map((id) => ({ id, title: db.tasks.get(id)?.title || null, result: "updated" }));
+    return { count: ids.length, operation, updated: true, items };
   }
 
   async importCsv(csvText, { defaultProject = null, defaultArea = null } = {}) {
@@ -1474,6 +1857,17 @@ export class ThingsDatabase {
 
   today() {
     return localDate(this.timeZone);
+  }
+
+  // Entities are replaced, never mutated, so copying the maps is enough for an independent copy.
+  clone() {
+    const copy = new ThingsDatabase(this.timeZone);
+    copy.tasks = new Map(this.tasks);
+    copy.areas = new Map(this.areas);
+    copy.tags = new Map(this.tags);
+    copy.checklists = new Map(this.checklists);
+    copy.latestServerIndex = this.latestServerIndex;
+    return copy;
   }
 
   applyChangeMap(changeMap) {

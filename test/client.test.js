@@ -17,12 +17,14 @@ import {
 
 function fakeCloud({ head = 10 } = {}) {
   const calls = [];
+  // A server at head N serves N history items; filler tags keep the pull consistent with the head.
+  const filler = Array.from({ length: head }, () => ({ [generateUUID()]: { t: 0, e: "Tag4", p: { tt: "filler", ix: 0 } } }));
   const fetchImpl = async (url, init = {}) => {
     calls.push({ url: String(url), method: init.method, headers: init.headers, body: init.body });
     const json = (data, status = 200) => new Response(JSON.stringify(data), { status });
     if (String(url).includes("/commit")) return json({ "server-head-index": head + 1 });
     if (String(url).endsWith("/history/KEY")) return json({ "latest-server-index": head, "latest-schema-version": 301 });
-    if (String(url).includes("/items")) return json({ schema: 301, "current-item-index": head, items: [] });
+    if (String(url).includes("/items")) return json({ schema: 301, "current-item-index": head, items: filler.slice(Number(new URL(url).searchParams.get("start-index"))) });
     throw new Error(`unexpected ${url}`);
   };
   return { calls, fetchImpl };

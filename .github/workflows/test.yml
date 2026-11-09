@@ -1,0 +1,28 @@
+name: test
+
+on:
+  push:
+    paths:
+      - "src/**"
+      - "test/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/test.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "test/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/test.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # The tests import only src/things-client.js, which has no dependencies, so no install step.
+      - run: npm test

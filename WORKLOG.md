@@ -1,5 +1,19 @@
 # Things MCP connector worklog
 
+## 2026-11-09 - Write hardening: state-aware validator, safe commit path, fail-closed reads (not deployed)
+
+**What changed**: `validateChangeMap(body, db)` now also checks shapes and state, and `commitChanges` runs it against the synced database on every write (and again after a 409/412 re-sync). It refuses unknown entity names and property keys (only `Task6`, `ChecklistItem3`, `Tag4`, `Area3`), dropped `undefined` values, partial creates, and a 0 in `sr`/`tir`/`dd`/`sp`/`icsd`/`ato` ("no date" is `null`). It checks notes (`ch` is the CRC-32), checklist items (the Things 3.24.2 shape, exactly one live parent), `st` against `sr` (future needs 2, today's with 2 is refused, headings use 1, Inbox has no date or container), `ss` against `sp`, and every reference (`pr`, `agr`, `ar`, `tg`, `ts`, `rt`, `pn`) for existence, type, and trash state. A to-do cannot be in both an area and a project, and a heading must belong to the project. Repeat rules use a port of `ThingsRepeat.problems(in:)`; templates accept only title, notes, tags, trash, and container edits, and occurrences refuse `rr`, `rt`, `tp`. Deleting something that live items still reference is refused, and the delete tools now cascade (checklist items, headings, trashed children, tag and area references).
+
+**Commit path**: the body and its ids are built once and resent unchanged. 409/412 retry up to twice after re-reading the head. A 5xx or dropped connection is checked against the history before anything is resent: if it landed it is reported as done, if not it is resent once, if the history is unreadable the error says the outcome is unknown. 4xx says nothing was written. Batch tools are one atomic commit and return per-item results; a bad id names every bad id and writes nothing. `import_json` works on a copy of the cache, so a refused commit no longer leaves ghost entities in it, and it refuses entry types it cannot write instead of skipping them.
+
+**Read path**: history paging advances by items received; an empty or malformed page, a missing or non-integer head, or a head of 0 after a synced history fails closed. A pull is applied to a copy and swapped in only when complete.
+
+**Behavior changes**: `add_todo` with a project, heading, or area defaults to Anytime (it used to default to the Inbox, a state Things does not use for filed to-dos); moving an Inbox to-do into a container takes it out of the Inbox; converting a to-do to a project clears its project and heading. A reminder at exactly 00:00 is refused (`ato` 0 reads as "no date"). CI: `.github/workflows/test.yml` runs `npm test` on path-scoped pushes and PRs.
+
+**Verification**: `npm test` (mocked fetch only, no live calls). Not deployed, not committed.
+
+---
+
 ## 2026-11-09 - Things 3.24 crashed on ids the connector minted; ids and dates now validated
 
 **What happened**: Things 3.24.2 beta on the Mac crashed on launch in `LegacySCHistoryPerformSync` (precondition in `decodeBase58String`, entity `Task7`). Things ids are a 16-byte UUID in Bitcoin-style base58 (leading zero bytes become leading "1"s), and the app decodes each into a 16-byte buffer. `generateUUID()` produced 22 random base58 characters, which need 17 bytes about 45% of the time: values above 2^128, or a leading "1". All 2,077 native keys in the history decode to exactly 16 bytes; 689 connector-era keys did not. Earlier oversized ids were test items created and deleted before the Mac pulled them, so they collapsed away. Today's BCBS import left 135 live items with bad ids, starting with the "BCBS VT" area at history index 1154. The Mac's cursor was 1153.

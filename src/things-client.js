@@ -40,6 +40,18 @@ export function dateToTimestamp(dateStr) {
   return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) / 1000;
 }
 
+// ISO 8601 string, Date, or unix timestamp -> unix seconds.
+export function parseIsoDate(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "number") return value;
+  if (value instanceof Date) return value.getTime() / 1000;
+  const ms = Date.parse(value);
+  if (Number.isNaN(ms)) {
+    throw new Error(`Invalid ISO 8601 date "${value}".`);
+  }
+  return ms / 1000;
+}
+
 export function timestampToDate(ts) {
   if (ts === null || ts === undefined) return null;
   return new Date(ts * 1000).toISOString().slice(0, 10);
@@ -179,10 +191,33 @@ export function buildTaskCreate({
   area = null,
   tags = [],
   status = 0,
+  creationDate = null,
+  completionDate = null,
   now = toUnixTimestamp(),
   timeZone,
 }) {
   const sched = withReminder(schedulingFields(when, timeZone), reminderTime, timeZone);
+
+  let ss = 0;
+  if (typeof status === "number") ss = status;
+  else if (status === "completed") ss = 3;
+  else if (status === "canceled") ss = 2;
+
+  let cd = now;
+  if (creationDate !== null && creationDate !== undefined) {
+    const parsedCd = parseIsoDate(creationDate);
+    if (parsedCd <= now) cd = parsedCd;
+  }
+
+  let sp = null;
+  if (ss === 3 || ss === 2) {
+    sp = now;
+    if (completionDate !== null && completionDate !== undefined) {
+      const parsedComp = parseIsoDate(completionDate);
+      if (parsedComp <= now) sp = parsedComp;
+    }
+  }
+
   return {
     t: 0,
     e: ENTITY.task,
@@ -190,8 +225,8 @@ export function buildTaskCreate({
       tt: title,
       nt: noteObject(notes),
       tp: type,
-      ss: status,
-      sp: status === 0 ? null : now,
+      ss,
+      sp,
       tr: false,
       st: sched.st,
       sb: sched.sb,
@@ -206,7 +241,7 @@ export function buildTaskCreate({
       tg: tags,
       ix: 0,
       ti: 0,
-      cd: now,
+      cd,
       md: now,
       // Defaults Things writes on every new task.
       dds: null,
@@ -521,16 +556,31 @@ export class ThingsCloudClient {
 
   // Build the property patch for an update. Throws on unknown references or bad dates.
   buildTaskPatch(db, updates, now = toUnixTimestamp()) {
-    const p = { md: now, ...statusFields(updates.status, now) };
+    const existing = updates.__uuid ? db.tasks.get(updates.__uuid) : null;
+    let statusArg = updates.status;
+    if (updates.completed === true) statusArg = "completed";
+    else if (updates.canceled === true) statusArg = "canceled";
+    else if (updates.completed === false && statusArg === undefined && existing?.status === 3) statusArg = "open";
+    else if (updates.canceled === false && statusArg === undefined && existing?.status === 2) statusArg = "open";
+
+    const p = { md: now, ...statusFields(statusArg, now) };
 
     if (updates.title !== undefined) p.tt = updates.title;
     if (updates.notes !== undefined) p.nt = noteObject(updates.notes);
+    else if (updates["append-notes"] || updates.appendNotes || updates["prepend-notes"] || updates.prependNotes) {
+      let baseNotes = existing?.notes || "";
+      const prepend = updates["prepend-notes"] ?? updates.prependNotes;
+      const append = updates["append-notes"] ?? updates.appendNotes;
+      if (prepend) baseNotes = prepend + baseNotes;
+      if (append) baseNotes = baseNotes + append;
+      p.nt = noteObject(baseNotes);
+    }
 
     if (updates.when !== undefined) Object.assign(p, withReminder(schedulingFields(updates.when, this.timeZone), null, this.timeZone), { ato: undefined });
     if (updates.when !== undefined && p.ato === undefined) delete p.ato;
 
     if (updates.reminderTime !== undefined) {
-      const existingSr = p.sr !== undefined ? p.sr : db.tasks.get(updates.__uuid)?.startDate ? dateToTimestamp(db.tasks.get(updates.__uuid).startDate) : null;
+      const existingSr = p.sr !== undefined ? p.sr : existing?.startDate ? dateToTimestamp(existing.startDate) : null;
       Object.assign(p, withReminder({ st: p.st ?? 1, sb: p.sb ?? 0, sr: existingSr, tir: p.tir ?? null }, updates.reminderTime, this.timeZone));
       if (updates.reminderTime) {
         if (p.st === undefined) delete p.st;
@@ -549,24 +599,68 @@ export class ThingsCloudClient {
 
     if (updates.deadline !== undefined) p.dd = updates.deadline ? dateToTimestamp(updates.deadline) : null;
 
-    // Containers: null or "" clears; a heading implies its project.
-    if (updates.project !== undefined) {
-      p.pr = updates.project ? [db.resolveRef("project", updates.project)] : [];
-      p.agr = [];
-      if (updates.project) p.ar = [];
+    // Creation date: cannot be in the future
+    const rawCd = updates.creationDate ?? updates.creation_date ?? updates["creation-date"];
+    if (rawCd !== undefined && rawCd !== null) {
+      const cdTs = parseIsoDate(rawCd);
+      if (cdTs <= now) {
+        p.cd = cdTs;
+      }
     }
-    if (updates.heading !== undefined) {
-      if (updates.heading) {
-        p.agr = [db.resolveRef("heading", updates.heading)];
+
+    // Completion date: only applies to completed or canceled items; cannot be in the future
+    const rawComp = updates.completionDate ?? updates.completion_date ?? updates["completion-date"];
+    if (rawComp !== undefined && rawComp !== null) {
+      const effectiveSs = p.ss !== undefined ? p.ss : existing?.status;
+      if (effectiveSs === 3 || effectiveSs === 2) {
+        const compTs = parseIsoDate(rawComp);
+        if (compTs <= now) {
+          p.sp = compTs;
+        }
+      } else {
+        p.sp = null;
+      }
+    }
+
+    // Containers: null or "" clears; a heading implies its project.
+    if (updates.heading !== undefined || updates["heading-id"] !== undefined) {
+      const headingRef = updates.heading ?? updates["heading-id"];
+      if (headingRef) {
+        p.agr = [db.resolveRef("heading", headingRef)];
         p.pr = [];
         p.ar = [];
       } else {
         p.agr = [];
       }
     }
-    if (updates.area !== undefined) {
-      p.ar = updates.area ? [db.resolveRef("area", updates.area)] : [];
-      if (updates.area) {
+    if (updates.project !== undefined) {
+      p.pr = updates.project ? [db.resolveRef("project", updates.project)] : [];
+      p.agr = [];
+      if (updates.project) p.ar = [];
+    }
+    if (updates.list !== undefined || updates["list-id"] !== undefined) {
+      const listRef = updates.list ?? updates["list-id"];
+      if (listRef) {
+        const resolved = db.resolveListRef(listRef);
+        if (resolved.type === "project") {
+          p.pr = [resolved.id];
+          p.agr = [];
+          p.ar = [];
+        } else {
+          p.ar = [resolved.id];
+          p.pr = [];
+          p.agr = [];
+        }
+      } else {
+        p.pr = [];
+        p.ar = [];
+        p.agr = [];
+      }
+    }
+    if (updates.area !== undefined || updates["area-id"] !== undefined) {
+      const areaRef = updates.area ?? updates["area-id"];
+      p.ar = areaRef ? [db.resolveRef("area", areaRef)] : [];
+      if (areaRef) {
         p.pr = [];
         p.agr = [];
       }
@@ -601,7 +695,17 @@ export class ThingsCloudClient {
 
   // --- Projects and headings --------------------------------------------------
 
-  async createProject({ title, notes = "", area = null, when = "anytime", deadline = null, tags = [] }) {
+  async createProject({
+    title,
+    notes = "",
+    area = null,
+    when = "anytime",
+    deadline = null,
+    tags = [],
+    status = 0,
+    completionDate = null,
+    creationDate = null,
+  }) {
     const db = await this.syncDatabase();
     const uuid = generateUUID();
     const change = buildTaskCreate({
@@ -612,10 +716,13 @@ export class ThingsCloudClient {
       deadline,
       area: area ? db.resolveRef("area", area) : null,
       tags: this.resolveTagIds(db, tags),
+      status,
+      creationDate,
+      completionDate,
       timeZone: this.timeZone,
     });
     await this.commitChanges([{ [uuid]: change }]);
-    return { id: uuid, title, type: "project", status: "open" };
+    return { id: uuid, title, type: "project", status: status === 3 ? "completed" : status === 2 ? "canceled" : "open" };
   }
 
   async updateProject(uuid, updates = {}) {
@@ -789,39 +896,82 @@ export class ThingsCloudClient {
     const changes = [];
     let projectsCreated = 0;
     let todosCreated = 0;
-
-    const taskFields = (attrs) => ({
-      title: attrs.title || "Untitled",
-      notes: attrs.notes || "",
-      when: attrs.when || "anytime",
-      deadline: attrs.deadline || null,
-      reminderTime: attrs.reminder || attrs["reminder-time"] || null,
-      tags: this.resolveTagIds(db, attrs.tags || []),
-      now,
-      timeZone: this.timeZone,
-    });
+    let projectsUpdated = 0;
+    let todosUpdated = 0;
+    const itemResults = [];
 
     const addChecklist = (attrs, todoUUID) => {
       (attrs["checklist-items"] || attrs.checklist || []).forEach((cl, idx) => {
         const title = typeof cl === "string" ? cl : cl.title || cl.attributes?.title;
-        changes.push({ [generateUUID()]: buildChecklistCreate({ title, task: todoUUID, index: idx, now }) });
+        const isCompleted = typeof cl === "object" && (cl.completed === true || cl.status === "completed" || cl.attributes?.completed === true);
+        changes.push({
+          [generateUUID()]: buildChecklistCreate({
+            title,
+            task: todoUUID,
+            index: idx,
+            status: isCompleted ? 3 : 0,
+            now,
+          }),
+        });
       });
     };
 
     for (const item of items) {
       const type = item.type || "to-do";
+      const operation = item.operation || "create";
       const attrs = item.attributes || {};
 
-      if (type === "project") {
-        const projectUUID = generateUUID();
-        changes.push({
-          [projectUUID]: buildTaskCreate({
-            ...taskFields({ ...attrs, title: attrs.title || "Untitled Project" }),
-            type: 1,
-            area: attrs.area ? db.resolveRef("area", attrs.area) : null,
-          }),
+      if (operation === "update") {
+        if (!item.id) {
+          throw new Error(`Update operation requires an "id".`);
+        }
+        const existing = db.tasks.get(item.id);
+        if (!existing) {
+          throw new Error(`No to-do or project with id ${item.id}.`);
+        }
+        if (type === "project" && existing.type !== 1) {
+          throw new Error(`Item ${item.id} is not a project.`);
+        }
+        if (type === "to-do" && existing.type !== 0) {
+          throw new Error(`Item ${item.id} is not a to-do.`);
+        }
+
+        const patch = this.buildTaskPatch(db, { ...attrs, __uuid: item.id }, now);
+        changes.push({ [item.id]: { t: 1, e: ENTITY.task, p: patch } });
+        db.applyChangeMap({ [item.id]: { t: 1, e: ENTITY.task, p: patch } });
+        if (type === "project") projectsUpdated++;
+        else todosUpdated++;
+        itemResults.push({ id: item.id, type, operation: "updated", title: patch.tt || existing.title || "Untitled" });
+        if (attrs["checklist-items"] || attrs.checklist) {
+          addChecklist(attrs, item.id);
+        }
+      } else if (type === "project") {
+        const projectUUID = item.id || generateUUID();
+        const areaId = attrs["area-id"]
+          ? db.resolveRef("area", attrs["area-id"])
+          : attrs.area
+          ? db.resolveRef("area", attrs.area)
+          : null;
+        const status = attrs.completed === true ? 3 : attrs.canceled === true ? 2 : (attrs.status === "completed" ? 3 : attrs.status === "canceled" ? 2 : 0);
+        const projectChange = buildTaskCreate({
+          title: attrs.title || "Untitled Project",
+          notes: attrs.notes || "",
+          type: 1,
+          when: attrs.when || "anytime",
+          deadline: attrs.deadline || null,
+          reminderTime: attrs.reminder || attrs["reminder-time"] || null,
+          tags: this.resolveTagIds(db, attrs.tags || []),
+          area: areaId,
+          status,
+          creationDate: attrs["creation-date"] || attrs.creationDate || attrs.creation_date || null,
+          completionDate: attrs["completion-date"] || attrs.completionDate || attrs.completion_date || null,
+          now,
+          timeZone: this.timeZone,
         });
+        changes.push({ [projectUUID]: projectChange });
+        db.applyChangeMap({ [projectUUID]: projectChange });
         projectsCreated++;
+        itemResults.push({ id: projectUUID, type: "project", operation: "created", title: attrs.title || "Untitled Project" });
 
         let headingUUID = null;
         let idx = 0;
@@ -829,45 +979,105 @@ export class ThingsCloudClient {
           const subType = sub.type || "to-do";
           const subAttrs = sub.attributes || {};
           if (subType === "heading") {
-            headingUUID = generateUUID();
-            changes.push({
-              [headingUUID]: buildTaskCreate({
-                title: subAttrs.title || "Section",
-                type: 2,
-                when: "anytime",
-                project: projectUUID,
-                now,
-                timeZone: this.timeZone,
-              }),
+            headingUUID = sub.id || generateUUID();
+            const headingChange = buildTaskCreate({
+              title: subAttrs.title || "Section",
+              type: 2,
+              when: "anytime",
+              project: projectUUID,
+              now,
+              timeZone: this.timeZone,
             });
+            changes.push({ [headingUUID]: headingChange });
+            db.applyChangeMap({ [headingUUID]: headingChange });
           } else if (subType === "to-do") {
-            const todoUUID = generateUUID();
+            const todoUUID = sub.id || generateUUID();
+            const subStatus = subAttrs.completed === true ? 3 : subAttrs.canceled === true ? 2 : (subAttrs.status === "completed" ? 3 : subAttrs.status === "canceled" ? 2 : 0);
             const change = buildTaskCreate({
-              ...taskFields(subAttrs),
+              title: subAttrs.title || "Untitled",
+              notes: subAttrs.notes || "",
+              type: 0,
+              when: subAttrs.when || "anytime",
+              deadline: subAttrs.deadline || null,
+              reminderTime: subAttrs.reminder || subAttrs["reminder-time"] || null,
+              tags: this.resolveTagIds(db, subAttrs.tags || []),
               project: headingUUID ? null : projectUUID,
               heading: headingUUID,
+              status: subStatus,
+              creationDate: subAttrs["creation-date"] || subAttrs.creationDate || subAttrs.creation_date || null,
+              completionDate: subAttrs["completion-date"] || subAttrs.completionDate || subAttrs.completion_date || null,
+              now,
+              timeZone: this.timeZone,
             });
             change.p.ix = idx++;
             changes.push({ [todoUUID]: change });
+            db.applyChangeMap({ [todoUUID]: change });
             todosCreated++;
+            itemResults.push({ id: todoUUID, type: "to-do", operation: "created", title: subAttrs.title || "Untitled" });
             addChecklist(subAttrs, todoUUID);
           }
         }
       } else if (type === "to-do") {
-        const todoUUID = generateUUID();
-        changes.push({
-          [todoUUID]: buildTaskCreate({
-            ...taskFields({ ...attrs, when: attrs.when || "inbox" }),
-            project: attrs["list-id"] ? db.resolveRef("project", attrs["list-id"]) : attrs.list ? db.resolveRef("project", attrs.list) : null,
-          }),
+        const todoUUID = item.id || generateUUID();
+        let project = null;
+        let heading = null;
+        let area = null;
+
+        if (attrs["heading-id"] || attrs.heading) {
+          heading = db.resolveRef("heading", attrs["heading-id"] || attrs.heading);
+        } else if (attrs["list-id"] || attrs.list) {
+          const listRef = db.resolveListRef(attrs["list-id"] || attrs.list);
+          if (listRef.type === "project") project = listRef.id;
+          else area = listRef.id;
+        } else if (attrs["area-id"] || attrs.area) {
+          area = db.resolveRef("area", attrs["area-id"] || attrs.area);
+        }
+
+        let when = attrs.when;
+        if (!when) {
+          if (project || heading || area) {
+            when = "anytime";
+          } else {
+            when = "inbox";
+          }
+        }
+
+        const status = attrs.completed === true ? 3 : attrs.canceled === true ? 2 : (attrs.status === "completed" ? 3 : attrs.status === "canceled" ? 2 : 0);
+        const todoChange = buildTaskCreate({
+          title: attrs.title || "Untitled",
+          notes: attrs.notes || "",
+          type: 0,
+          when,
+          deadline: attrs.deadline || null,
+          reminderTime: attrs.reminder || attrs["reminder-time"] || null,
+          tags: this.resolveTagIds(db, attrs.tags || []),
+          project,
+          heading,
+          area,
+          status,
+          creationDate: attrs["creation-date"] || attrs.creationDate || attrs.creation_date || null,
+          completionDate: attrs["completion-date"] || attrs.completionDate || attrs.completion_date || null,
+          now,
+          timeZone: this.timeZone,
         });
+
+        changes.push({ [todoUUID]: todoChange });
+        db.applyChangeMap({ [todoUUID]: todoChange });
         todosCreated++;
+        itemResults.push({ id: todoUUID, type: "to-do", operation: "created", title: attrs.title || "Untitled" });
         addChecklist(attrs, todoUUID);
       }
     }
 
     await this.commitChanges(changes);
-    return { projectsCreated, todosCreated, totalEntities: changes.length };
+    return {
+      projectsCreated,
+      todosCreated,
+      projectsUpdated,
+      todosUpdated,
+      totalEntities: changes.length,
+      items: itemResults,
+    };
   }
 
   async addTagsToTask(taskUUID, tagNames) {
@@ -893,14 +1103,16 @@ export class ThingsCloudClient {
 
     for (const uuid of uuids) {
       if (!db.tasks.has(uuid)) throw new Error(`Task not found: ${uuid}`);
-      const p = { md: now };
-      if (operation === "complete") Object.assign(p, statusFields("completed", now));
-      else if (operation === "cancel") Object.assign(p, statusFields("canceled", now));
-      else if (operation === "trash") p.tr = true;
-      else if (operation === "reschedule" && options.when) {
-        Object.assign(p, schedulingFields(options.when, this.timeZone));
-      }
-      changes.push({ [uuid]: { t: 1, e: ENTITY.task, p } });
+      const patch = this.buildTaskPatch(db, {
+        __uuid: uuid,
+        status: operation === "complete" ? "completed" : operation === "cancel" ? "canceled" : undefined,
+        trashed: operation === "trash" ? true : undefined,
+        when: operation === "reschedule" ? options.when : options.when,
+        deadline: options.deadline,
+        completionDate: options.completionDate || options.completion_date,
+        creationDate: options.creationDate || options.creation_date,
+      }, now);
+      changes.push({ [uuid]: { t: 1, e: ENTITY.task, p: patch } });
     }
 
     await this.commitChanges(changes);
@@ -1045,6 +1257,33 @@ export class ThingsDatabase {
     throw new Error(`No ${kind} found for "${wanted}".${hint}`);
   }
 
+  // Resolve a list reference which can be either a project or an area.
+  resolveListRef(value) {
+    const wanted = String(value).trim();
+    const task = this.tasks.get(wanted);
+    if (task && task.type === 1 && !task.trashed) return { type: "project", id: wanted };
+    if (this.areas.has(wanted)) return { type: "area", id: wanted };
+
+    const wantedLower = wanted.toLowerCase();
+    const matchingProjects = [...this.tasks.values()].filter(
+      (t) => t.type === 1 && !t.trashed && (t.title || "").toLowerCase() === wantedLower
+    );
+    const matchingAreas = [...this.areas.values()].filter(
+      (a) => (a.title || "").toLowerCase() === wantedLower
+    );
+
+    const totalMatches = matchingProjects.length + matchingAreas.length;
+    if (totalMatches === 1) {
+      if (matchingProjects.length === 1) return { type: "project", id: matchingProjects[0].uuid };
+      return { type: "area", id: matchingAreas[0].uuid };
+    }
+    if (totalMatches > 1) {
+      const allIds = [...matchingProjects, ...matchingAreas].map((m) => m.uuid).join(", ");
+      throw new Error(`More than one project or area is named "${wanted}". Use its id instead: ${allIds}.`);
+    }
+    throw new Error(`No project or area found for "${wanted}".`);
+  }
+
   tagTitles(ids = []) {
     return ids.map((id) => this.tags.get(id)?.title || id);
   }
@@ -1087,6 +1326,8 @@ export class ThingsDatabase {
       scheduledDate: t.startDate || null,
       deadline: t.deadline || null,
       reminderTime: secondsToTime(t.reminderSeconds),
+      creationDate: t.creationDate ? new Date(t.creationDate * 1000).toISOString() : null,
+      completionDate: t.stopDate ? new Date(t.stopDate * 1000).toISOString() : null,
       project: projectId ? this.tasks.get(projectId)?.title || projectId : null,
       projectId,
       heading: t.heading ? this.tasks.get(t.heading)?.title || t.heading : null,
@@ -1203,6 +1444,8 @@ export class ThingsDatabase {
           areaId: p.area || null,
           deadline: p.deadline || null,
           scheduledDate: p.startDate || null,
+          creationDate: p.creationDate ? new Date(p.creationDate * 1000).toISOString() : null,
+          completionDate: p.stopDate ? new Date(p.stopDate * 1000).toISOString() : null,
           totalTasks: todos.length,
           completedTasks: completed,
           openTasks: todos.length - completed,
@@ -1245,6 +1488,8 @@ export class ThingsDatabase {
       areaId: p.area || null,
       deadline: p.deadline || null,
       scheduledDate: p.startDate || null,
+      creationDate: p.creationDate ? new Date(p.creationDate * 1000).toISOString() : null,
+      completionDate: p.stopDate ? new Date(p.stopDate * 1000).toISOString() : null,
       tags: this.tagTitles(p.tags),
       headings,
       ungroupedTasks,

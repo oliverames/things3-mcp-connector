@@ -109,3 +109,235 @@ test("Upcoming lists future start dates and deadlines, not undated Today items",
   const titles = db.getUpcoming().map((t) => t.title).sort();
   assert.deepEqual(titles, ["scheduled", "today with deadline"]);
 });
+
+test("creating a to-do with completed and completion-date", async () => {
+  const { calls, fetchImpl } = fakeCloud();
+  const client = new ThingsCloudClient({ email: "a@b.c", password: "pw", historyKey: "KEY", fetchImpl });
+  const compDate = "2026-08-31T17:00:00Z";
+  const expectedTs = Date.parse(compDate) / 1000;
+
+  const result = await client.importJson([
+    {
+      type: "to-do",
+      attributes: {
+        title: "Finished Asana task",
+        completed: true,
+        "completion-date": compDate,
+      },
+    },
+  ]);
+
+  assert.equal(result.todosCreated, 1);
+  assert.equal(result.items[0].operation, "created");
+  const commit = calls.find((c) => c.url.includes("/commit"));
+  const [change] = Object.values(JSON.parse(commit.body));
+  assert.equal(change.e, "Task6");
+  assert.equal(change.p.tt, "Finished Asana task");
+  assert.equal(change.p.ss, 3);
+  assert.equal(change.p.sp, expectedTs);
+});
+
+test("updating the notes and both dates on an existing completed to-do", async () => {
+  const existingId = "EXISTING_TODO_UUID";
+  const initialCreated = Date.parse("2026-08-01T10:00:00Z") / 1000;
+  const initialStop = Date.parse("2026-08-10T12:00:00Z") / 1000;
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method, headers: init.headers, body: init.body });
+    const json = (data, status = 200) => new Response(JSON.stringify(data), { status });
+    if (String(url).includes("/commit")) return json({ "server-head-index": 11 });
+    if (String(url).endsWith("/history/KEY")) return json({ "latest-server-index": 10, "latest-schema-version": 301 });
+    if (String(url).includes("/items")) {
+      return json({
+        schema: 301,
+        "current-item-index": 10,
+        items: [
+          {
+            [existingId]: {
+              t: 0,
+              e: "Task6",
+              p: {
+                tt: "Original Title",
+                nt: { _t: "tx", t: 1, ch: 0, v: "Old notes" },
+                tp: 0,
+                ss: 3,
+                sp: initialStop,
+                cd: initialCreated,
+                tr: false,
+                st: 1,
+              },
+            },
+          },
+        ],
+      });
+    }
+    throw new Error(`unexpected ${url}`);
+  };
+
+  const client = new ThingsCloudClient({ email: "a@b.c", password: "pw", historyKey: "KEY", fetchImpl });
+  const newCompDate = "2026-08-31T17:00:00Z";
+  const newCreateDate = "2026-08-31T13:00:00Z";
+  const expectedCompTs = Date.parse(newCompDate) / 1000;
+  const expectedCreateTs = Date.parse(newCreateDate) / 1000;
+
+  const result = await client.importJson([
+    {
+      type: "to-do",
+      operation: "update",
+      id: existingId,
+      attributes: {
+        notes: "Updated Asana migration notes",
+        "completion-date": newCompDate,
+        "creation-date": newCreateDate,
+      },
+    },
+  ]);
+
+  assert.equal(result.todosUpdated, 1);
+  assert.equal(result.items[0].operation, "updated");
+  assert.equal(result.items[0].id, existingId);
+
+  const commit = calls.find((c) => c.url.includes("/commit"));
+  const [change] = Object.values(JSON.parse(commit.body));
+  assert.equal(change.p.nt.v, "Updated Asana migration notes");
+  assert.equal(change.p.sp, expectedCompTs);
+  assert.equal(change.p.cd, expectedCreateTs);
+});
+
+test("an update on an id that doesn't exist", async () => {
+  const { calls, fetchImpl } = fakeCloud();
+  const client = new ThingsCloudClient({ email: "a@b.c", password: "pw", historyKey: "KEY", fetchImpl });
+
+  await assert.rejects(
+    async () => {
+      await client.importJson([
+        {
+          type: "to-do",
+          operation: "update",
+          id: "NON_EXISTENT_ID",
+          attributes: {
+            notes: "Should fail",
+          },
+        },
+      ]);
+    },
+    {
+      name: "Error",
+      message: /No to-do or project with id NON_EXISTENT_ID/,
+    }
+  );
+
+  // Verify no commit was made and no item was created
+  assert.ok(!calls.some((c) => c.url.includes("/commit")));
+});
+
+test("a completion date on a project", async () => {
+  const existingProjectId = "PROJECT_UUID";
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method, headers: init.headers, body: init.body });
+    const json = (data, status = 200) => new Response(JSON.stringify(data), { status });
+    if (String(url).includes("/commit")) return json({ "server-head-index": 11 });
+    if (String(url).endsWith("/history/KEY")) return json({ "latest-server-index": 10, "latest-schema-version": 301 });
+    if (String(url).includes("/items")) {
+      return json({
+        schema: 301,
+        "current-item-index": 10,
+        items: [
+          {
+            [existingProjectId]: {
+              t: 0,
+              e: "Task6",
+              p: {
+                tt: "Big Project",
+                tp: 1,
+                ss: 0,
+                tr: false,
+                st: 1,
+              },
+            },
+          },
+        ],
+      });
+    }
+    throw new Error(`unexpected ${url}`);
+  };
+
+  const client = new ThingsCloudClient({ email: "a@b.c", password: "pw", historyKey: "KEY", fetchImpl });
+  const compDate = "2026-09-01T15:00:00Z";
+  const expectedCompTs = Date.parse(compDate) / 1000;
+
+  await client.updateProject(existingProjectId, {
+    status: "completed",
+    completionDate: compDate,
+  });
+
+  const commit = calls.find((c) => c.url.includes("/commit"));
+  const [change] = Object.values(JSON.parse(commit.body));
+  assert.equal(change.e, "Task6");
+  assert.equal(change.p.ss, 3);
+  assert.equal(change.p.sp, expectedCompTs);
+});
+
+test("importJson creates project with completed and completion-date, and to-do with list-id does not land in Inbox", async () => {
+  const areaId = "AREA_UUID";
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method, headers: init.headers, body: init.body });
+    const json = (data, status = 200) => new Response(JSON.stringify(data), { status });
+    if (String(url).includes("/commit")) return json({ "server-head-index": 11 });
+    if (String(url).endsWith("/history/KEY")) return json({ "latest-server-index": 10, "latest-schema-version": 301 });
+    if (String(url).includes("/items")) {
+      return json({
+        schema: 301,
+        "current-item-index": 10,
+        items: [
+          {
+            [areaId]: {
+              t: 0,
+              e: "Area3",
+              p: { tt: "Work Area" },
+            },
+          },
+        ],
+      });
+    }
+    throw new Error(`unexpected ${url}`);
+  };
+
+  const client = new ThingsCloudClient({ email: "a@b.c", password: "pw", historyKey: "KEY", fetchImpl });
+  const compDate = "2026-09-01T12:00:00Z";
+  const expectedCompTs = Date.parse(compDate) / 1000;
+
+  await client.importJson([
+    {
+      type: "project",
+      attributes: {
+        title: "Migrated Project",
+        "area-id": areaId,
+        completed: true,
+        "completion-date": compDate,
+      },
+    },
+    {
+      type: "to-do",
+      attributes: {
+        title: "Area To-Do",
+        "list-id": areaId,
+      },
+    },
+  ]);
+
+  const commit = calls.find((c) => c.url.includes("/commit"));
+  const changes = Object.values(JSON.parse(commit.body));
+  const projectChange = changes.find((c) => c.p.tp === 1);
+  assert.equal(projectChange.p.tt, "Migrated Project");
+  assert.deepEqual(projectChange.p.ar, [areaId]);
+  assert.equal(projectChange.p.ss, 3);
+  assert.equal(projectChange.p.sp, expectedCompTs);
+
+  const todoChange = changes.find((c) => c.p.tp === 0);
+  assert.equal(todoChange.p.tt, "Area To-Do");
+  assert.deepEqual(todoChange.p.ar, [areaId]);
+  assert.equal(todoChange.p.st, 1); // anytime, NOT inbox (0)
+});

@@ -701,7 +701,7 @@ export class ThingsMCP extends McpAgent {
       "things_update_todo",
       {
         title: "Update To-Do",
-        description: "Update any property of an existing to-do (title, notes, when, deadline, reminder, project, heading, area, status, tags).",
+        description: "Update any property of an existing to-do (title, notes, when, deadline, reminder, project, heading, area, status, tags, completion_date, creation_date).",
         inputSchema: {
           id: z.string().describe("UUID of the to-do to update"),
           title: z.string().optional().describe("Updated title"),
@@ -714,6 +714,8 @@ export class ThingsMCP extends McpAgent {
           area: z.string().optional().describe("Move to area UUID"),
           tags: z.array(z.string()).optional().describe("Full list of tag names or IDs (replaces existing; tags must already exist)"),
           status: z.enum(["open", "completed", "canceled"]).optional().describe("Set status"),
+          completion_date: z.string().optional().describe("Completion date in ISO 8601 (applies only to completed or canceled to-dos, cannot be in future)"),
+          creation_date: z.string().optional().describe("Creation date in ISO 8601 (cannot be in future)"),
           trashed: z.boolean().optional().describe("Set true to trash"),
         },
         annotations: {
@@ -737,6 +739,8 @@ export class ThingsMCP extends McpAgent {
           area: args.area,
           tags: args.tags,
           status: args.status,
+          completionDate: args.completion_date,
+          creationDate: args.creation_date,
           trashed: args.trashed,
         });
         return textResult(`To-do ${args.id} updated successfully.`);
@@ -849,7 +853,7 @@ export class ThingsMCP extends McpAgent {
       "things_update_project",
       {
         title: "Update Project",
-        description: "Update a project's title, notes, area, deadline, or mark it completed/canceled.",
+        description: "Update a project's title, notes, area, deadline, completion_date, creation_date, or mark it completed/canceled.",
         inputSchema: {
           project_id: z.string().describe("Project UUID"),
           title: z.string().optional().describe("New title"),
@@ -857,6 +861,8 @@ export class ThingsMCP extends McpAgent {
           area: z.string().optional().describe("New Area UUID"),
           deadline: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("New deadline (YYYY-MM-DD)"),
           status: z.enum(["open", "completed", "canceled"]).optional().describe("New status"),
+          completion_date: z.string().optional().describe("Completion date in ISO 8601 (applies only to completed or canceled projects, cannot be in future)"),
+          creation_date: z.string().optional().describe("Creation date in ISO 8601 (cannot be in future)"),
           trashed: z.boolean().optional().describe("Set true to move project to Trash"),
         },
         annotations: {
@@ -867,9 +873,18 @@ export class ThingsMCP extends McpAgent {
           openWorldHint: false,
         },
       },
-      async ({ project_id, title, notes, area, deadline, status, trashed }) => {
+      async ({ project_id, title, notes, area, deadline, status, completion_date, creation_date, trashed }) => {
         const client = await getClient();
-        await client.updateProject(project_id, { title, notes, area, deadline, status, trashed });
+        await client.updateProject(project_id, {
+          title,
+          notes,
+          area,
+          deadline,
+          status,
+          completionDate: completion_date,
+          creationDate: creation_date,
+          trashed,
+        });
         return textResult(`Project ${project_id} updated successfully.`);
       }
     );
@@ -1141,9 +1156,9 @@ export class ThingsMCP extends McpAgent {
       "things_import_json",
       {
         title: "Import Things JSON",
-        description: "Batch import complex structured projects, headings, to-dos, checklists, and tags using Things 3 JSON format in a single atomic sync commit.",
+        description: "Batch import complex structured projects, headings, to-dos, checklists, and tags or update existing items using Things 3 JSON format in a single atomic sync commit.",
         inputSchema: {
-          payload: z.any().describe("Things JSON array or object containing projects or to-dos"),
+          payload: z.any().describe("Things JSON array or object containing projects or to-dos to create or update"),
         },
         annotations: {
           title: "Import Things JSON",
@@ -1156,7 +1171,11 @@ export class ThingsMCP extends McpAgent {
       async ({ payload }) => {
         const client = await getClient();
         const result = await client.importJson(payload);
-        return textResult(`Imported Things JSON: created ${result.projectsCreated} projects and ${result.todosCreated} to-dos (${result.totalEntities} total entities).`);
+        const itemLines = result.items.map(
+          (item) => `- ${item.type} "${item.title || item.id}" (${item.id}): ${item.operation}`
+        );
+        const summary = `Imported Things JSON: created ${result.projectsCreated} projects and ${result.todosCreated} to-dos, updated ${result.projectsUpdated} projects and ${result.todosUpdated} to-dos (${result.totalEntities} total entities).`;
+        return textResult(`${summary}\n\nItem results:\n${itemLines.join("\n")}`);
       }
     );
 
@@ -1295,11 +1314,14 @@ export class ThingsMCP extends McpAgent {
       "things_batch_update_todos",
       {
         title: "Batch Update To-Dos",
-        description: "Perform a batch update across multiple to-dos simultaneously (e.g. complete all, trash all, or reschedule all).",
+        description: "Perform a batch update across multiple to-dos simultaneously (e.g. complete all, trash all, reschedule all, or set dates).",
         inputSchema: {
           ids: z.array(z.string()).describe("Array of to-do UUIDs"),
-          operation: z.enum(["complete", "cancel", "trash", "reschedule"]).describe("Batch operation to perform"),
+          operation: z.enum(["complete", "cancel", "trash", "reschedule", "set_dates"]).describe("Batch operation to perform"),
           when: z.enum(["today", "anytime", "someday"]).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional().describe("Required when operation is 'reschedule'"),
+          deadline: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Deadline (YYYY-MM-DD) to set"),
+          completion_date: z.string().optional().describe("Completion date in ISO 8601 (applies to completed or canceled to-dos, cannot be in future)"),
+          creation_date: z.string().optional().describe("Creation date in ISO 8601 (cannot be in future)"),
         },
         annotations: {
           title: "Batch Update To-Dos",
@@ -1309,9 +1331,14 @@ export class ThingsMCP extends McpAgent {
           openWorldHint: false,
         },
       },
-      async ({ ids, operation, when }) => {
+      async ({ ids, operation, when, deadline, completion_date, creation_date }) => {
         const client = await getClient();
-        const result = await client.batchUpdateTodos(ids, operation, { when });
+        const result = await client.batchUpdateTodos(ids, operation, {
+          when,
+          deadline,
+          completionDate: completion_date,
+          creationDate: creation_date,
+        });
         return textResult(`Batch ${operation} applied to ${result.count} to-dos.`);
       }
     );

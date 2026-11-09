@@ -1,5 +1,17 @@
 # Things MCP connector worklog
 
+## 2026-11-09 - Match Things JSON format: dates, updates, and bulk support
+
+**What changed**:
+- `things_import_json` now honors every attribute from Cultured Code's Things JSON format: `completed`, `canceled`, `completion-date`, `creation-date`, `when`, `area-id`, `list-id`, and `heading`.
+- Container resolution for `list-id`/`list` dynamically detects whether the target is a project or an area (`resolveListRef`), and when a container is specified without an explicit `when`, `when` defaults to `"anytime"` so items land in their intended container rather than defaulting to the Inbox.
+- Added full support for `"operation": "update"` with `"id"` in `things_import_json` for both to-dos and projects. Missing IDs throw an explicit error rather than creating a phantom item.
+- Per-item `created` or `updated` status is now tracked and returned in `things_import_json` results.
+- `things_update_todo` and `things_update_project` now accept `completion_date` and `creation_date` in ISO 8601 format, following Things' rules (completion date only applies to completed/canceled items, and future dates are ignored).
+- `things_batch_update_todos` extended to support date operations (`completion_date`, `creation_date`, `deadline`, and operation `"set_dates"`).
+- Extended `formatTask`, `getProjects`, and `getProject` to expose `creationDate` and `completionDate` in ISO 8601 strings.
+- Added comprehensive unit tests in `test/client.test.js` covering to-do creation with completion date, updating notes and both dates on an existing completed to-do, rejecting updates for non-existent IDs, project completion dates, and container-targeted imports. All 12 tests pass.
+
 ## 2026-11-09 - Icons trimmed to fill their canvas
 
 The icons were the 1024px Things tile (824px of artwork inside 100px of transparent margin) scaled down whole, so the tile covered 80% of every canvas: a 3px empty border on the 32px favicon and transparent corners on the 180px apple-touch icon, which iOS fills black. Regenerated the favicons (16/32/48/96), `favicon.ico` (48/32/16), `icon-192/256/512` from the trimmed tile, and made `apple-touch-icon.png` an opaque full-bleed square (checked fully opaque). `icon-1024.png` is the unchanged source art. Search Console has no `things3mcp.org` property yet for the account used here.

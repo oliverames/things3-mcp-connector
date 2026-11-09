@@ -341,3 +341,57 @@ test("importJson creates project with completed and completion-date, and to-do w
   assert.deepEqual(todoChange.p.ar, [areaId]);
   assert.equal(todoChange.p.st, 1); // anytime, NOT inbox (0)
 });
+
+test("schedulingFields supports tomorrow and batchUpdateTodos can set dates", async () => {
+  const sched = schedulingFields("tomorrow", "UTC");
+  assert.equal(sched.st, 2);
+  assert.ok(sched.sr > 0);
+
+  const todoId = "BATCH_TODO_UUID";
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method, headers: init.headers, body: init.body });
+    const json = (data, status = 200) => new Response(JSON.stringify(data), { status });
+    if (String(url).includes("/commit")) return json({ "server-head-index": 11 });
+    if (String(url).endsWith("/history/KEY")) return json({ "latest-server-index": 10, "latest-schema-version": 301 });
+    if (String(url).includes("/items")) {
+      return json({
+        schema: 301,
+        "current-item-index": 10,
+        items: [
+          {
+            [todoId]: {
+              t: 0,
+              e: "Task6",
+              p: {
+                tt: "Batch Item",
+                tp: 0,
+                ss: 3,
+                st: 1,
+                tr: false,
+              },
+            },
+          },
+        ],
+      });
+    }
+    throw new Error(`unexpected ${url}`);
+  };
+
+  const client = new ThingsCloudClient({ email: "a@b.c", password: "pw", historyKey: "KEY", fetchImpl });
+  const compDate = "2026-08-31T17:00:00Z";
+  const createDate = "2026-08-31T12:00:00Z";
+  const deadline = "2026-09-15";
+
+  await client.batchUpdateTodos([todoId], "set_dates", {
+    completionDate: compDate,
+    creationDate: createDate,
+    deadline,
+  });
+
+  const commit = calls.find((c) => c.url.includes("/commit"));
+  const [change] = Object.values(JSON.parse(commit.body));
+  assert.equal(change.p.sp, Date.parse(compDate) / 1000);
+  assert.equal(change.p.cd, Date.parse(createDate) / 1000);
+  assert.equal(change.p.dd, Date.UTC(2026, 8, 15) / 1000);
+});

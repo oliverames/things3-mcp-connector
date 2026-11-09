@@ -153,11 +153,16 @@ export function schedulingFields(when, timeZone) {
       return { st: 2, sb: 0, sr: null, tir: null };
     case "today":
       return { st: 1, sb: 0, sr: dateToTimestamp(today), tir: dateToTimestamp(today) };
+    case "tomorrow": {
+      const tomorrow = addDays(today, 1);
+      const ts = dateToTimestamp(tomorrow);
+      return { st: 2, sb: 0, sr: ts, tir: ts };
+    }
     case "evening":
       return { st: 1, sb: 1, sr: dateToTimestamp(today), tir: dateToTimestamp(today) };
     default: {
       if (!isDateString(when)) {
-        throw new Error(`Invalid "when" value "${when}". Use inbox, today, evening, anytime, someday, or YYYY-MM-DD.`);
+        throw new Error(`Invalid "when" value "${when}". Use inbox, today, tomorrow, evening, anytime, someday, or YYYY-MM-DD.`);
       }
       const ts = dateToTimestamp(when);
       // A date in the future is "Upcoming" (start = someday + scheduled date); today or earlier is Today.
@@ -512,10 +517,19 @@ export class ThingsCloudClient {
     area = null,
     tags = [],
     checklist = [],
+    status = 0,
+    completed = undefined,
+    canceled = undefined,
+    completionDate = null,
+    creationDate = null,
   }) {
     const db = await this.syncDatabase();
     const taskUUID = generateUUID();
     const now = toUnixTimestamp();
+
+    let ss = status;
+    if (completed === true) ss = 3;
+    else if (canceled === true) ss = 2;
 
     const change = buildTaskCreate({
       title,
@@ -527,6 +541,9 @@ export class ThingsCloudClient {
       heading: heading ? db.resolveRef("heading", heading) : null,
       area: area ? db.resolveRef("area", area) : null,
       tags: this.resolveTagIds(db, tags),
+      status: ss,
+      completionDate,
+      creationDate,
       now,
       timeZone: this.timeZone,
     });
@@ -904,12 +921,14 @@ export class ThingsCloudClient {
       (attrs["checklist-items"] || attrs.checklist || []).forEach((cl, idx) => {
         const title = typeof cl === "string" ? cl : cl.title || cl.attributes?.title;
         const isCompleted = typeof cl === "object" && (cl.completed === true || cl.status === "completed" || cl.attributes?.completed === true);
+        const isCanceled = typeof cl === "object" && (cl.canceled === true || cl.status === "canceled" || cl.attributes?.canceled === true);
+        const status = isCompleted ? 3 : isCanceled ? 2 : 0;
         changes.push({
           [generateUUID()]: buildChecklistCreate({
             title,
             task: todoUUID,
             index: idx,
-            status: isCompleted ? 3 : 0,
+            status,
             now,
           }),
         });

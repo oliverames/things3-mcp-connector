@@ -657,11 +657,11 @@ export class ThingsMCP extends McpAgent {
       "things_add_todo",
       {
         title: "Add To-Do",
-        description: "Create a new to-do in Things 3 with scheduling, reminder alert, deadline, project/heading/area, and checklist.",
+        description: "Create a new to-do in Things 3 with scheduling, reminder alert, deadline, project/heading/area, checklist, and optional dates.",
         inputSchema: {
           title: z.string().describe("Title of the to-do"),
           notes: z.string().optional().describe("Notes / Markdown description"),
-          when: z.enum(["inbox", "today", "evening", "anytime", "someday"]).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional().default("inbox").describe("Where or when to schedule: 'inbox', 'today', 'evening', 'anytime', 'someday', or date 'YYYY-MM-DD'"),
+          when: z.enum(["inbox", "today", "tomorrow", "evening", "anytime", "someday"]).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional().default("inbox").describe("Where or when to schedule: 'inbox', 'today', 'tomorrow', 'evening', 'anytime', 'someday', or date 'YYYY-MM-DD'"),
           reminder_time: z.string().regex(/^\d{1,2}:\d{2}$/).optional().describe("Time for reminder alert (e.g. '09:00', '14:30')"),
           deadline: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Due date / deadline (YYYY-MM-DD)"),
           project: z.string().optional().describe("UUID of parent project"),
@@ -669,6 +669,10 @@ export class ThingsMCP extends McpAgent {
           area: z.string().optional().describe("UUID of parent area"),
           tags: z.array(z.string()).optional().describe("Tag names or IDs to attach (tags must already exist)"),
           checklist: z.array(z.string()).optional().describe("List of checklist item titles"),
+          completed: z.boolean().optional().describe("Set true if already completed"),
+          canceled: z.boolean().optional().describe("Set true if canceled"),
+          completion_date: z.string().optional().describe("Completion date in ISO 8601"),
+          creation_date: z.string().optional().describe("Creation date in ISO 8601"),
         },
         annotations: {
           title: "Add To-Do",
@@ -691,6 +695,10 @@ export class ThingsMCP extends McpAgent {
           area: args.area,
           tags: args.tags,
           checklist: args.checklist,
+          completed: args.completed,
+          canceled: args.canceled,
+          completionDate: args.completion_date,
+          creationDate: args.creation_date,
         });
         return textResult(`Successfully created to-do "${result.title}" (ID: ${result.id}) scheduled for ${result.when}.`);
       }
@@ -706,7 +714,7 @@ export class ThingsMCP extends McpAgent {
           id: z.string().describe("UUID of the to-do to update"),
           title: z.string().optional().describe("Updated title"),
           notes: z.string().optional().describe("Updated notes"),
-          when: z.enum(["inbox", "today", "evening", "anytime", "someday"]).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional().describe("Move or reschedule to-do"),
+          when: z.enum(["inbox", "today", "tomorrow", "evening", "anytime", "someday"]).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional().describe("Move or reschedule to-do"),
           reminder_time: z.string().regex(/^\d{1,2}:\d{2}$/).optional().describe("Update reminder time alert ('HH:MM')"),
           deadline: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Update deadline ('YYYY-MM-DD')"),
           project: z.string().optional().describe("Move to project UUID"),
@@ -1318,7 +1326,7 @@ export class ThingsMCP extends McpAgent {
         inputSchema: {
           ids: z.array(z.string()).describe("Array of to-do UUIDs"),
           operation: z.enum(["complete", "cancel", "trash", "reschedule", "set_dates"]).describe("Batch operation to perform"),
-          when: z.enum(["today", "anytime", "someday"]).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional().describe("Required when operation is 'reschedule'"),
+          when: z.enum(["today", "tomorrow", "anytime", "someday"]).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional().describe("Required when operation is 'reschedule'"),
           deadline: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Deadline (YYYY-MM-DD) to set"),
           completion_date: z.string().optional().describe("Completion date in ISO 8601 (applies to completed or canceled to-dos, cannot be in future)"),
           creation_date: z.string().optional().describe("Creation date in ISO 8601 (cannot be in future)"),

@@ -201,7 +201,7 @@ export class ThingsMCP extends McpAgent {
       "things_get_today",
       {
         title: "Get Today's To-Dos",
-        description: "Fetch all to-dos scheduled for Today in Things 3, including project/area context, deadlines, checklists, and tags.",
+        description: "Fetch the Today list as Things shows it: to-dos whose start date is today or earlier, plus to-dos with no start date whose deadline is today or overdue. Includes project/area context, deadlines, checklists, and tags.",
         inputSchema: {},
         annotations: {
           title: "Get Today's To-Dos",
@@ -245,7 +245,7 @@ export class ThingsMCP extends McpAgent {
       "things_get_upcoming",
       {
         title: "Get Upcoming To-Dos & Deadlines",
-        description: "Fetch to-dos with a future start date and to-dos with a deadline in the window, in chronological order. Matches Things' Upcoming list, so a to-do scheduled for today still appears when its deadline falls in the window.",
+        description: "Fetch to-dos with a future start date and to-dos with a future deadline in the window, in chronological order. Matches Things' Upcoming list, so a to-do scheduled for today still appears when its deadline falls in the window. Overdue deadlines are in things_get_today and things_get_deadlines.",
         inputSchema: {
           days: z.number().optional().default(14).describe("Number of days ahead to look (default: 14)"),
         },
@@ -365,7 +365,7 @@ export class ThingsMCP extends McpAgent {
       "things_get_repeating_todos",
       {
         title: "Get Repeating To-Dos",
-        description: "Fetch recurring to-do templates and repeating task definitions in Things 3.",
+        description: "Fetch repeating to-do templates. Each has \"repeating\": true, \"repeatRule\" (the rule in words) and \"repeat\" (frequency, interval, next occurrence, end, deadline offset). Templates are hidden rule holders: they are left out of lists, search, and project counts, and their schedule can only be changed in Things. The to-dos they generate carry \"repeatTemplateId\".",
         inputSchema: {},
         annotations: {
           title: "Get Repeating To-Dos",
@@ -482,7 +482,7 @@ export class ThingsMCP extends McpAgent {
       "things_get_todo",
       {
         title: "Get To-Do Details",
-        description: "Fetch complete details of a specific to-do by UUID or exact title.",
+        description: "Fetch complete details of a specific to-do by UUID or exact title. When several items share the title, a live, open to-do is preferred over trashed items and repeating templates.",
         inputSchema: {
           id: z.string().describe("To-do UUID or exact title"),
         },
@@ -508,7 +508,7 @@ export class ThingsMCP extends McpAgent {
       "things_search",
       {
         title: "Search Things",
-        description: "Comprehensive search across to-dos, projects, headings, and notes with optional filtering.",
+        description: "Search to-do and project titles and notes, with optional area, project, and tag filters (id or title, case-insensitive; an unknown name is an error). Trashed items, headings, and repeating templates are not searched.",
         inputSchema: {
           query: z.string().describe("Search keywords or phrase"),
           status: z.enum(["open", "completed", "all"]).optional().default("open").describe("Filter status"),
@@ -556,7 +556,6 @@ export class ThingsMCP extends McpAgent {
           email: account.email,
           status: account.status,
           mailDropEmail: account.mailDropEmail,
-          historyKey: account.historyKey,
           latestServerSyncIndex: db.latestServerIndex,
           stats: db.getStats(),
         });
@@ -669,10 +668,10 @@ export class ThingsMCP extends McpAgent {
           title: z.string().describe("Title of the to-do"),
           notes: z.string().optional().describe("Notes / Markdown description"),
           when: z.enum(["inbox", "today", "tomorrow", "evening", "anytime", "someday"]).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional().describe("Where or when to schedule: 'inbox', 'today', 'tomorrow', 'evening', 'anytime', 'someday', or date 'YYYY-MM-DD'. Defaults to 'inbox', or 'anytime' when a project, heading, or area is given (those cannot be in the Inbox)."),
-          reminder_time: z.string().regex(/^\d{1,2}:\d{2}$/).optional().describe("Time for reminder alert (e.g. '09:00', '14:30')"),
+          reminder_time: z.string().regex(/^\d{1,2}:\d{2}$/).optional().describe("Time for reminder alert (e.g. '09:00', '14:30'). Needs a date: with no 'when' the to-do is scheduled for today, and 'inbox', 'anytime', or 'someday' is refused."),
           deadline: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Due date / deadline (YYYY-MM-DD)"),
           project: z.string().optional().describe("UUID of parent project"),
-          heading: z.string().optional().describe("UUID of parent heading inside project"),
+          heading: z.string().optional().describe("UUID or title of parent heading. Given with project, it must be a heading of that project and the to-do is filed under it."),
           area: z.string().optional().describe("UUID of parent area"),
           tags: z.array(z.string()).optional().describe("Tag names or IDs to attach (tags must already exist)"),
           checklist: z.array(z.string()).optional().describe("List of checklist item titles"),
@@ -716,16 +715,16 @@ export class ThingsMCP extends McpAgent {
       "things_update_todo",
       {
         title: "Update To-Do",
-        description: "Update any property of an existing to-do (title, notes, when, deadline, reminder, project, heading, area, status, tags, completion_date, creation_date).",
+        description: "Update any property of an existing to-do (title, notes, when, deadline, reminder, project, heading, area, status, tags, completion_date, creation_date). Project and heading ids are refused; use things_update_project or things_update_heading.",
         inputSchema: {
           id: z.string().describe("UUID of the to-do to update"),
           title: z.string().optional().describe("Updated title"),
           notes: z.string().optional().describe("Updated notes"),
-          when: z.enum(["inbox", "today", "tomorrow", "evening", "anytime", "someday"]).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional().describe("Move or reschedule to-do"),
-          reminder_time: z.string().regex(/^\d{1,2}:\d{2}$/).optional().describe("Update reminder time alert ('HH:MM')"),
-          deadline: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Update deadline ('YYYY-MM-DD')"),
+          when: z.enum(["inbox", "today", "tomorrow", "evening", "anytime", "someday"]).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional().describe("Move or reschedule to-do. 'inbox', 'anytime', and 'someday' have no date, so they also clear the reminder time."),
+          reminder_time: z.string().regex(/^\d{1,2}:\d{2}$/).or(z.literal("")).nullable().optional().describe("Update reminder time alert ('HH:MM'); null or '' removes it. Needs a date: with no start date the to-do moves to today."),
+          deadline: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).or(z.literal("")).nullable().optional().describe("Update deadline ('YYYY-MM-DD'); null or '' removes it"),
           project: z.string().optional().describe("Move to project UUID"),
-          heading: z.string().optional().describe("Move to heading UUID inside project"),
+          heading: z.string().optional().describe("Move to heading UUID inside project. Given with project, it must be a heading of that project."),
           area: z.string().optional().describe("Move to area UUID"),
           tags: z.array(z.string()).optional().describe("Full list of tag names or IDs (replaces existing; tags must already exist)"),
           status: z.enum(["open", "completed", "canceled"]).optional().describe("Set status"),
@@ -815,7 +814,7 @@ export class ThingsMCP extends McpAgent {
       "things_duplicate_todo",
       {
         title: "Duplicate To-Do",
-        description: "Clone an existing to-do, preserving its notes, tags, project, area, and checklist items.",
+        description: "Clone an existing to-do, preserving its notes, tags, project, area, and checklist items (with their checked state). To-dos only; repeating templates are refused.",
         inputSchema: {
           id: z.string().describe("UUID of the to-do to duplicate"),
         },
@@ -874,7 +873,7 @@ export class ThingsMCP extends McpAgent {
           title: z.string().optional().describe("New title"),
           notes: z.string().optional().describe("New notes"),
           area: z.string().optional().describe("New Area UUID"),
-          deadline: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("New deadline (YYYY-MM-DD)"),
+          deadline: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).or(z.literal("")).nullable().optional().describe("New deadline (YYYY-MM-DD); null or '' removes it"),
           status: z.enum(["open", "completed", "canceled"]).optional().describe("New status"),
           completion_date: z.string().optional().describe("Completion date in ISO 8601 (applies only to completed or canceled projects, cannot be in future)"),
           creation_date: z.string().optional().describe("Creation date in ISO 8601 (cannot be in future)"),
@@ -934,7 +933,7 @@ export class ThingsMCP extends McpAgent {
       "things_update_heading",
       {
         title: "Update Heading",
-        description: "Rename or delete a section heading in a project.",
+        description: "Rename or permanently delete a section heading in a project. Only heading ids are accepted. Deleting is refused while the heading still holds to-dos that are not in the Trash.",
         inputSchema: {
           id: z.string().describe("Heading UUID"),
           title: z.string().optional().describe("New title for heading"),
@@ -1087,14 +1086,14 @@ export class ThingsMCP extends McpAgent {
       "things_manage_maildrop",
       {
         title: "Manage Maildrop Address",
-        description: "Manage Things Cloud Maildrop email address (used to forward emails into your Things Inbox).",
+        description: "Manage Things Cloud Maildrop email address (used to forward emails into your Things Inbox). 'reset' and 'clear' permanently invalidate the current address.",
         inputSchema: {
           action: z.enum(["get", "reset", "clear"]).describe("Action: 'get' current address, 'reset' to generate new address, or 'clear' to disable"),
         },
         annotations: {
           title: "Manage Maildrop Address",
           readOnlyHint: false,
-          destructiveHint: false,
+          destructiveHint: true,
           idempotentHint: false,
           openWorldHint: false,
         },
@@ -1119,7 +1118,7 @@ export class ThingsMCP extends McpAgent {
       "things_move_todo",
       {
         title: "Move To-Do",
-        description: "Move a to-do to a different list ('inbox', 'today', 'anytime', 'someday', or date), or reassign to a project, heading, or area.",
+        description: "Move a to-do to a different list ('inbox', 'today', 'anytime', 'someday', or date), or reassign to a project, heading, or area. Moving to 'inbox', 'anytime', or 'someday' clears the reminder time. A heading given with a project must belong to that project.",
         inputSchema: {
           id: z.string().describe("To-do UUID"),
           when: z.enum(["inbox", "today", "evening", "anytime", "someday"]).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional().describe("Move to list or schedule for date"),
@@ -1171,7 +1170,7 @@ export class ThingsMCP extends McpAgent {
       "things_import_json",
       {
         title: "Import Things JSON",
-        description: "Batch import complex structured projects, headings, to-dos, checklists, and tags or update existing items using Things 3 JSON format in a single atomic sync commit. To change an existing item, pass {\"operation\": \"update\", \"id\": \"<Things id>\"}; an id without operation update is refused. New items always get ids minted by Things' own format. Dates are ISO 8601 (or unix seconds), never milliseconds. The whole batch is validated and rejected before writing if any id, reference, or date is one Things cannot decode.",
+        description: "Batch import complex structured projects, headings, to-dos, checklists, and tags or update existing items using Things 3 JSON format in a single atomic sync commit. To change an existing item, pass {\"operation\": \"update\", \"id\": \"<Things id>\"}; an id without operation update is refused. New items always get ids minted by Things' own format. Dates are ISO 8601 (or unix seconds), never milliseconds. On an update, 'checklist-items' replaces the checklist, 'append-checklist-items' adds to it, and 'add-tags' adds tags. The whole batch is validated and rejected before writing if any id, reference, or date is one Things cannot decode.",
         inputSchema: {
           payload: z.any().describe("Things JSON array or object containing projects or to-dos to create or update"),
         },
@@ -1253,7 +1252,7 @@ export class ThingsMCP extends McpAgent {
       "things_delete_todo",
       {
         title: "Delete To-Do",
-        description: "Delete a to-do by moving it to Trash, or permanently purge it from Things Cloud.",
+        description: "Delete a to-do by moving it to Trash, or permanently purge it from Things Cloud. Only to-do ids are accepted; a project, heading, area, tag, or checklist item id is refused.",
         inputSchema: {
           id: z.string().describe("UUID of the to-do"),
           permanent: z.boolean().optional().default(false).describe("If true, deletes permanently; if false (default), moves to Trash"),
@@ -1269,7 +1268,7 @@ export class ThingsMCP extends McpAgent {
       async ({ id, permanent }) => {
         const client = await getClient();
         if (permanent) {
-          await client.deleteEntity(id);
+          await client.deleteTodo(id);
           return textResult(`To-do ${id} permanently deleted.`);
         } else {
           await client.trashTodo(id);
@@ -1283,7 +1282,7 @@ export class ThingsMCP extends McpAgent {
       "things_empty_trash",
       {
         title: "Empty Trash",
-        description: "Permanently delete and purge all items currently stored in the Things 3 Trash.",
+        description: "Permanently delete and purge all items currently stored in the Things 3 Trash. A trashed project or heading is purged together with everything inside it, as when the Trash is emptied in Things.",
         inputSchema: {},
         annotations: {
           title: "Empty Trash",
@@ -1296,7 +1295,8 @@ export class ThingsMCP extends McpAgent {
       async () => {
         const client = await getClient();
         const result = await client.emptyTrash();
-        return textResult(`Emptied Trash: permanently purged ${result.purgedCount} items.`);
+        const contained = result.containedCount ? ` (${result.trashedCount} trashed, plus ${result.containedCount} inside trashed projects or headings)` : "";
+        return textResult(`Emptied Trash: permanently purged ${result.purgedCount} items${contained}.`);
       }
     );
 
@@ -1305,7 +1305,7 @@ export class ThingsMCP extends McpAgent {
       "things_delete_checklist_item",
       {
         title: "Delete Checklist Item",
-        description: "Remove a checklist item from its to-do.",
+        description: "Permanently remove one checklist item from its to-do. Only a checklist item id is accepted; the parent to-do's id is refused.",
         inputSchema: {
           id: z.string().describe("Checklist item UUID"),
         },
@@ -1508,7 +1508,7 @@ export class ThingsMCP extends McpAgent {
       "things_import_csv",
       {
         title: "Import Tasks from CSV",
-        description: "Import tasks into Things 3 from CSV exports (supports Asana, Todoist, OmniFocus, and standard spreadsheet formats) with automatic mapping of titles, notes, due dates, creation dates, completion dates, and project/area assignment.",
+        description: "Import tasks into Things 3 from CSV exports (supports Asana, Todoist, OmniFocus, and standard spreadsheet formats) with automatic mapping of titles, notes, due dates, creation dates, completion dates, and project/area assignment. Rows are filed into projects, areas, and headings that already exist (matched by title); nothing but to-dos is created, and a row naming a missing project or heading fails the whole import. Create the projects and headings first, or use things_import_json.",
         inputSchema: {
           csv_data: z.string().describe("Raw CSV text content"),
           default_project: z.string().optional().describe("Optional default project name or UUID for tasks without a project"),
@@ -1642,7 +1642,7 @@ export class ThingsMCP extends McpAgent {
               text: `Audit and execute a migration from Asana to Things 3:
 1. Ask the user for their Asana CSV export or JSON data (or provide a preview with things_import_csv).
 2. Use things_get_project_stats to inspect the current state of Things 3 projects before importing.
-3. Import the tasks using things_import_csv (or things_import_json), ensuring sections map to headings, completed tasks preserve completion dates, and projects map to Things projects.
+3. things_import_csv only files rows into projects and headings that already exist, so first create each project (things_create_project) and its sections as headings (things_create_heading), or build the whole structure with things_import_json. Then import the tasks, checking that completed tasks keep their completion dates.
 4. Call things_get_logbook with since/until parameters to verify historical completed tasks were preserved accurately.
 5. Re-run things_get_project_stats to confirm project counts and task totals match expectations.`,
             },

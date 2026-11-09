@@ -37,7 +37,12 @@ export function dateToTimestamp(dateStr) {
   if (!dateStr) return null;
   const m = String(dateStr).match(DATE_RE);
   if (!m) throw new Error(`Invalid date "${dateStr}". Use YYYY-MM-DD.`);
-  return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) / 1000;
+  const ts = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) / 1000;
+  // Date.UTC rolls an impossible date forward (Feb 31 becomes Mar 3); refuse it instead.
+  if (new Date(ts * 1000).toISOString().slice(0, 10) !== m[0]) {
+    throw new Error(`Invalid date "${dateStr}": that day does not exist in the calendar.`);
+  }
+  return ts;
 }
 
 // ISO 8601 string, Date, or unix timestamp -> unix seconds.
@@ -165,6 +170,7 @@ const entityFamily = (name) => String(name).replace(/\d+$/, "");
 const TEMPLATE_SAFE_KEYS = new Set(["tt", "nt", "tg", "tr", "md", "pr", "agr", "ar", "ix"]);
 
 const isNum = (v) => typeof v === "number" && Number.isFinite(v);
+const illFormed = (v) => typeof v === "string" && typeof v.isWellFormed === "function" && !v.isWellFormed();
 const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const sameKeys = (o, keys) => isPlainObject(o) && Object.keys(o).length === keys.length && keys.every((k) => k in o);
 
@@ -240,6 +246,64 @@ function offsetProblems(entries, freq) {
   }
 }
 
+// Structural equality for JSON values, ignoring key order.
+function sameJson(a, b) {
+  if (a === b) return true;
+  if (Array.isArray(a) || Array.isArray(b)) return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => sameJson(v, b[i]));
+  if (!isPlainObject(a) || !isPlainObject(b)) return false;
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length && keys.every((k) => k in b && sameJson(a[k], b[k]));
+}
+
+// A repeat rule in words, for the read tools. Reads whatever the Things apps wrote, so anything
+// outside the known shapes is reported as unrecognized instead of guessed at.
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const ordinal = (n) => `${n}${n % 100 >= 11 && n % 100 <= 13 ? "th" : ["th", "st", "nd", "rd"][n % 10] || "th"}`;
+const listOf = (parts) => (parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}` : parts[0] || "");
+
+export function describeRepeatRule(rr, { hasDeadline = false } = {}) {
+  const unit = isPlainObject(rr) ? RR_UNITS[rr.fu] : null;
+  if (!unit || !Number.isInteger(rr.fa) || rr.fa < 1) return { summary: "Repeats (rule not recognized)", frequency: null };
+  const noun = { daily: "day", weekly: "week", monthly: "month", yearly: "year" }[unit];
+  const afterCompletion = rr.tp === 1;
+  const every = rr.fa === 1 ? `Every ${noun}` : `Every ${rr.fa} ${noun}s`;
+  const nth = (e) => `the ${e.wdo === -1 ? "last" : ordinal(e.wdo)} ${WEEKDAYS[e.wd]}`;
+  const dayOf = (e) => (e.dy === -1 ? "the last day" : `the ${ordinal(e.dy + 1)}`);
+  const of = Array.isArray(rr.of) ? rr.of.filter(isPlainObject) : [];
+
+  let on = "";
+  if (afterCompletion) on = " after completion";
+  else if (unit === "weekly" && of.length) on = ` on ${listOf(of.map((e) => WEEKDAYS[e.wd] ?? "?"))}`;
+  else if (unit === "monthly" && of.length) on = ` on ${listOf(of.map((e) => ("wd" in e ? nth(e) : dayOf(e))))}`;
+  else if (unit === "yearly" && of.length) {
+    const e = of[0];
+    on = "wd" in e ? ` on ${nth(e)} of ${MONTHS[e.mo] ?? "?"}` : e.dy === -1 ? ` on the last day of ${MONTHS[e.mo] ?? "?"}` : ` on ${MONTHS[e.mo] ?? "?"} ${e.dy + 1}`;
+  }
+
+  const endsOn = isNum(rr.ed) && rr.ed < RR_FAR_FUTURE ? timestampToDate(rr.ed) : null;
+  const count = Number.isInteger(rr.rc) && rr.rc > 0 ? rr.rc : null;
+  // With "Add deadlines" on, each date of the rule is a deadline and rr.ts is how many days before
+  // it the occurrence starts (0 or negative).
+  const startsDaysBeforeDeadline = hasDeadline && Number.isInteger(rr.ts) ? Math.abs(rr.ts) : null;
+  let summary = `${every}${on}`;
+  if (count) summary += `, ${count} time${count === 1 ? "" : "s"}`;
+  if (endsOn) summary += `, until ${endsOn}`;
+  if (hasDeadline) {
+    summary += startsDaysBeforeDeadline ? `; each date is a deadline and the to-do starts ${startsDaysBeforeDeadline} day${startsDaysBeforeDeadline === 1 ? "" : "s"} before it` : "; each occurrence has a deadline on its date";
+  }
+  return {
+    summary,
+    frequency: unit,
+    interval: rr.fa,
+    mode: afterCompletion ? "after-completion" : "fixed",
+    endsOn,
+    count,
+    hasDeadline,
+    startsDaysBeforeDeadline,
+  };
+}
+
 const NOTE_KEYS = ["_t", "ch", "v", "t"];
 const EMPTY_XX_KEYS = ["_t", "sn"];
 
@@ -305,6 +369,10 @@ export function validateChangeMap(body, db = null) {
       }
     }
     if ("tt" in p && typeof p.tt !== "string") add("tt must be a string");
+    // A lone surrogate is not valid UTF-8; Things cannot decode the text it ends up in.
+    if (illFormed(p.tt)) add("tt contains a lone surrogate");
+    if (illFormed(p.nt?.v)) add("nt.v contains a lone surrogate");
+    if (illFormed(p.sh)) add("sh contains a lone surrogate");
     if ("xx" in p && !xxOK(p.xx)) add('xx must be {"_t":"oo","sn":{}}');
     if ("ix" in p && !isNum(p.ix)) add("ix must be a finite number");
     if ("ss" in p && ![0, 2, 3].includes(p.ss)) add("ss must be 0, 2, or 3");
@@ -323,7 +391,6 @@ export function validateChangeMap(body, db = null) {
       if ("icc" in p && p.icc !== null && !inRange(p.icc, 0, Number.MAX_SAFE_INTEGER)) add("icc must be an integer >= 0");
       if ("rr" in p && p.rr !== null) for (const m of repeatRuleProblems(p.rr)) add(`rr ${m}`);
       for (const key of ["pr", "agr", "ar"]) if (Array.isArray(p[key]) && p[key].length > 1) add(`${key} may hold at most one id`);
-      if (typeof p.tt === "string" && typeof p.tt.isWellFormed === "function" && !p.tt.isWellFormed()) add("tt contains a lone surrogate");
     } else if (family === "ChecklistItem") {
       if ("ts" in p && !(Array.isArray(p.ts) && p.ts.length === 1)) add("a checklist item needs exactly one parent task in ts");
       if ("sp" in p && "ss" in p && (p.ss === 0) !== (p.sp === null)) add("sp must be null exactly when ss is 0");
@@ -369,6 +436,17 @@ function validateAgainstDatabase(body, db) {
     if (family === "Area") continue;
     if (family === "Tag") {
       refMust("pn", (r) => r !== id && shadow.tags.has(r), "an existing tag other than itself");
+      if ("pn" in p) {
+        // Walk up from the new parent; arriving back at this tag means it would be its own ancestor.
+        const seen = new Set();
+        for (let up = shadow.tags.get(id)?.parent; up && !seen.has(up); up = shadow.tags.get(up)?.parent) {
+          if (up === id) {
+            add(`pn would make tag ${id} its own ancestor`);
+            break;
+          }
+          seen.add(up);
+        }
+      }
       continue;
     }
 
@@ -404,7 +482,8 @@ function validateAgainstDatabase(body, db) {
       if (sr !== null && sr <= todayTs && t.start === 2) add(`st 2 (someday) with start date ${t.startDate}, which is today or past, is inconsistent`);
       if (t.start === 0 && sr !== null) add("an Inbox to-do (st 0) cannot have a start date");
     }
-    if ("ato" in p && t.reminderSeconds !== null && t.reminderSeconds !== undefined && !t.startDate && !t.recurrenceRule) {
+    if (["st", "tp"].some((k) => k in p) && t.type === 1 && t.start === 0) add("a project cannot be in the Inbox (st 0)");
+    if (("ato" in p || "sr" in p) && t.reminderSeconds !== null && t.reminderSeconds !== undefined && !t.startDate && !t.recurrenceRule) {
       add("a reminder time needs a start date");
     }
     if (["st", "pr", "agr", "ar", "tp"].some((k) => k in p) && t.type === 0 && t.start === 0 && (t.project || t.heading || t.area)) {
@@ -509,12 +588,19 @@ export function schedulingFields(when, timeZone) {
 function withReminder(fields, reminderTime, timeZone) {
   const ato = timeToSeconds(reminderTime);
   if (ato === null) return { ...fields, ato: null };
+  if (ato === 0) throw new Error("A reminder at 00:00 cannot be stored (Things reads 0 as no reminder). Use 00:01.");
   if (fields.sr === null || fields.sr === undefined) {
     const today = dateToTimestamp(localDate(timeZone));
     return { ...fields, st: 1, sr: today, tir: today, ato };
   }
   return { ...fields, ato };
 }
+
+const UNDATED_WHEN = ["inbox", "anytime", "someday"];
+const REMINDER_NEEDS_DATE = (when) => `A reminder needs a date, and "${when}" has none. Use when: "today" or a YYYY-MM-DD date, or leave the reminder out.`;
+
+const TASK_KINDS = ["to-do", "project", "heading"];
+const aKind = (kind) => `${/^[aeiou]/.test(kind) ? "an" : "a"} ${kind}`;
 
 const EMPTY_XX = () => ({ sn: {}, _t: "oo" });
 
@@ -802,14 +888,19 @@ export class ThingsCloudClient {
   }
 
   // Did a commit whose outcome we never saw (5xx, dropped connection) land? Reads the history
-  // after `ancestor` and looks for every key of the body with the same change type. Returns true,
-  // false, or null when the history cannot be read either.
+  // after `ancestor` and looks for every key of the body. An update only counts when its
+  // properties are the ones we sent (md is unique per commit), so another client's edit to the same
+  // item in that window is not mistaken for ours. Returns true, false, or null when the history
+  // cannot be read either.
   async commitLanded(body, ancestor) {
     try {
       const head = (await this.getHistoryMetadata()).latestServerIndex;
       const seen = new Set();
       for (const itemMap of await this.pullRange(ancestor, head)) {
-        for (const [id, ch] of Object.entries(body)) if (itemMap[id]?.t === ch.t) seen.add(id);
+        for (const [id, ch] of Object.entries(body)) {
+          const got = itemMap[id];
+          if (got?.t === ch.t && (ch.t !== 1 || sameJson(got.p, ch.p))) seen.add(id);
+        }
       }
       return seen.size === Object.keys(body).length;
     } catch {
@@ -937,8 +1028,13 @@ export class ThingsCloudClient {
     const db = await this.syncDatabase();
     const taskUUID = generateUUID();
     const now = toUnixTimestamp();
+    // A reminder needs a date: with no "when" it goes on today, and an undated list is refused.
+    if (reminderTime && UNDATED_WHEN.includes(when)) throw new Error(REMINDER_NEEDS_DATE(when));
     // A to-do in a project, heading, or area cannot sit in the Inbox; default to Anytime there.
-    if (when === undefined || when === null) when = project || heading || area ? "anytime" : "inbox";
+    if (when === undefined || when === null) when = reminderTime ? "today" : project || heading || area ? "anytime" : "inbox";
+    const projectId = project ? db.resolveRef("project", project) : null;
+    // With a project given, the heading must be one of that project's headings.
+    const headingId = heading ? (projectId ? db.resolveHeadingIn(projectId, heading) : db.resolveRef("heading", heading)) : null;
 
     let ss = status;
     if (completed === true) ss = 3;
@@ -950,8 +1046,8 @@ export class ThingsCloudClient {
       when,
       reminderTime,
       deadline,
-      project: project ? db.resolveRef("project", project) : null,
-      heading: heading ? db.resolveRef("heading", heading) : null,
+      project: projectId,
+      heading: headingId,
       area: area ? db.resolveRef("area", area) : null,
       tags: this.resolveTagIds(db, tags),
       status: ss,
@@ -968,6 +1064,7 @@ export class ThingsCloudClient {
           title: typeof item === "string" ? item : item.title,
           task: taskUUID,
           index: idx,
+          status: typeof item === "object" && [2, 3].includes(item.status) ? item.status : 0,
           now,
         }),
       });
@@ -1006,17 +1103,21 @@ export class ThingsCloudClient {
       p.nt = noteObject(baseNotes);
     }
 
-    if (updates.when !== undefined) Object.assign(p, withReminder(schedulingFields(updates.when, this.timeZone), null, this.timeZone), { ato: undefined });
-    if (updates.when !== undefined && p.ato === undefined) delete p.ato;
+    if (updates.when !== undefined) {
+      const sched = schedulingFields(updates.when, this.timeZone);
+      Object.assign(p, sched);
+      // A dated move keeps the reminder time. Inbox, Anytime, and Someday have no date, so the
+      // reminder is cleared with it (as the Things Reminders Sync writer does).
+      if (sched.sr === null) p.ato = null;
+    }
 
-    if (updates.reminderTime !== undefined) {
+    const reminderTime = [updates.reminderTime, updates["reminder-time"], updates.reminder].find((v) => v !== undefined);
+    if (reminderTime !== undefined) {
+      if (reminderTime && updates.when !== undefined && p.sr === null) throw new Error(REMINDER_NEEDS_DATE(updates.when));
       const existingSr = p.sr !== undefined ? p.sr : existing?.startDate ? dateToTimestamp(existing.startDate) : null;
-      Object.assign(p, withReminder({ st: p.st ?? 1, sb: p.sb ?? 0, sr: existingSr, tir: p.tir ?? null }, updates.reminderTime, this.timeZone));
-      if (updates.reminderTime) {
-        if (p.st === undefined) delete p.st;
-      }
+      Object.assign(p, withReminder({ st: p.st ?? 1, sb: p.sb ?? 0, sr: existingSr, tir: p.tir ?? null }, reminderTime, this.timeZone));
       if (updates.when === undefined) {
-        if (existingSr === null && updates.reminderTime) {
+        if (existingSr === null && reminderTime) {
           // sr/tir/st were set by withReminder
         } else {
           delete p.sr;
@@ -1052,40 +1153,28 @@ export class ThingsCloudClient {
       }
     }
 
-    // Containers: null or "" clears; a heading implies its project.
+    // Containers: null or "" clears; a heading implies its project. When a project (or a list that
+    // is a project) comes with a heading, the heading must be one of that project's headings and
+    // the to-do is filed under it.
+    const headingRef = updates.heading ?? updates["heading-id"];
+    const listRef = updates.list ?? updates["list-id"];
+    const list = listRef ? db.resolveListRef(listRef) : null;
+    const projectId = updates.project ? db.resolveRef("project", updates.project) : list?.type === "project" ? list.id : null;
+    const headingId = headingRef ? (projectId ? db.resolveHeadingIn(projectId, headingRef) : db.resolveRef("heading", headingRef)) : null;
+
     if (updates.heading !== undefined || updates["heading-id"] !== undefined) {
-      const headingRef = updates.heading ?? updates["heading-id"];
-      if (headingRef) {
-        p.agr = [db.resolveRef("heading", headingRef)];
-        p.pr = [];
-        p.ar = [];
-      } else {
-        p.agr = [];
-      }
+      p.agr = headingId ? [headingId] : [];
+      if (headingId) Object.assign(p, { pr: [], ar: [] });
     }
-    if (updates.project !== undefined) {
-      p.pr = updates.project ? [db.resolveRef("project", updates.project)] : [];
+    if (updates.project !== undefined && !headingId) {
+      p.pr = projectId ? [projectId] : [];
       p.agr = [];
-      if (updates.project) p.ar = [];
+      if (projectId) p.ar = [];
     }
-    if (updates.list !== undefined || updates["list-id"] !== undefined) {
-      const listRef = updates.list ?? updates["list-id"];
-      if (listRef) {
-        const resolved = db.resolveListRef(listRef);
-        if (resolved.type === "project") {
-          p.pr = [resolved.id];
-          p.agr = [];
-          p.ar = [];
-        } else {
-          p.ar = [resolved.id];
-          p.pr = [];
-          p.agr = [];
-        }
-      } else {
-        p.pr = [];
-        p.ar = [];
-        p.agr = [];
-      }
+    if ((updates.list !== undefined || updates["list-id"] !== undefined) && !headingId) {
+      p.pr = list?.type === "project" ? [list.id] : [];
+      p.ar = list?.type === "area" ? [list.id] : [];
+      p.agr = [];
     }
     if (updates.area !== undefined || updates["area-id"] !== undefined) {
       const areaRef = updates.area ?? updates["area-id"];
@@ -1096,6 +1185,7 @@ export class ThingsCloudClient {
       }
     }
     if (updates.tags !== undefined) p.tg = this.resolveTagIds(db, updates.tags);
+    if (updates["add-tags"]) p.tg = [...new Set([...(p.tg ?? existing?.tags ?? []), ...this.resolveTagIds(db, updates["add-tags"])])];
     if (updates.trashed !== undefined) p.tr = Boolean(updates.trashed);
     if (updates.type !== undefined) p.tp = updates.type;
 
@@ -1106,12 +1196,28 @@ export class ThingsCloudClient {
     return p;
   }
 
-  async updateTodo(uuid, updates = {}) {
+  // The to-do, project, and heading tools each accept only their own kind of item: a project or
+  // heading id given to a to-do tool (or the reverse) is refused, never written.
+  requireKind(db, uuid, type) {
+    const wanted = TASK_KINDS[type];
+    const t = db.tasks.get(uuid);
+    if (t?.type === type) return t;
+    const actual = db.kindOf(uuid);
+    if (!actual) throw new Error(`No ${wanted} with id ${uuid}.`);
+    const hint = t ? ` Use the ${actual} tools for it.` : "";
+    throw new Error(`${uuid} is ${aKind(actual)}, not a ${wanted}; nothing was changed.${hint}`);
+  }
+
+  async updateTask(uuid, updates, type) {
     const db = await this.syncDatabase();
-    if (!db.tasks.has(uuid)) throw new Error(`No to-do, project, or heading with id ${uuid}.`);
+    this.requireKind(db, uuid, type);
     const patch = this.buildTaskPatch(db, { ...updates, __uuid: uuid });
     await this.commitChanges([{ [uuid]: { t: 1, e: ENTITY.task, p: patch } }]);
     return { id: uuid, updated: true };
+  }
+
+  async updateTodo(uuid, updates = {}) {
+    return this.updateTask(uuid, updates, 0);
   }
 
   async trashTodo(uuid) {
@@ -1120,17 +1226,22 @@ export class ThingsCloudClient {
 
   // Tombstones for `ids` plus everything that would otherwise be left pointing at them: checklist
   // items, headings, and trashed children of a purged project or heading, and tag or area
-  // references on items that stay. Live children of a purged project are left alone; the
-  // validator then refuses the commit and names them.
+  // references on items that stay. A trashed project or heading takes all of its contents with it:
+  // Things keeps tr false on the to-dos inside a trashed project and removes them together with
+  // it when the Trash is emptied. Live children of a project that is not trashed are left alone;
+  // the validator then refuses the commit and names them.
   purgeChanges(db, ids) {
     const purge = new Set(ids);
     const now = toUnixTimestamp();
+    const withContents = new Set(ids.filter((id) => db.tasks.get(id)?.trashed));
     for (let grew = true; grew; ) {
       grew = false;
       for (const t of db.tasks.values()) {
         if (purge.has(t.uuid) || !(purge.has(t.project) || purge.has(t.heading))) continue;
-        if (t.type === 2 || t.trashed) {
+        const inTrashed = withContents.has(t.project) || withContents.has(t.heading);
+        if (t.type === 2 || t.trashed || inTrashed) {
           purge.add(t.uuid);
+          if (t.trashed || inTrashed) withContents.add(t.uuid);
           grew = true;
         }
       }
@@ -1155,12 +1266,26 @@ export class ThingsCloudClient {
     return changes;
   }
 
-  // Permanently remove an item. The entity name is taken from the database.
-  async deleteEntity(uuid) {
+  // Permanently remove one item of the named kind ("to-do", "project", "heading", or "checklist
+  // item"). An id of any other kind is refused: a parent's id given by mistake must not delete
+  // the parent.
+  async deleteEntity(uuid, kind) {
     const db = await this.syncDatabase();
-    if (!db.entityOf(uuid)) throw new Error(`No item with id ${uuid}.`);
+    if (kind === "checklist item") {
+      if (!db.checklists.has(uuid)) {
+        const actual = db.kindOf(uuid);
+        throw new Error(actual ? `${uuid} is ${aKind(actual)}, not a checklist item; nothing was deleted.` : `No checklist item with id ${uuid}.`);
+      }
+    } else {
+      if (!TASK_KINDS.includes(kind)) throw new Error(`deleteEntity needs a kind (${TASK_KINDS.join(", ")}, or checklist item).`);
+      this.requireKind(db, uuid, TASK_KINDS.indexOf(kind));
+    }
     await this.commitChanges(this.purgeChanges(db, [uuid]));
     return { id: uuid, deleted: true };
+  }
+
+  async deleteTodo(uuid) {
+    return this.deleteEntity(uuid, "to-do");
   }
 
   // --- Projects and headings --------------------------------------------------
@@ -1196,10 +1321,7 @@ export class ThingsCloudClient {
   }
 
   async updateProject(uuid, updates = {}) {
-    const db = await this.syncDatabase();
-    const task = db.tasks.get(uuid);
-    if (!task || task.type !== 1) throw new Error(`No project with id ${uuid}.`);
-    return this.updateTodo(uuid, updates);
+    return this.updateTask(uuid, updates, 1);
   }
 
   async createHeading({ project, title }) {
@@ -1212,9 +1334,9 @@ export class ThingsCloudClient {
   }
 
   async updateHeading(uuid, { title, deleted = false }) {
-    if (deleted) return this.deleteEntity(uuid);
+    if (deleted) return this.deleteEntity(uuid, "heading");
     const db = await this.syncDatabase();
-    if (db.tasks.get(uuid)?.type !== 2) throw new Error(`No heading with id ${uuid}.`);
+    this.requireKind(db, uuid, 2);
     await this.commitChanges([{ [uuid]: { t: 1, e: ENTITY.task, p: { tt: title, md: toUnixTimestamp() } } }]);
     return { id: uuid, title, updated: true };
   }
@@ -1256,8 +1378,16 @@ export class ThingsCloudClient {
     return { id: uuid, deleted: true, contentsPurged: deleteContents };
   }
 
+  // Things keeps tag titles unique; a second "work" beside "Work" would make every later write
+  // that names the tag ambiguous.
+  requireFreeTagTitle(db, title, exceptId = null) {
+    const clash = [...db.tags.values()].find((g) => g.uuid !== exceptId && (g.title || "").toLowerCase() === String(title).trim().toLowerCase());
+    if (clash) throw new Error(`A tag named "${clash.title}" already exists (${clash.uuid}).`);
+  }
+
   async createTag({ title, shortcut = null, parent = null }) {
     const db = await this.syncDatabase();
+    this.requireFreeTagTitle(db, title);
     const uuid = generateUUID();
     await this.commitChanges([
       {
@@ -1282,7 +1412,10 @@ export class ThingsCloudClient {
     if (!db.tags.has(uuid)) throw new Error(`No tag with id ${uuid}.`);
     const now = toUnixTimestamp();
     const p = { md: now };
-    if (title !== undefined) p.tt = title;
+    if (title !== undefined) {
+      this.requireFreeTagTitle(db, title, uuid);
+      p.tt = title;
+    }
     if (shortcut !== undefined) p.sh = shortcut || null;
     if (parent !== undefined) p.pn = parent ? [db.resolveRef("tag", parent)] : [];
     await this.commitChanges([{ [uuid]: { t: 1, e: ENTITY.tag, p } }]);
@@ -1366,15 +1499,15 @@ export class ThingsCloudClient {
   }
 
   async deleteChecklistItem(uuid) {
-    return this.deleteEntity(uuid);
+    return this.deleteEntity(uuid, "checklist item");
   }
 
   // --- Compound operations -----------------------------------------------------
 
   async duplicateTodo(uuid) {
     const db = await this.syncDatabase();
-    const orig = db.tasks.get(uuid);
-    if (!orig) throw new Error(`To-do not found: ${uuid}`);
+    const orig = this.requireKind(db, uuid, 0);
+    if (orig.recurrenceRule) throw new Error(`${uuid} is a repeating template; duplicate repeating to-dos in Things.`);
     return this.createTodo({
       title: `${orig.title || "Untitled"} (Copy)`,
       notes: orig.notes || "",
@@ -1385,7 +1518,7 @@ export class ThingsCloudClient {
       heading: orig.heading,
       area: orig.area,
       tags: orig.tags || [],
-      checklist: db.checklistItemsFor(uuid).map((c) => c.title),
+      checklist: db.checklistItemsFor(uuid).map((c) => ({ title: c.title, status: c.status })),
     });
   }
 
@@ -1393,8 +1526,13 @@ export class ThingsCloudClient {
     const db = await this.syncDatabase();
     const trashed = [...db.tasks.values()].filter((t) => t.trashed);
     if (!trashed.length) return { purgedCount: 0 };
-    await this.commitChanges(this.purgeChanges(db, trashed.map((t) => t.uuid)));
-    return { purgedCount: trashed.length };
+    const changes = this.purgeChanges(db, trashed.map((t) => t.uuid));
+    await this.commitChanges(changes);
+    // Everything tombstoned, checklist items included; containedCount is what went with a trashed
+    // project or heading without being marked trashed itself.
+    const purged = changes.filter((c) => Object.values(c)[0].t === 2).map((c) => Object.keys(c)[0]);
+    const tasksPurged = purged.filter((id) => db.tasks.has(id));
+    return { purgedCount: tasksPurged.length, trashedCount: trashed.length, containedCount: tasksPurged.length - trashed.length };
   }
 
   async moveTodo(uuid, { when, project, heading, area }) {
@@ -1409,12 +1547,14 @@ export class ThingsCloudClient {
   // Turn a to-do into a project; its checklist items become to-dos inside it.
   async convertTodoToProject(uuid) {
     const db = await this.syncDatabase();
-    const task = db.tasks.get(uuid);
-    if (!task || task.type !== 0) throw new Error(`To-do not found: ${uuid}`);
+    const task = this.requireKind(db, uuid, 0);
 
     const checklistItems = db.checklistItemsFor(uuid);
     const now = toUnixTimestamp();
-    const changes = [{ [uuid]: { t: 1, e: ENTITY.task, p: { tp: 1, pr: [], agr: [], md: now } } }];
+    const patch = { tp: 1, pr: [], agr: [], md: now };
+    // Things has no Inbox projects: a project made from an Inbox to-do goes to Anytime.
+    if (task.start === 0) Object.assign(patch, { st: 1, sb: 0 });
+    const changes = [{ [uuid]: { t: 1, e: ENTITY.task, p: patch } }];
 
     checklistItems.forEach((item, idx) => {
       const todo = buildTaskCreate({
@@ -1448,8 +1588,8 @@ export class ThingsCloudClient {
     let todosUpdated = 0;
     const itemResults = [];
 
-    const addChecklist = (attrs, todoUUID) => {
-      (attrs["checklist-items"] || attrs.checklist || []).forEach((cl, idx) => {
+    const addChecklist = (attrs, todoUUID, items = attrs["checklist-items"] || attrs.checklist || [], firstIndex = 0) => {
+      items.forEach((cl, idx) => {
         const title = typeof cl === "string" ? cl : cl.title || cl.attributes?.title;
         const isCompleted = typeof cl === "object" && (cl.completed === true || cl.status === "completed" || cl.attributes?.completed === true);
         const isCanceled = typeof cl === "object" && (cl.canceled === true || cl.status === "canceled" || cl.attributes?.canceled === true);
@@ -1458,13 +1598,14 @@ export class ThingsCloudClient {
           [generateUUID()]: buildChecklistCreate({
             title,
             task: todoUUID,
-            index: idx,
+            index: firstIndex + idx,
             status,
             now,
           }),
         });
       });
     };
+    const updated = new Map();
 
     // The connector mints every new id itself. An id on a create usually means the caller meant
     // "operation": "update"; writing it would fork or overwrite an item, so refuse instead.
@@ -1508,14 +1649,29 @@ export class ThingsCloudClient {
           throw new Error(`Item ${item.id} is not a to-do.`);
         }
 
+        if ("prepend-checklist-items" in attrs) throw new Error(`"prepend-checklist-items" is not supported on updates; use "checklist-items" (replaces) or "append-checklist-items".`);
         const patch = this.buildTaskPatch(db, { ...attrs, __uuid: item.id }, now);
-        changes.push({ [item.id]: { t: 1, e: ENTITY.task, p: patch } });
+        // A commit holds one change per id, so a second update of the same item joins the first.
+        if (updated.has(item.id)) Object.assign(updated.get(item.id), patch);
+        else {
+          updated.set(item.id, patch);
+          changes.push({ [item.id]: { t: 1, e: ENTITY.task, p: patch } });
+        }
         db.applyChangeMap({ [item.id]: { t: 1, e: ENTITY.task, p: patch } });
         if (type === "project") projectsUpdated++;
         else todosUpdated++;
         itemResults.push({ id: item.id, type, operation: "updated", title: patch.tt || existing.title || "Untitled" });
+        // "checklist-items" replaces the checklist, as in Things JSON; "append-checklist-items" adds to it.
+        const current = db.checklistItemsFor(item.id);
         if (attrs["checklist-items"] || attrs.checklist) {
+          for (const c of current) {
+            const tombstone = { [c.uuid]: { t: 2, e: ENTITY.checklist, p: {} } };
+            changes.push(tombstone);
+            db.applyChangeMap(tombstone);
+          }
           addChecklist(attrs, item.id);
+        } else if (attrs["append-checklist-items"]) {
+          addChecklist(attrs, item.id, attrs["append-checklist-items"], current.reduce((max, c) => Math.max(max, c.index ?? 0), -1) + 1);
         }
       } else if (type === "project") {
         const projectUUID = generateUUID();
@@ -1595,10 +1751,12 @@ export class ThingsCloudClient {
         let heading = null;
         let area = null;
 
-        if (attrs["heading-id"] || attrs.heading) {
-          heading = db.resolveRef("heading", attrs["heading-id"] || attrs.heading);
-        } else if (attrs["list-id"] || attrs.list) {
-          const listRef = db.resolveListRef(attrs["list-id"] || attrs.list);
+        const headingRef = attrs["heading-id"] || attrs.heading;
+        const listRef = attrs["list-id"] || attrs.list ? db.resolveListRef(attrs["list-id"] || attrs.list) : null;
+        if (headingRef) {
+          // With a project list given, the heading must be one of that project's headings.
+          heading = listRef?.type === "project" ? db.resolveHeadingIn(listRef.id, headingRef) : db.resolveRef("heading", headingRef);
+        } else if (listRef) {
           if (listRef.type === "project") project = listRef.id;
           else area = listRef.id;
         } else if (attrs["area-id"] || attrs.area) {
@@ -1652,20 +1810,26 @@ export class ThingsCloudClient {
     };
   }
 
+  // To-dos and projects carry tags; headings do not.
+  taggable(db, uuid) {
+    const task = db.tasks.get(uuid);
+    if (!task) throw new Error(`Task not found: ${uuid}`);
+    if (task.type === 2) throw new Error(`${uuid} is a heading; only to-dos and projects carry tags.`);
+    return task;
+  }
+
   async addTagsToTask(taskUUID, tagNames) {
     const db = await this.syncDatabase();
-    const task = db.tasks.get(taskUUID);
-    if (!task) throw new Error(`Task not found: ${taskUUID}`);
+    const task = this.taggable(db, taskUUID);
     const merged = [...new Set([...(task.tags || []), ...this.resolveTagIds(db, tagNames)])];
-    return this.updateTodo(taskUUID, { tags: merged });
+    return this.updateTask(taskUUID, { tags: merged }, task.type);
   }
 
   async removeTagsFromTask(taskUUID, tagNames) {
     const db = await this.syncDatabase();
-    const task = db.tasks.get(taskUUID);
-    if (!task) throw new Error(`Task not found: ${taskUUID}`);
+    const task = this.taggable(db, taskUUID);
     const remove = new Set(this.resolveTagIds(db, tagNames));
-    return this.updateTodo(taskUUID, { tags: (task.tags || []).filter((id) => !remove.has(id)) });
+    return this.updateTask(taskUUID, { tags: (task.tags || []).filter((id) => !remove.has(id)) }, task.type);
   }
 
   // One commit: every item lands or none does. The result lists each item so the caller can see
@@ -1676,7 +1840,7 @@ export class ThingsCloudClient {
       throw new Error('Operation "set_dates" needs deadline, completion_date, or creation_date.');
     }
     const db = await this.syncDatabase();
-    return this.commitBatch(db, uuids, operation, "Task", (uuid) => db.tasks.has(uuid), (uuid, now) =>
+    return this.commitBatch(db, uuids, operation, "To-do", (uuid) => db.tasks.get(uuid)?.type === 0, (uuid, now) =>
       this.buildTaskPatch(db, {
         __uuid: uuid,
         status: operation === "complete" ? "completed" : operation === "cancel" ? "canceled" : undefined,
@@ -1692,6 +1856,9 @@ export class ThingsCloudClient {
   async batchUpdateProjects(uuids, operation, options = {}) {
     if (operation === "reschedule" && !options.when) throw new Error('Operation "reschedule" needs "when".');
     if (operation === "set_area" && !options.area) throw new Error('Operation "set_area" needs "area".');
+    if (operation === "set_dates" && !(options.when || options.area || options.deadline || options.completionDate || options.completion_date || options.creationDate || options.creation_date)) {
+      throw new Error('Operation "set_dates" needs when, deadline, completion_date, or creation_date.');
+    }
     const db = await this.syncDatabase();
     return this.commitBatch(db, uuids, operation, "Project", (uuid) => db.tasks.get(uuid)?.type === 1, (uuid, now) =>
       this.buildTaskPatch(db, {
@@ -1710,7 +1877,10 @@ export class ThingsCloudClient {
   async commitBatch(db, uuids, operation, label, exists, patchFor) {
     const ids = [...new Set(uuids)];
     const missing = ids.filter((uuid) => !exists(uuid));
-    if (missing.length) throw new Error(`${label} not found: ${missing.join(", ")}. Nothing was written.`);
+    if (missing.length) {
+      const named = missing.map((uuid) => (db.kindOf(uuid) ? `${uuid} (${aKind(db.kindOf(uuid))})` : uuid));
+      throw new Error(`${label} not found: ${named.join(", ")}. Nothing was written.`);
+    }
     const now = toUnixTimestamp();
     const changes = ids.map((uuid) => ({ [uuid]: { t: 1, e: ENTITY.task, p: patchFor(uuid, now) } }));
     await this.commitChanges(changes);
@@ -1912,7 +2082,12 @@ export class ThingsDatabase {
     if ("sb" in p) out.startBucket = p.sb;
     if ("sr" in p) out.startDate = timestampToDate(p.sr);
     if ("tir" in p) out.todayRefDate = timestampToDate(p.tir);
-    if ("dd" in p) out.deadline = timestampToDate(p.dd);
+    if ("dd" in p) {
+      // A repeating template with "Add deadlines" carries the far-future sentinel, not a real date.
+      out.deadlineSentinel = isNum(p.dd) && p.dd >= RR_FAR_FUTURE;
+      out.deadline = out.deadlineSentinel ? null : timestampToDate(p.dd);
+    }
+    if ("dds" in p) out.deadlineSuppressed = p.dds !== null && p.dds !== undefined;
     if ("ato" in p) out.reminderSeconds = p.ato;
     if ("pr" in p) out.project = first(p.pr);
     if ("agr" in p) out.heading = first(p.agr);
@@ -1972,7 +2147,7 @@ export class ThingsDatabase {
       tag: [this.tags, (t) => true],
       area: [this.areas, () => true],
       project: [this.tasks, (t) => t.type === 1 && !t.trashed],
-      heading: [this.tasks, (t) => t.type === 2 && !t.trashed],
+      heading: [this.tasks, (t) => t.type === 2 && !t.trashed && !this.tasks.get(t.project)?.trashed],
     };
     const [map, accept] = pools[kind];
     const byId = map.get(wanted);
@@ -1985,6 +2160,30 @@ export class ThingsDatabase {
     }
     const hint = kind === "tag" ? " Create it with create_tag first." : "";
     throw new Error(`No ${kind} found for "${wanted}".${hint}`);
+  }
+
+  // A heading of one given project, by id or (case-insensitive) title. A heading that exists only
+  // in another project is refused, and a title shared with other projects is not ambiguous here.
+  resolveHeadingIn(projectId, value) {
+    const wanted = String(value).trim();
+    const live = (t) => t?.type === 2 && !t.trashed;
+    const named = (t) => live(t) && (t.uuid === wanted || (t.title || "").toLowerCase() === wanted.toLowerCase());
+    const all = [...this.tasks.values()].filter(named);
+    const here = all.filter((t) => t.project === projectId);
+    const project = this.tasks.get(projectId)?.title || projectId;
+    if (here.length === 1) return here[0].uuid;
+    if (here.length > 1) throw new Error(`More than one heading in project "${project}" is named "${wanted}". Use its id instead: ${here.map((h) => h.uuid).join(", ")}.`);
+    if (all.length) throw new Error(`Heading "${wanted}" belongs to another project, not "${project}". Nothing was written.`);
+    throw new Error(`No heading found for "${wanted}" in project "${project}".`);
+  }
+
+  kindOf(uuid) {
+    const t = this.tasks.get(uuid);
+    if (t) return TASK_KINDS[t.type] || "to-do";
+    if (this.checklists.has(uuid)) return "checklist item";
+    if (this.areas.has(uuid)) return "area";
+    if (this.tags.has(uuid)) return "tag";
+    return null;
   }
 
   // Resolve a list reference which can be either a project or an area.
@@ -2037,6 +2236,8 @@ export class ThingsDatabase {
   }
 
   whenOf(t) {
+    // A template is the hidden holder of a rule, not a Someday to-do.
+    if (t.recurrenceRule) return "repeating";
     if (t.start === 0) return "inbox";
     if (t.start === 2) return t.startDate || "someday";
     if (t.startDate && t.startDate <= this.today()) return t.startBucket === 1 ? "evening" : "today";
@@ -2047,14 +2248,23 @@ export class ThingsDatabase {
     const projectId = this.projectIdOf(t);
     const checklist = this.resolveChecklistItems(t.uuid);
 
+    const template = Boolean(t.recurrenceRule);
+    const rule = template ? describeRepeatRule(t.recurrenceRule, { hasDeadline: Boolean(t.deadlineSentinel) }) : null;
+
     return {
       id: t.uuid,
       title: t.title,
       notes: t.notes || "",
       status: t.status === 3 ? "completed" : t.status === 2 ? "canceled" : "open",
       when: this.whenOf(t),
-      scheduledDate: t.startDate || null,
+      scheduledDate: template ? null : t.startDate || null,
       deadline: t.deadline || null,
+      // A repeating template: the rule in words, and the day Things will show the next occurrence.
+      // An occurrence is an ordinary to-do that names its template.
+      repeating: template || undefined,
+      repeatRule: rule?.summary,
+      repeat: rule ? { ...rule, nextOccurrence: t.todayRefDate || null } : undefined,
+      repeatTemplateId: (!template && t.repeatingTemplates?.[0]) || undefined,
       reminderTime: secondsToTime(t.reminderSeconds),
       creationDate: t.creationDate ? new Date(t.creationDate * 1000).toISOString() : null,
       completionDate: t.stopDate ? new Date(t.stopDate * 1000).toISOString() : null,
@@ -2077,8 +2287,20 @@ export class ThingsDatabase {
     return !t.trashed && !t.recurrenceRule;
   }
 
+  // Things leaves tr false on the contents of a trashed project (or heading); they are in the
+  // Trash with it all the same.
+  inTrashedContainer(t) {
+    const heading = t.heading ? this.tasks.get(t.heading) : null;
+    return Boolean(heading?.trashed || this.tasks.get(this.projectIdOf(t))?.trashed);
+  }
+
+  // Open to-dos as the Things lists show them: also not inside a trashed, completed, or canceled project.
   getOpenTasks() {
-    return [...this.tasks.values()].filter((t) => t.type === 0 && t.status === 0 && this.isLive(t));
+    return [...this.tasks.values()].filter((t) => {
+      if (t.type !== 0 || t.status !== 0 || !this.isLive(t) || this.inTrashedContainer(t)) return false;
+      const project = this.tasks.get(this.projectIdOf(t));
+      return !project || !project.status;
+    });
   }
 
   getInbox() {
@@ -2089,8 +2311,14 @@ export class ThingsDatabase {
 
   getToday() {
     const today = this.today();
+    // As in the Things app: everything whose start date has arrived, including scheduled to-dos
+    // still at st 2 (the apps flip them to st 1 only when they next run), plus to-dos with no
+    // start date whose deadline is today or overdue, unless that deadline was dismissed from Today.
     return this.getOpenTasks()
-      .filter((t) => t.start === 1 && t.startDate && t.startDate <= today)
+      .filter((t) => {
+        if (t.startDate) return t.start !== 0 && t.startDate <= today;
+        return Boolean(t.deadline && t.deadline <= today && !t.deadlineSuppressed);
+      })
       .sort((a, b) => (a.startBucket || 0) - (b.startBucket || 0) || (a.todayIndex || 0) - (b.todayIndex || 0))
       .map((t) => this.formatTask(t));
   }
@@ -2101,22 +2329,30 @@ export class ThingsDatabase {
     return this.getOpenTasks()
       .filter((t) => {
         const scheduled = t.startDate && t.startDate > today && t.startDate <= last;
-        const hasDeadline = t.deadline && t.deadline <= last;
+        const hasDeadline = t.deadline && t.deadline > today && t.deadline <= last;
         return scheduled || hasDeadline;
       })
       .sort((a, b) => (a.startDate || a.deadline || "").localeCompare(b.startDate || b.deadline || ""))
       .map((t) => this.formatTask(t));
   }
 
+  // Read filters take an id or a title the way writes do: case-insensitive, and an unknown or
+  // ambiguous name is an error instead of an empty list.
+  filterId(kind, value) {
+    return value ? this.resolveRef(kind, value) : null;
+  }
+
   matchesArea(t, area) {
-    return !area || t.area === area || this.areas.get(t.area)?.title === area;
+    return !area || t.area === area;
   }
 
   matchesTag(t, tag) {
-    return !tag || (t.tags || []).some((id) => id === tag || this.tags.get(id)?.title === tag);
+    return !tag || (t.tags || []).includes(tag);
   }
 
   getAnytime({ area = null, tag = null } = {}) {
+    area = this.filterId("area", area);
+    tag = this.filterId("tag", tag);
     return this.getOpenTasks()
       .filter((t) => t.start === 1 && this.matchesArea(t, area) && this.matchesTag(t, tag))
       .map((t) => this.formatTask(t));
@@ -2144,11 +2380,12 @@ export class ThingsDatabase {
       limit = limitOrOptions;
     }
 
-    const sinceTs = since ? (typeof since === "number" ? since : parseIsoDate(since)) : null;
-    let untilTs = until ? (typeof until === "number" ? until : parseIsoDate(until)) : null;
-    if (until && typeof until === "string" && until.length === 10 && untilTs !== null) {
-      untilTs += 86399;
-    }
+    // A bare YYYY-MM-DD bound is a calendar day in the connector's time zone, like every other date
+    // the tools show; a full timestamp is compared as an instant.
+    const sinceDay = isDateString(since) ? since : null;
+    const untilDay = isDateString(until) ? until : null;
+    const sinceTs = since && !sinceDay ? (typeof since === "number" ? since : parseIsoDate(since)) : null;
+    const untilTs = until && !untilDay ? (typeof until === "number" ? until : parseIsoDate(until)) : null;
 
     return [...this.tasks.values()]
       .filter((t) => {
@@ -2164,6 +2401,9 @@ export class ThingsDatabase {
         const itemTs = t.stopDate || t.modificationDate || 0;
         if (sinceTs !== null && itemTs < sinceTs) return false;
         if (untilTs !== null && itemTs > untilTs) return false;
+        const itemDay = sinceDay || untilDay ? localDate(this.timeZone, itemTs) : null;
+        if (sinceDay && itemDay < sinceDay) return false;
+        if (untilDay && itemDay > untilDay) return false;
 
         return true;
       })
@@ -2185,7 +2425,14 @@ export class ThingsDatabase {
     return [...this.tasks.values()].filter((t) => t.trashed).map((t) => this.formatTask(t));
   }
 
+  // The to-dos of a project, directly or under its headings. Repeating templates are left out:
+  // they are hidden rule holders, and their occurrences are the to-dos.
+  projectTodos(projectId) {
+    return [...this.tasks.values()].filter((t) => t.type === 0 && this.isLive(t) && this.projectIdOf(t) === projectId);
+  }
+
   getProjects({ status = "open", area = null } = {}) {
+    area = this.filterId("area", area);
     return [...this.tasks.values()]
       .filter((t) => {
         if (t.type !== 1 || t.trashed) return false;
@@ -2194,7 +2441,7 @@ export class ThingsDatabase {
         return this.matchesArea(t, area);
       })
       .map((p) => {
-        const todos = [...this.tasks.values()].filter((t) => t.type === 0 && !t.trashed && this.projectIdOf(t) === p.uuid);
+        const todos = this.projectTodos(p.uuid);
         const completed = todos.filter((t) => t.status === 3 || t.status === 2).length; // canceled counts as done, as in Things
         return {
           id: p.uuid,
@@ -2216,6 +2463,7 @@ export class ThingsDatabase {
   }
 
   getProjectStats({ area = null } = {}) {
+    area = this.filterId("area", area);
     const today = this.today();
     const allProjects = [...this.tasks.values()].filter(
       (t) => t.type === 1 && !t.trashed && this.matchesArea(t, area)
@@ -2232,9 +2480,7 @@ export class ThingsDatabase {
     let overdueProjectsCount = 0;
 
     const projectSummaries = allProjects.map((p) => {
-      const todos = [...this.tasks.values()].filter(
-        (t) => t.type === 0 && !t.trashed && this.projectIdOf(t) === p.uuid
-      );
+      const todos = this.projectTodos(p.uuid);
       const completed = todos.filter((t) => t.status === 3 || t.status === 2).length;
       const open = todos.length - completed;
       const isOverdue = p.status === 0 && Boolean(p.deadline && p.deadline < today);
@@ -2277,11 +2523,18 @@ export class ThingsDatabase {
     };
   }
 
+  // Among several items with the same title, the one a person most likely means: not trashed, not
+  // a repeating template, open.
+  static bestMatch(matches) {
+    const rank = (t) => (t.trashed ? 4 : 0) + (t.recurrenceRule ? 2 : 0) + (t.status ? 1 : 0);
+    return [...matches].sort((a, b) => rank(a) - rank(b))[0];
+  }
+
   findProject(identifier) {
+    const byId = this.tasks.get(identifier);
+    if (byId?.type === 1) return byId;
     const wanted = String(identifier).toLowerCase();
-    return [...this.tasks.values()].find(
-      (t) => t.type === 1 && (t.uuid === identifier || (t.title && t.title.toLowerCase() === wanted))
-    );
+    return ThingsDatabase.bestMatch([...this.tasks.values()].filter((t) => t.type === 1 && t.title && t.title.toLowerCase() === wanted));
   }
 
   getProject(projectIdentifier) {
@@ -2295,11 +2548,14 @@ export class ThingsDatabase {
       .map((h) => ({
         id: h.uuid,
         title: h.title,
-        tasks: all.filter((t) => t.type === 0 && t.heading === h.uuid && !t.trashed).map((t) => this.formatTask(t)),
+        tasks: all.filter((t) => t.type === 0 && t.heading === h.uuid && this.isLive(t)).map((t) => this.formatTask(t)),
       }));
 
     const ungroupedTasks = all
-      .filter((t) => t.type === 0 && t.project === p.uuid && !t.heading && !t.trashed)
+      .filter((t) => t.type === 0 && t.project === p.uuid && !t.heading && this.isLive(t))
+      .map((t) => this.formatTask(t));
+    const repeatingTemplates = all
+      .filter((t) => t.type === 0 && !t.trashed && t.recurrenceRule && this.projectIdOf(t) === p.uuid)
       .map((t) => this.formatTask(t));
 
     return {
@@ -2316,6 +2572,8 @@ export class ThingsDatabase {
       tags: this.tagTitles(p.tags),
       headings,
       ungroupedTasks,
+      // Rules that generate to-dos in this project; not to-dos themselves and not counted as open.
+      repeatingTemplates: repeatingTemplates.length ? repeatingTemplates : undefined,
     };
   }
 
@@ -2348,24 +2606,25 @@ export class ThingsDatabase {
 
   getTask(taskIdentifier) {
     const wanted = String(taskIdentifier).toLowerCase();
-    const t =
-      this.tasks.get(taskIdentifier) ||
-      [...this.tasks.values()].find((task) => task.title && task.title.toLowerCase() === wanted);
+    const titled = [...this.tasks.values()].filter((task) => task.title && task.title.toLowerCase() === wanted);
+    // By title: a to-do before a project or heading of the same name, then the most likely one.
+    const t = this.tasks.get(taskIdentifier) || ThingsDatabase.bestMatch(titled.some((x) => x.type === 0) ? titled.filter((x) => x.type === 0) : titled);
     return t ? this.formatTask(t) : null;
   }
 
   search(query, { status = "open", includeNotes = true, area = null, project = null, tag = null } = {}) {
     const q = query.toLowerCase();
+    area = this.filterId("area", area);
+    tag = this.filterId("tag", tag);
+    project = this.filterId("project", project);
     return [...this.tasks.values()]
       .filter((t) => {
-        if (t.trashed || t.type === 2) return false;
+        // Repeating templates are listed by getRepeatingTodos; here they would double every occurrence.
+        if (!this.isLive(t) || t.type === 2) return false;
         if (status === "open" && t.status !== 0) return false;
         if (status === "completed" && t.status !== 3) return false;
         if (!this.matchesArea(t, area)) return false;
-        if (project) {
-          const pid = this.projectIdOf(t);
-          if (pid !== project && this.tasks.get(pid)?.title !== project) return false;
-        }
+        if (project && this.projectIdOf(t) !== project) return false;
         if (!this.matchesTag(t, tag)) return false;
         return (t.title || "").toLowerCase().includes(q) || (includeNotes && (t.notes || "").toLowerCase().includes(q));
       })
@@ -2381,7 +2640,7 @@ export class ThingsDatabase {
     const future = [];
 
     for (const t of this.tasks.values()) {
-      if (!this.isLive(t) || t.status !== 0 || !t.deadline || t.type === 2) continue;
+      if (!this.isLive(t) || this.inTrashedContainer(t) || t.status !== 0 || !t.deadline || t.type === 2) continue;
       const item = this.formatTask(t);
       if (t.deadline < today) overdue.push(item);
       else if (t.deadline === today) dueToday.push(item);
@@ -2395,7 +2654,7 @@ export class ThingsDatabase {
 
   getDailySummary() {
     const today = this.today();
-    const todos = [...this.tasks.values()].filter((t) => this.isLive(t) && t.type === 0);
+    const todos = [...this.tasks.values()].filter((t) => this.isLive(t) && t.type === 0 && !this.inTrashedContainer(t));
 
     const completedToday = todos
       .filter((t) => t.status === 3 && t.stopDate && localDate(this.timeZone, t.stopDate) === today)
@@ -2473,7 +2732,7 @@ export class ThingsDatabase {
 
     return {
       totalTodos: todos.length,
-      openTodos: todos.filter((t) => t.status === 0).length,
+      openTodos: this.getOpenTasks().length,
       completedTodos: todos.filter((t) => t.status === 3).length,
       totalProjects: projects.length,
       openProjects: projects.filter((p) => p.status === 0).length,

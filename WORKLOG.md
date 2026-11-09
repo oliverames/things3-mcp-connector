@@ -1,5 +1,41 @@
 # Things MCP connector worklog
 
+## 2026-11-09 - Audit fixes: delete guards, login page escaping, Today and repeating reads (not deployed, not committed)
+
+Source: the read-only connector audit and the Swift/JavaScript write parity audit of the same day. Each finding was reproduced against the code first: every new test fails on `8e36a3d` and passes now.
+
+**Writes**
+- The permanent-delete paths take the kind they are allowed to delete. `things_delete_checklist_item` with a to-do id, `things_delete_todo` with a project, heading, area, tag, or checklist id, and `things_update_heading delete` with a project id are refused with nothing written. `deleteEntity` no longer works without a kind.
+- To-do tools (`update`, `complete`, `cancel`, `move`, `delete`, `duplicate`, the to-do batch) refuse project and heading ids; project tools refuse to-do ids. The error names what the id is.
+- A tag parent that would make a tag its own ancestor is refused by the validator. A tag title that already exists (any case) is refused.
+- Impossible calendar dates are refused in `dateToTimestamp`.
+- `when` of inbox, anytime, or someday writes `ato: null`, as the Swift writer does. The validator now checks "a reminder needs a start date" whenever `sr` or `ato` changes. A reminder together with an undated `when` is refused; a reminder with no `when` on a new to-do schedules it for today, and the reply says so. `reminder_time` and `deadline` accept `null` or `""` to clear. 00:00 gets its own message.
+- Converting an Inbox to-do to a project also writes `st 1, sb 0`. The validator refuses a project at `st 0`.
+- Project plus heading: the heading is resolved among that project's headings and the to-do is filed under it (`agr: [heading], pr: []`); a heading of another project is refused. The same holds for `list` plus `heading` in `import_json` and CSV rows. A heading whose project is trashed can no longer be a target.
+- Lone surrogates are refused in `tt` of every entity, in `nt.v`, and in `sh`.
+- `commitLanded` counts an update as ours only when the history item carries the properties we sent, so another client's edit to the same id after a 5xx leads to a resend instead of a false "done".
+- `things_empty_trash` purges a trashed project or heading together with everything inside it (Things leaves `tr: false` on those children and removes them with the project). A project that is not trashed still cannot be purged from under live to-dos. The reply separates trashed items from contained ones.
+- `import_json` updates: two updates for one id are merged, `checklist-items` replaces the checklist, `append-checklist-items` and `add-tags` are applied, `reminder` and `reminder-time` are honored, and `prepend-checklist-items` is an error instead of a silent drop.
+- `things_duplicate_todo` keeps checklist state and refuses repeating templates. The project batch refuses `set_dates` with nothing to set.
+
+**Reads**
+- Today: open to-dos whose start date has arrived at `st 1` or `st 2`, plus to-dos with no start date whose deadline is today or overdue and was not dismissed (`dds` null). Decision on overdue deadlines: they are in Today, because that is where the Things app shows them; Upcoming now lists future deadlines only. To-dos in a trashed project or under a trashed heading, and open to-dos in a completed or canceled project, are not listed as live.
+- Repeating templates: `"repeating": true`, `"when": "repeating"`, `repeatRule` in words, a `repeat` object, `deadline: null` (the 4001-01-01 sentinel no longer appears; the rule says when deadlines are on and how many days before the deadline the to-do starts). Templates are out of project task lists and counts, search, and title lookups. Occurrences carry `repeatTemplateId`.
+- Title lookups prefer live, open items. Area, project, and tag filters resolve like writes (case-insensitive, unknown name is an error). Logbook `since` and `until` given as plain dates are days in the connector's time zone.
+- `things_get_account_info` no longer returns the history key.
+
+**Login pages**: every interpolated value is HTML-escaped (`esc` in `pages.js`), and HTML responses carry `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'`. `form-action` is left open because the login POST redirects to the OAuth client's redirect URI and browsers apply `form-action` to that redirect.
+
+**Also**: Maildrop reset and clear are marked destructive. README no longer lists `things_trash_todo` or `things_get_repeating`. The CSV tool description and the migration prompt say that projects and headings must exist first.
+
+**Declined**: closing or refusing open children when a project is completed (needs a product decision; the read side now hides them); refusing new to-dos in completed projects (would also refuse imports of finished projects); rebuilding read-modify-write patches after a 409; per-session time zones; ignoring `when` on non-reschedule to-do batches; OAuth storage changes (credential oracle ordering, duplicate credential copy, key derivation). No repeat-rule create or edit tools were added.
+
+**Unverified**: how the Things apps treat the newly refused states; the meaning of `rr.ts` as "days the to-do starts before its deadline" (docs only show `ts: 0`); that Things removes untrashed children when it empties a trashed project; `empty_trash` and Maildrop reset and clear against the live service; the CSP in a real browser OAuth round trip.
+
+**Verification**: `npm test`, 78 tests, mocked fetch only. No live calls, not deployed, not committed.
+
+---
+
 ## 2026-11-09 - Write hardening: state-aware validator, safe commit path, fail-closed reads (not deployed)
 
 **What changed**: `validateChangeMap(body, db)` now also checks shapes and state, and `commitChanges` runs it against the synced database on every write (and again after a 409/412 re-sync). It refuses unknown entity names and property keys (only `Task6`, `ChecklistItem3`, `Tag4`, `Area3`), dropped `undefined` values, partial creates, and a 0 in `sr`/`tir`/`dd`/`sp`/`icsd`/`ato` ("no date" is `null`). It checks notes (`ch` is the CRC-32), checklist items (the Things 3.24.2 shape, exactly one live parent), `st` against `sr` (future needs 2, today's with 2 is refused, headings use 1, Inbox has no date or container), `ss` against `sp`, and every reference (`pr`, `agr`, `ar`, `tg`, `ts`, `rt`, `pn`) for existence, type, and trash state. A to-do cannot be in both an area and a project, and a heading must belong to the project. Repeat rules use a port of `ThingsRepeat.problems(in:)`; templates accept only title, notes, tags, trash, and container edits, and occurrences refuse `rr`, `rt`, `tp`. Deleting something that live items still reference is refused, and the delete tools now cascade (checklist items, headings, trashed children, tag and area references).

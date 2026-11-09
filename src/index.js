@@ -3,6 +3,7 @@ import { ThingsMCP } from "./things-mcp.js";
 import { OAuthCredentials } from "./oauth-storage.js";
 import { ThingsHandler } from "./things-handler.js";
 import { CONNECTOR_RESOURCE_METADATA, CONNECTOR_ORIGIN } from "./brand-assets.js";
+import { withSecurityHeaders } from "./pages.js";
 
 export { ThingsMCP, OAuthCredentials };
 
@@ -55,10 +56,6 @@ export default {
       }
     }
 
-    const response = await provider.fetch(request, env, ctx);
-    const headers = new Headers(response.headers);
-    headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
-    headers.set("X-Content-Type-Options", "nosniff");
-    return new Response(response.body, { status: response.status, headers });
+    return withSecurityHeaders(await provider.fetch(request, env, ctx));
   },
 };

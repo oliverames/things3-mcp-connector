@@ -105,7 +105,30 @@ const styles = `
   .footer a { color: var(--accent); text-decoration: none; }
 `;
 
+// Every value interpolated into a page goes through this: the client name comes from open client
+// registration, the consent id from the POST body, and error text can quote an upstream response.
+export function esc(value) {
+  return String(value ?? "").replace(/[&<>"'`]/g, (c) => `&#${c.charCodeAt(0)};`);
+}
+
+// No script may run on these pages, whatever ends up in them. Styles are inline; images are the
+// connector's own icons. form-action is left open on purpose: the login form's response redirects
+// to the OAuth client's redirect URI, and browsers apply form-action to that redirect too.
+export const HTML_CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'";
+
+// Headers for every response; HTML also gets the Content-Security-Policy.
+export function withSecurityHeaders(response) {
+  const headers = new Headers(response.headers);
+  headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
+  headers.set("X-Content-Type-Options", "nosniff");
+  if ((headers.get("Content-Type") || "").toLowerCase().includes("text/html")) {
+    headers.set("Content-Security-Policy", HTML_CSP);
+  }
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
 function layout({ title, content }) {
+  title = esc(title);
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -150,6 +173,9 @@ export function landingPage() {
 }
 
 export function loginPage({ clientName, consentId = "", queryParams = {}, error = null }) {
+  clientName = esc(clientName);
+  consentId = esc(consentId);
+  error = error ? esc(error) : null;
   return layout({
     title: "Connect Things 3",
     content: `
@@ -159,7 +185,7 @@ export function loginPage({ clientName, consentId = "", queryParams = {}, error 
       ${error ? `<div class="error-box">${error}</div>` : ""}
       <form action="/authorize/login" method="POST">
         <input type="hidden" name="consentId" value="${consentId || ""}">
-        <input type="hidden" name="oauthParams" value="${encodeURIComponent(JSON.stringify(queryParams))}">
+        <input type="hidden" name="oauthParams" value="${esc(encodeURIComponent(JSON.stringify(queryParams)))}">
         <div class="field">
           <label for="email">Things Cloud Email</label>
           <input type="email" id="email" name="email" required autocomplete="email" placeholder="you@example.com">
@@ -196,7 +222,7 @@ export function errorPage(msg) {
     title: "Error",
     content: `
       <h1>Connection Error</h1>
-      <div class="error-box">${msg}</div>
+      <div class="error-box">${esc(msg)}</div>
       <a href="/" style="color: var(--accent); text-decoration: none; font-weight: 600;">Return to Home</a>
     `,
   });

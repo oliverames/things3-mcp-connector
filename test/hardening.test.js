@@ -2,7 +2,10 @@
 // is mocked: nothing here talks to Things Cloud.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { loginPage, errorPage, withSecurityHeaders } from "../src/pages.js";
 import {
+  describeRepeatRule,
   ThingsCloudClient,
   ThingsDatabase,
   validateChangeMap,
@@ -438,18 +441,25 @@ test("deleting a tag strips it from the items that carry it in the same commit",
   assert.deepEqual(body[a].p.tg, []);
 });
 
-test("emptying the trash also removes checklist items and headings, and refuses to orphan live children", async () => {
+test("emptying the trash removes checklist items, headings, and the contents of a trashed project; a live project keeps its children", async () => {
   const [p, h, t, c, live] = Array.from({ length: 5 }, generateUUID);
   const { client, commits } = cloud([project(p, { tr: true }), heading(h, p), todo(t, { pr: [p], tr: true }), checklist(c, t)]);
   await client.emptyTrash();
   assert.deepEqual(Object.keys(commits[0].body).sort(), [p, h, t, c].sort());
   assert.ok(Object.values(commits[0].body).every((ch) => ch.t === 2));
 
-  const second = cloud([project(p, { tr: true }), todo(live, { pr: [p] })]);
-  await assert.rejects(second.client.emptyTrash(), /still references deleted item/);
-  assert.equal(second.commits.length, 0);
-  await assert.rejects(second.client.deleteEntity(p), /still references deleted item/);
-  assert.equal(second.commits.length, 0);
+  // Things leaves tr false on the to-dos of a trashed project; they go with it, under a heading too.
+  const [under, c2] = [generateUUID(), generateUUID()];
+  const second = cloud([project(p, { tr: true }), heading(h, p), todo(live, { pr: [p] }), todo(under, { agr: [h] }), checklist(c2, under)]);
+  const result = await second.client.emptyTrash();
+  assert.deepEqual(Object.keys(second.commits[0].body).sort(), [p, h, live, under, c2].sort());
+  assert.ok(Object.values(second.commits[0].body).every((ch) => ch.t === 2));
+  assert.deepEqual(result, { purgedCount: 4, trashedCount: 1, containedCount: 3 });
+
+  // A project that is not in the Trash is never purged out from under its to-dos.
+  const third = cloud([project(p), todo(live, { pr: [p] })]);
+  await assert.rejects(third.client.deleteEntity(p, "project"), /still references deleted item/);
+  assert.equal(third.commits.length, 0);
 });
 
 test("a refused or failed import leaves the cached database untouched", async () => {
@@ -503,7 +513,7 @@ test("a batch that would write something unsafe writes nothing", async () => {
   const [a, tpl] = [generateUUID(), generateUUID()];
   const { client, commits } = cloud([todo(a), todo(tpl, { rr: rrOf({}), st: 2 })]);
   await assert.rejects(client.batchUpdateTodos([a, tpl], "complete"), /would change a repeating template/);
-  await assert.rejects(client.batchUpdateTodos([a], "reschedule", { when: "someday" }).then(() => client.updateTodo(a, { reminderTime: "00:00" })), /ato is 0/);
+  await assert.rejects(client.batchUpdateTodos([a], "reschedule", { when: "someday" }).then(() => client.updateTodo(a, { reminderTime: "00:00" })), /00:00 cannot be stored/);
   assert.equal(commits.length, 1); // only the valid reschedule above
 });
 
@@ -674,4 +684,360 @@ test("Task7 items from Things 3.24 decode, and changes to them validate", async 
   const tpl = generateUUID();
   const withTemplate = cloud([seven(tpl, { rr: rrOf({}), st: 2 })]);
   await assert.rejects(withTemplate.client.updateTodo(tpl, { when: "today" }), /would change a repeating template/);
+});
+
+// --- audit 2026-11-09: destructive tools, kinds, cycles, recovery --------------------------------------
+
+test("permanent deletes only tombstone the kind of item the tool names", async () => {
+  const [t, c, p, h, a, g] = Array.from({ length: 6 }, generateUUID);
+  const { client, commits } = cloud([todo(t), checklist(c, t), project(p), heading(h, p), area(a), tag(g)]);
+  await assert.rejects(client.deleteChecklistItem(t), /is a to-do, not a checklist item/);
+  await assert.rejects(client.deleteTodo(p), /is a project, not a to-do/);
+  await assert.rejects(client.deleteTodo(h), /is a heading, not a to-do/);
+  await assert.rejects(client.deleteTodo(a), /is an area, not a to-do/);
+  await assert.rejects(client.deleteTodo(c), /is a checklist item, not a to-do/);
+  await assert.rejects(client.updateHeading(p, { deleted: true }), /is a project, not a heading/);
+  await assert.rejects(client.deleteTag(t), /No tag with id/);
+  await assert.rejects(client.deleteArea(g), /No area with id/);
+  await assert.rejects(client.deleteEntity(t), /needs a kind/);
+  assert.equal(commits.length, 0);
+
+  await client.deleteChecklistItem(c);
+  assert.deepEqual(commits[0].body, { [c]: { t: 2, e: "ChecklistItem3", p: {} } });
+  await client.deleteTodo(t);
+  assert.deepEqual(commits[1].body, { [t]: { t: 2, e: "Task6", p: {} } });
+});
+
+test("to-do tools refuse project and heading ids, and project tools refuse to-do ids", async () => {
+  const [t, p, h] = Array.from({ length: 3 }, generateUUID);
+  const { client, commits } = cloud([todo(t), project(p), heading(h, p)]);
+  await assert.rejects(client.updateTodo(p, { status: "completed" }), /is a project, not a to-do.*Use the project tools/);
+  await assert.rejects(client.updateTodo(h, { status: "completed", trashed: true }), /is a heading, not a to-do/);
+  await assert.rejects(client.trashTodo(h), /is a heading, not a to-do/);
+  await assert.rejects(client.moveTodo(p, { when: "today" }), /is a project, not a to-do/);
+  await assert.rejects(client.updateProject(t, { title: "x" }), /is a to-do, not a project/);
+  await assert.rejects(client.batchUpdateTodos([t, p, h], "complete"), (err) => err.message.includes(`${p} (a project)`) && err.message.includes(`${h} (a heading)`) && !err.message.includes(`${t} (`));
+  await assert.rejects(client.duplicateTodo(p), /is a project, not a to-do/);
+  await assert.rejects(client.addTagsToTask(h, []), /is a heading/);
+  assert.equal(commits.length, 0);
+  await client.updateProject(p, { title: "renamed" });
+  assert.equal(commits[0].body[p].p.tt, "renamed");
+});
+
+test("a tag cannot become its own ancestor", async () => {
+  const [work, errands, shop] = Array.from({ length: 3 }, generateUUID);
+  const named = (id, tt, pn = []) => ({ [id]: { t: 0, e: "Tag4", p: { tt, pn, ix: 0 } } });
+  const { client, commits } = cloud([named(work, "Work"), named(errands, "Errands", [work]), named(shop, "Shop", [errands])]);
+  await assert.rejects(client.updateTag(work, { parent: "Errands" }), /its own ancestor/);
+  await assert.rejects(client.updateTag(work, { parent: shop }), /its own ancestor/);
+  await assert.rejects(client.updateTag(work, { parent: work }), /other than itself/);
+  assert.equal(commits.length, 0);
+  await client.updateTag(shop, { parent: work });
+  assert.deepEqual(commits[0].body[shop].p.pn, [work]);
+});
+
+test("after a 5xx, another client's edit to the same item is not counted as our commit", async () => {
+  const t = generateUUID();
+  const { client, commits, history } = cloud([todo(t)], {
+    onCommit: (n, body, h) => {
+      if (n !== 1) return undefined;
+      h.push({ [t]: { t: 1, e: "Task6", p: { tt: "edited on the Mac", md: 1794000000.25 } } });
+      return new Response("unavailable", { status: 503 });
+    },
+  });
+  await client.updateTodo(t, { status: "completed" });
+  assert.equal(commits.length, 2); // ours had not landed, so it was sent again
+  assert.equal(history.at(-1)[t].p.ss, 3);
+  assert.equal((await client.syncDatabase()).tasks.get(t).status, 3);
+});
+
+// --- audit 2026-11-09: dates, reminders, containers, text ------------------------------------------------
+
+test("a date that is not in the calendar is refused, not rolled forward", async () => {
+  assert.throws(() => dateToTimestamp("2027-02-31"), /does not exist/);
+  assert.throws(() => dateToTimestamp("2027-13-45"), /does not exist/);
+  assert.equal(dateToTimestamp("2028-02-29"), Date.UTC(2028, 1, 29) / 1000);
+  const { client, commits } = cloud([]);
+  await assert.rejects(client.createTodo({ title: "x", when: "2027-02-31" }), /does not exist/);
+  await assert.rejects(client.createTodo({ title: "x", deadline: "2027-04-31" }), /does not exist/);
+  assert.equal(commits.length, 0);
+});
+
+test("moving a to-do to Someday, Anytime, or the Inbox clears its reminder; a dated move keeps it", async () => {
+  const t = generateUUID();
+  const { client, commits } = cloud([todo(t, { sr: day(0), tir: day(0), ato: 32400 })]);
+  for (const when of ["someday", "anytime", "inbox"]) {
+    await client.updateTodo(t, { when });
+    const p = commits.at(-1).body[t].p;
+    assert.equal(p.ato, null, when);
+    assert.equal(p.sr, null, when);
+    await client.updateTodo(t, { when: "today", reminderTime: "09:00" });
+  }
+  await client.moveTodo(t, { when: addDays(localDate(TZ), 3) });
+  assert.ok(!("ato" in commits.at(-1).body[t].p));
+  await client.batchUpdateTodos([t], "reschedule", { when: "someday" });
+  assert.equal(commits.at(-1).body[t].p.ato, null);
+  // The state itself is refused whichever key the patch carries.
+  const db = dbOf(todo(t, { sr: day(0), tir: day(0), ato: 32400 }));
+  refused({ [t]: { t: 1, e: "Task6", p: { st: 2, sr: null, tir: null } } }, db, /reminder time needs a start date/);
+});
+
+test("a reminder needs a date: undated lists are refused, no when means today, null clears it", async () => {
+  const t = generateUUID();
+  const { client, commits } = cloud([todo(t, { sr: day(0), tir: day(0), ato: 32400 })]);
+  await assert.rejects(client.createTodo({ title: "x", when: "someday", reminderTime: "09:00" }), /reminder needs a date/);
+  await assert.rejects(client.updateTodo(t, { when: "anytime", reminderTime: "09:00" }), /reminder needs a date/);
+  await assert.rejects(client.createTodo({ title: "x", when: "today", reminderTime: "00:00" }), /00:00 cannot be stored/);
+  assert.equal(commits.length, 0);
+  const made = await client.createTodo({ title: "x", reminderTime: "09:00" });
+  assert.equal(made.when, "today");
+  assert.deepEqual([commits[0].body[made.id].p.st, commits[0].body[made.id].p.sr, commits[0].body[made.id].p.ato], [1, today(), 32400]);
+  await client.updateTodo(t, { reminderTime: null, deadline: null });
+  const p = commits[1].body[t].p;
+  assert.deepEqual([p.ato, p.dd, "sr" in p], [null, null, false]);
+});
+
+test("a project made from an Inbox to-do leaves the Inbox, and a project at st 0 is refused", async () => {
+  const [t, c] = [generateUUID(), generateUUID()];
+  const { client, commits } = cloud([todo(t, { st: 0 }), checklist(c, t)]);
+  await client.convertTodoToProject(t);
+  const p = commits[0].body[t].p;
+  assert.deepEqual([p.tp, p.st, p.sb], [1, 1, 0]);
+  const db = dbOf(todo(t, { st: 0 }));
+  refused({ [t]: { t: 1, e: "Task6", p: { tp: 1, pr: [], agr: [] } } }, db, /project cannot be in the Inbox/);
+});
+
+test("a heading given with a project must belong to it, and the to-do is filed under the heading", async () => {
+  const [a, b, ha, hb, other, t] = Array.from({ length: 6 }, generateUUID);
+  const { client, commits } = cloud([
+    project(a, { tt: "A" }),
+    project(b, { tt: "B" }),
+    heading(ha, a, { tt: "Backlog" }),
+    heading(hb, b, { tt: "Backlog" }),
+    heading(other, b, { tt: "Later" }),
+    todo(t),
+  ]);
+  await client.moveTodo(t, { project: a, heading: ha });
+  assert.deepEqual([commits[0].body[t].p.agr, commits[0].body[t].p.pr], [[ha], []]);
+  await assert.rejects(client.moveTodo(t, { project: a, heading: other }), /belongs to another project/);
+  await assert.rejects(client.createTodo({ title: "x", project: "A", heading: "Later" }), /belongs to another project/);
+  assert.equal(commits.length, 1);
+
+  // "Backlog" exists in both projects; the project says which one is meant.
+  const made = await client.createTodo({ title: "x", project: "A", heading: "backlog" });
+  assert.deepEqual([commits[1].body[made.id].p.agr, commits[1].body[made.id].p.pr], [[ha], []]);
+  const imported = await client.importJson([{ type: "to-do", attributes: { title: "row", list: "B", heading: "Backlog" } }]);
+  assert.deepEqual(commits[2].body[imported.items[0].id].p.agr, [hb]);
+  await client.importJson([{ type: "to-do", operation: "update", id: t, attributes: { list: "B", heading: "Later" } }]);
+  assert.deepEqual([commits[3].body[t].p.agr, commits[3].body[t].p.pr], [[other], []]);
+});
+
+test("a to-do cannot be filed under a heading of a trashed project", async () => {
+  const [p, h] = [generateUUID(), generateUUID()];
+  const { client, commits } = cloud([project(p, { tr: true }), heading(h, p, { tt: "Old" })]);
+  await assert.rejects(client.createTodo({ title: "x", heading: h }), /No heading found/);
+  assert.equal(commits.length, 0);
+});
+
+test("a lone surrogate is refused in every text field, not only task titles", async () => {
+  const bad = "cut \ud83d";
+  const [g, a] = [generateUUID(), generateUUID()];
+  const { client, commits } = cloud([tag(g), area(a)]);
+  await assert.rejects(client.createTodo({ title: "ok", notes: bad }), /nt\.v contains a lone surrogate/);
+  await assert.rejects(client.createTodo({ title: "ok", checklist: [bad] }), /tt contains a lone surrogate/);
+  await assert.rejects(client.createTag({ title: bad }), /lone surrogate/);
+  await assert.rejects(client.updateTag(g, { shortcut: "\ud83d" }), /sh contains a lone surrogate/);
+  await assert.rejects(client.createArea({ title: bad }), /lone surrogate/);
+  await assert.rejects(client.updateArea(a, { title: bad }), /lone surrogate/);
+  assert.equal(commits.length, 0);
+  await client.createTodo({ title: "ok", notes: "whole 😀", checklist: ["fine 😀"] });
+  assert.equal(commits.length, 1);
+});
+
+// --- audit 2026-11-09: read side ------------------------------------------------------------------------
+
+test("Today is what Things shows: arrived start dates at st 1 or 2, due and overdue deadlines, live containers only", () => {
+  const [trashedP, doneP, trashedH, liveP] = Array.from({ length: 4 }, generateUUID);
+  const named = (tt, p) => todo(generateUUID(), { tt, ...p });
+  const db = dbOf(
+    project(trashedP, { tr: true }),
+    project(doneP, { ss: 3, sp: 1794000000 }),
+    project(liveP),
+    heading(trashedH, liveP, { tr: true }),
+    named("today", { sr: day(0), tir: day(0) }),
+    named("scheduled, not yet confirmed", { st: 2, sr: day(0), tir: day(0) }),
+    named("scheduled yesterday", { st: 2, sr: day(-1), tir: day(-1) }),
+    named("future", { st: 2, sr: day(3), tir: day(3) }),
+    named("overdue deadline", { dd: day(-2) }),
+    named("someday, due today", { st: 2, dd: day(0) }),
+    named("deadline dismissed from Today", { dd: day(-1), dds: day(0) }),
+    named("future start, overdue deadline", { st: 2, sr: day(3), dd: day(-1) }),
+    named("in trashed project", { sr: day(0), pr: [trashedP] }),
+    named("in completed project", { sr: day(0), pr: [doneP] }),
+    named("under trashed heading", { sr: day(0), agr: [trashedH] }),
+    named("someday", { st: 2 })
+  );
+  const titles = (list) => list.map((t) => t.title).sort();
+  assert.deepEqual(titles(db.getToday()), ["overdue deadline", "scheduled yesterday", "scheduled, not yet confirmed", "someday, due today", "today"]);
+  assert.deepEqual(titles(db.getUpcoming()), ["future", "future start, overdue deadline"]);
+  assert.deepEqual(titles(db.getSomeday()), ["someday", "someday, due today"]);
+  const anytime = titles(db.getAnytime());
+  for (const hidden of ["in trashed project", "in completed project", "under trashed heading"]) assert.ok(!anytime.includes(hidden), hidden);
+  assert.ok(!titles(db.getDeadlines().overdue).includes("in trashed project"));
+  assert.equal(db.getStats().openTodos, 9);
+});
+
+test("a repeating template reads as a rule, never as a Someday to-do with a year-4001 deadline", () => {
+  const [p, tpl, occ] = Array.from({ length: 3 }, generateUUID);
+  const rr = rrOf({ fu: 256, of: [{ wd: 1 }], ts: -2 });
+  const db = dbOf(
+    project(p, { tt: "Garden" }),
+    todo(tpl, { tt: "Water", rr, st: 2, sr: null, tir: day(2), icsd: day(2), dd: 64092211200, pr: [p] }),
+    todo(occ, { tt: "Water", rt: [tpl], sr: day(0), tir: day(0), dd: day(0), pr: [p] })
+  );
+  const [template] = db.getRepeatingTodos();
+  assert.equal(template.repeating, true);
+  assert.equal(template.when, "repeating");
+  assert.equal(template.deadline, null);
+  assert.equal(template.scheduledDate, null);
+  assert.equal(template.repeatRule, "Every week on Monday; each date is a deadline and the to-do starts 2 days before it");
+  assert.deepEqual(
+    [template.repeat.frequency, template.repeat.mode, template.repeat.hasDeadline, template.repeat.startsDaysBeforeDeadline, template.repeat.nextOccurrence],
+    ["weekly", "fixed", true, 2, addDays(localDate(TZ), 2)]
+  );
+
+  const view = db.getProject(p);
+  assert.deepEqual(view.ungroupedTasks.map((t) => [t.id, t.repeatTemplateId, t.repeating, t.deadline]), [[occ, tpl, undefined, localDate(TZ)]]);
+  assert.deepEqual(view.repeatingTemplates.map((t) => t.id), [tpl]);
+  assert.equal(db.getProjects()[0].openTasks, 1);
+  assert.equal(db.getProjectStats().projects[0].totalTasks, 1);
+  assert.deepEqual(db.search("water").map((t) => t.id), [occ]);
+  assert.equal(db.getTask("Water").id, occ);
+  assert.equal(db.getTask(tpl).repeating, true);
+  assert.ok(!JSON.stringify([db.getRepeatingTodos(), view, db.getTrash(), db.getDeadlines(), db.getTask(tpl)]).includes("4001"));
+});
+
+test("repeat rules are described in words for every shape Things writes", () => {
+  const say = (o, opts) => describeRepeatRule(rrOf(o), opts).summary;
+  assert.equal(say({}), "Every day");
+  assert.equal(say({ fa: 3 }), "Every 3 days");
+  assert.equal(say({ fu: 256, fa: 2, of: [{ wd: 1 }, { wd: 4 }] }), "Every 2 weeks on Monday and Thursday");
+  assert.equal(say({ fu: 8, of: [{ dy: 0 }, { dy: 14 }] }), "Every month on the 1st and the 15th");
+  assert.equal(say({ fu: 8, of: [{ wdo: -1, wd: 5 }] }), "Every month on the last Friday");
+  assert.equal(say({ fu: 8, of: [{ dy: -1 }] }), "Every month on the last day");
+  assert.equal(say({ fu: 4, of: [{ dy: 19, mo: 10 }] }), "Every year on November 20");
+  assert.equal(say({ fu: 4, of: [{ wdo: 4, mo: 10, wd: 4 }] }), "Every year on the 4th Thursday of November");
+  assert.equal(say({ fa: 4, of: [], tp: 1, ia: 0 }), "Every 4 days after completion");
+  assert.equal(describeRepeatRule(noEd({ rc: 5 })).summary, "Every day, 5 times");
+  assert.equal(say({ ed: 1798675200 }), "Every day, until 2026-12-31");
+  assert.equal(say({}, { hasDeadline: true }), "Every day; each occurrence has a deadline on its date");
+  assert.equal(describeRepeatRule({ fu: 99 }).summary, "Repeats (rule not recognized)");
+});
+
+test("lookups by title prefer live items, and list filters match names as writes do", () => {
+  const [a, liveP, deadP, live, dead] = Array.from({ length: 5 }, generateUUID);
+  const db = dbOf(
+    { [a]: { t: 0, e: "Area3", p: { tt: "Work", ix: 0 } } },
+    project(deadP, { tt: "Taxes", tr: true }),
+    project(liveP, { tt: "Taxes", ar: [a] }),
+    todo(dead, { tt: "Call mom", tr: true }),
+    todo(live, { tt: "Call mom", ar: [a] })
+  );
+  assert.equal(db.getTask("call mom").id, live);
+  assert.equal(db.getProject("taxes").id, liveP);
+  assert.equal(db.getProject(deadP).id, deadP);
+  assert.deepEqual(db.getAnytime({ area: "work" }).map((t) => t.id), [live]);
+  assert.deepEqual(db.getProjects({ area: "WORK" }).map((p) => p.id), [liveP]);
+  assert.deepEqual(db.search("call", { area: "work" }).map((t) => t.id), [live]);
+  assert.throws(() => db.getAnytime({ area: "Wrok" }), /No area found/);
+  assert.throws(() => db.search("call", { tag: "nope" }), /No tag found/);
+});
+
+test("Logbook since and until are calendar days in the connector's time zone", () => {
+  const at = (iso) => Date.parse(iso) / 1000;
+  const done = (tt, iso) => todo(generateUUID(), { tt, ss: 3, sp: at(iso) });
+  // 8 pm Eastern on Nov 8 is already Nov 9 in UTC; 9 pm Eastern on Nov 9 is Nov 10 in UTC.
+  const db = dbOf(done("evening of the 8th", "2026-11-09T01:00:00Z"), done("evening of the 9th", "2026-11-10T02:00:00Z"));
+  assert.deepEqual(db.getLogbook({ since: "2026-11-09", until: "2026-11-09" }).map((t) => t.title), ["evening of the 9th"]);
+  assert.deepEqual(db.getLogbook({ since: "2026-11-09T00:00:00Z", until: "2026-11-09T23:59:59Z" }).map((t) => t.title), ["evening of the 8th"]);
+});
+
+// --- audit 2026-11-09: smaller write defects ---------------------------------------------------------------
+
+test("import_json updates: repeated ids are merged, and checklist, reminder, and add-tags are applied", async () => {
+  const [t, c, g1, g2] = Array.from({ length: 4 }, generateUUID);
+  const { client, commits } = cloud([tag(g1), { [g2]: { t: 0, e: "Tag4", p: { tt: "second", ix: 0 } } }, todo(t, { sr: day(0), tir: day(0), tg: [g1] }), checklist(c, t)]);
+  const upd = (attributes) => ({ type: "to-do", operation: "update", id: t, attributes });
+  await client.importJson([upd({ title: "renamed" }), upd({ deadline: "2027-01-15" })]);
+  assert.deepEqual([commits[0].body[t].p.tt, commits[0].body[t].p.dd], ["renamed", dateToTimestamp("2027-01-15")]);
+
+  await client.importJson([upd({ "checklist-items": ["new"], "reminder-time": "09:30", "add-tags": ["second"] })]);
+  const body = commits[1].body;
+  assert.deepEqual(body[c], { t: 2, e: "ChecklistItem3", p: {} });
+  const created = Object.values(body).filter((ch) => ch.e === "ChecklistItem3" && ch.t === 0);
+  assert.deepEqual(created.map((ch) => [ch.p.tt, ch.p.ix]), [["new", 0]]);
+  assert.equal(body[t].p.ato, 34200);
+  assert.deepEqual(body[t].p.tg, [g1, g2]);
+
+  await client.importJson([upd({ "append-checklist-items": ["more"] })]);
+  const appended = Object.values(commits[2].body).filter((ch) => ch.e === "ChecklistItem3");
+  assert.deepEqual(appended.map((ch) => [ch.t, ch.p.tt, ch.p.ix]), [[0, "more", 1]]);
+  await assert.rejects(client.importJson([upd({ "prepend-checklist-items": ["first"] })]), /not supported/);
+  assert.equal(commits.length, 3);
+});
+
+test("a tag title that already exists is refused, and a duplicate keeps checklist state", async () => {
+  const [g, t, c1, c2] = Array.from({ length: 4 }, generateUUID);
+  const { client, commits } = cloud([
+    { [g]: { t: 0, e: "Tag4", p: { tt: "Work", ix: 0 } } },
+    todo(t, { tt: "Pack" }),
+    { [c1]: { t: 0, e: "ChecklistItem3", p: { tt: "done", ts: [t], ss: 3, sp: 1794000000, ix: 0 } } },
+    { [c2]: { t: 0, e: "ChecklistItem3", p: { tt: "open", ts: [t], ss: 0, ix: 1 } } },
+  ]);
+  await assert.rejects(client.createTag({ title: "work" }), /already exists/);
+  assert.equal(commits.length, 0);
+  await client.updateTag(g, { title: "WORK" }); // renaming a tag to its own name in another case is fine
+  await client.duplicateTodo(t);
+  const items = Object.values(commits[1].body).filter((ch) => ch.e === "ChecklistItem3");
+  assert.deepEqual(items.map((ch) => [ch.p.tt, ch.p.ss, ch.p.sp === null]), [["done", 3, false], ["open", 0, true]]);
+});
+
+test("a project batch with nothing to set is refused instead of reported as updated", async () => {
+  const p = generateUUID();
+  const { client, commits } = cloud([project(p)]);
+  await assert.rejects(client.batchUpdateProjects([p], "set_dates"), /needs when, deadline/);
+  assert.equal(commits.length, 0);
+});
+
+// --- audit 2026-11-09: login pages and tool output ------------------------------------------------------
+
+test("login and error pages escape every interpolated value and are served with a script-blocking CSP", async () => {
+  const attack = `"><script>alert(1)</script><img src=x onerror='x'>`;
+  const page = loginPage({ clientName: attack, consentId: attack, queryParams: { state: attack }, error: attack });
+  for (const html of [page, errorPage(attack)]) {
+    assert.ok(!html.includes("<script"), "no script tag survives");
+    assert.ok(!html.includes("<img src=x"), "no injected tag survives");
+    assert.ok(!html.includes(`"><`), "no attribute is closed early");
+  }
+  assert.ok(page.includes("&#60;script&#62;alert(1)&#60;/script&#62;"));
+  assert.match(page, /name="consentId" value="&#34;&#62;&#60;script/);
+
+  const html = withSecurityHeaders(new Response(page, { status: 400, headers: { "Content-Type": "text/html; charset=UTF-8" } }));
+  const csp = html.headers.get("Content-Security-Policy");
+  assert.match(csp, /default-src 'none'/);
+  assert.ok(!/script-src|unsafe-eval/.test(csp));
+  assert.match(csp, /frame-ancestors 'none'/);
+  assert.equal(html.status, 400);
+  assert.equal(await html.text(), page);
+  const json = withSecurityHeaders(new Response("{}", { headers: { "Content-Type": "application/json" } }));
+  assert.equal(json.headers.get("Content-Security-Policy"), null);
+  assert.equal(json.headers.get("X-Content-Type-Options"), "nosniff");
+});
+
+test("things_get_account_info does not return the history key", () => {
+  const source = readFileSync(new URL("../src/things-mcp.js", import.meta.url), "utf8");
+  const start = source.indexOf('"things_get_account_info"');
+  const tool = source.slice(start, source.indexOf("server.registerTool(", start));
+  assert.ok(start > 0 && tool.includes("mailDropEmail"));
+  assert.ok(!/historyKey/i.test(tool));
 });

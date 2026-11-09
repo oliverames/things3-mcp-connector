@@ -24,5 +24,5 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      # The tests import only src/things-client.js, which has no dependencies, so no install step.
+      # The tests import only src/things-client.js and src/pages.js, which have no dependencies, so no install step.
       - run: npm test

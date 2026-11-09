@@ -784,6 +784,31 @@ export class ThingsCloudClient {
     return { id: uuid, title, updated: true };
   }
 
+  async deleteArea(uuid, { deleteContents = false } = {}) {
+    const db = await this.syncDatabase();
+    if (!db.areas.has(uuid)) throw new Error(`No area with id ${uuid}.`);
+    const changes = [];
+    const now = toUnixTimestamp();
+
+    if (deleteContents) {
+      for (const t of db.tasks.values()) {
+        if (t.area === uuid && !t.trashed) {
+          changes.push({ [t.uuid]: { t: 1, e: ENTITY.task, p: { tr: true, md: now } } });
+        }
+      }
+    } else {
+      for (const t of db.tasks.values()) {
+        if (t.area === uuid) {
+          changes.push({ [t.uuid]: { t: 1, e: ENTITY.task, p: { ar: [], md: now } } });
+        }
+      }
+    }
+
+    changes.push({ [uuid]: { t: 2, e: ENTITY.area, p: {} } });
+    await this.commitChanges(changes);
+    return { id: uuid, deleted: true, contentsPurged: deleteContents };
+  }
+
   async createTag({ title, shortcut = null, parent = null }) {
     const db = await this.syncDatabase();
     const uuid = generateUUID();
@@ -805,6 +830,25 @@ export class ThingsCloudClient {
     return { id: uuid, title, shortcut, parent };
   }
 
+  async updateTag(uuid, { title, shortcut, parent }) {
+    const db = await this.syncDatabase();
+    if (!db.tags.has(uuid)) throw new Error(`No tag with id ${uuid}.`);
+    const now = toUnixTimestamp();
+    const p = { md: now };
+    if (title !== undefined) p.tt = title;
+    if (shortcut !== undefined) p.sh = shortcut || null;
+    if (parent !== undefined) p.pn = parent ? [db.resolveRef("tag", parent)] : [];
+    await this.commitChanges([{ [uuid]: { t: 1, e: ENTITY.tag, p } }]);
+    return { id: uuid, updated: true };
+  }
+
+  async deleteTag(uuid) {
+    const db = await this.syncDatabase();
+    if (!db.tags.has(uuid)) throw new Error(`No tag with id ${uuid}.`);
+    await this.commitChanges([{ [uuid]: { t: 2, e: ENTITY.tag, p: {} } }]);
+    return { id: uuid, deleted: true };
+  }
+
   // --- Checklist items --------------------------------------------------------
 
   async addChecklistItems(taskUUID, items) {
@@ -824,6 +868,44 @@ export class ThingsCloudClient {
     }
     await this.commitChanges(changes);
     return created;
+  }
+
+  async setChecklist(taskUUID, items) {
+    const db = await this.syncDatabase();
+    const task = db.tasks.get(taskUUID);
+    if (!task || task.type !== 0) throw new Error(`No to-do with id ${taskUUID}.`);
+
+    const existingChecklist = db.checklistItemsFor(taskUUID);
+    const changes = [];
+    const now = toUnixTimestamp();
+
+    for (const c of existingChecklist) {
+      changes.push({ [c.uuid]: { t: 2, e: ENTITY.checklist, p: {} } });
+    }
+
+    const created = [];
+    items.forEach((item, idx) => {
+      const id = generateUUID();
+      const title = typeof item === "string" ? item : item.title || "Untitled";
+      let status = 0;
+      if (typeof item === "object") {
+        if (item.status === "completed" || item.completed === true) status = 3;
+        else if (item.status === "canceled" || item.canceled === true) status = 2;
+      }
+      changes.push({
+        [id]: buildChecklistCreate({
+          title,
+          task: taskUUID,
+          index: idx,
+          status,
+          now,
+        }),
+      });
+      created.push({ id, title, status: status === 3 ? "completed" : status === 2 ? "canceled" : "open" });
+    });
+
+    await this.commitChanges(changes);
+    return { taskId: taskUUID, checklist: created, count: created.length };
   }
 
   async updateChecklistItem(uuid, { title, status }) {
@@ -1137,6 +1219,151 @@ export class ThingsCloudClient {
     await this.commitChanges(changes);
     return { count: uuids.length, operation, updated: true };
   }
+
+  async batchUpdateProjects(uuids, operation, options = {}) {
+    const db = await this.syncDatabase();
+    const now = toUnixTimestamp();
+    const changes = [];
+
+    for (const uuid of uuids) {
+      const p = db.tasks.get(uuid);
+      if (!p || p.type !== 1) throw new Error(`Project not found: ${uuid}`);
+      const patch = this.buildTaskPatch(db, {
+        __uuid: uuid,
+        status: operation === "complete" ? "completed" : operation === "cancel" ? "canceled" : undefined,
+        trashed: operation === "trash" ? true : undefined,
+        when: operation === "reschedule" ? options.when : options.when,
+        area: operation === "set_area" ? options.area : options.area,
+        deadline: options.deadline,
+        completionDate: options.completionDate || options.completion_date,
+        creationDate: options.creationDate || options.creation_date,
+      }, now);
+      changes.push({ [uuid]: { t: 1, e: ENTITY.task, p: patch } });
+    }
+
+    await this.commitChanges(changes);
+    return { count: uuids.length, operation, updated: true };
+  }
+
+  async importCsv(csvText, { defaultProject = null, defaultArea = null } = {}) {
+    const items = convertCsvToThingsJson(csvText, { defaultProject, defaultArea });
+    return this.importJson(items);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CSV parsing and Asana / CSV migration helpers
+// ---------------------------------------------------------------------------
+
+export function parseCSV(csvText) {
+  const rows = [];
+  let currentRow = [];
+  let currentField = "";
+  let insideQuotes = false;
+  let i = 0;
+
+  while (i < csvText.length) {
+    const char = csvText[i];
+    const nextChar = csvText[i + 1];
+
+    if (char === '"') {
+      if (insideQuotes && nextChar === '"') {
+        currentField += '"';
+        i += 2;
+        continue;
+      } else {
+        insideQuotes = !insideQuotes;
+        i++;
+        continue;
+      }
+    }
+
+    if (!insideQuotes && char === ',') {
+      currentRow.push(currentField.trim());
+      currentField = "";
+      i++;
+      continue;
+    }
+
+    if (!insideQuotes && (char === '\r' || char === '\n')) {
+      if (char === '\r' && nextChar === '\n') i++;
+      currentRow.push(currentField.trim());
+      if (currentRow.some((f) => f.length > 0)) {
+        rows.push(currentRow);
+      }
+      currentRow = [];
+      currentField = "";
+      i++;
+      continue;
+    }
+
+    currentField += char;
+    i++;
+  }
+
+  if (currentField.length > 0 || currentRow.length > 0) {
+    currentRow.push(currentField.trim());
+    if (currentRow.some((f) => f.length > 0)) {
+      rows.push(currentRow);
+    }
+  }
+
+  if (rows.length < 2) return [];
+
+  const headers = rows[0].map((h) => h.toLowerCase().replace(/[^a-z0-9]/g, ""));
+  const data = [];
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r];
+    const obj = {};
+    headers.forEach((h, idx) => {
+      obj[h] = row[idx] || "";
+    });
+    data.push(obj);
+  }
+  return data;
+}
+
+export function convertCsvToThingsJson(csvText, { defaultProject = null, defaultArea = null } = {}) {
+  const records = parseCSV(csvText);
+  if (!records.length) return [];
+
+  const tasks = [];
+  for (const row of records) {
+    const title = row.name || row.title || row.taskname || row.summary || row.todo || "";
+    if (!title) continue;
+
+    const notes = row.notes || row.description || "";
+    const deadline = row.duedate || row.deadline || row.due || null;
+    const when = row.startdate || row.when || row.start || null;
+    const creationDate = row.createdat || row.creationdate || null;
+    const completionDate = row.completedat || row.completiondate || null;
+    const isCompleted = Boolean(completionDate || (row.completed && row.completed.toLowerCase() === "true"));
+    const list = row.project || row.projects || row.list || defaultProject || null;
+    const area = row.area || defaultArea || null;
+    const heading = row.sectioncolumn || row.section || row.column || row.heading || null;
+    const rawTags = row.tags || row.labels || "";
+    const tags = rawTags ? rawTags.split(/[,;]/).map((t) => t.trim()).filter(Boolean) : [];
+
+    const attrs = {
+      title,
+      notes,
+      completed: isCompleted,
+    };
+    if (deadline) attrs.deadline = deadline;
+    if (when) attrs.when = when;
+    if (creationDate) attrs["creation-date"] = creationDate;
+    if (completionDate) attrs["completion-date"] = completionDate;
+    if (list) attrs.list = list;
+    if (area) attrs.area = area;
+    if (heading) attrs.heading = heading;
+    if (tags.length) attrs.tags = tags;
+
+    tasks.push({
+      type: "to-do",
+      attributes: attrs,
+    });
+  }
+  return tasks;
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,13 +1644,44 @@ export class ThingsDatabase {
       .map((t) => this.formatTask(t));
   }
 
-  getLogbook(limit = 50, statusFilter = "all") {
+  getLogbook(limitOrOptions = 50, statusFilter = "all") {
+    let limit = 50;
+    let filter = statusFilter;
+    let since = null;
+    let until = null;
+
+    if (typeof limitOrOptions === "object" && limitOrOptions !== null) {
+      if (limitOrOptions.limit !== undefined) limit = limitOrOptions.limit;
+      if (limitOrOptions.statusFilter !== undefined) filter = limitOrOptions.statusFilter;
+      if (limitOrOptions.status !== undefined) filter = limitOrOptions.status;
+      if (limitOrOptions.since !== undefined) since = limitOrOptions.since;
+      if (limitOrOptions.until !== undefined) until = limitOrOptions.until;
+    } else if (typeof limitOrOptions === "number") {
+      limit = limitOrOptions;
+    }
+
+    const sinceTs = since ? (typeof since === "number" ? since : parseIsoDate(since)) : null;
+    let untilTs = until ? (typeof until === "number" ? until : parseIsoDate(until)) : null;
+    if (until && typeof until === "string" && until.length === 10 && untilTs !== null) {
+      untilTs += 86399;
+    }
+
     return [...this.tasks.values()]
       .filter((t) => {
         if (t.trashed || t.type === 2) return false;
-        if (statusFilter === "completed") return t.status === 3;
-        if (statusFilter === "canceled") return t.status === 2;
-        return t.status === 3 || t.status === 2;
+        if (filter === "completed") {
+          if (t.status !== 3) return false;
+        } else if (filter === "canceled") {
+          if (t.status !== 2) return false;
+        } else {
+          if (t.status !== 3 && t.status !== 2) return false;
+        }
+
+        const itemTs = t.stopDate || t.modificationDate || 0;
+        if (sinceTs !== null && itemTs < sinceTs) return false;
+        if (untilTs !== null && itemTs > untilTs) return false;
+
+        return true;
       })
       .sort((a, b) => (b.stopDate || b.modificationDate || 0) - (a.stopDate || a.modificationDate || 0))
       .slice(0, limit)
@@ -1471,6 +1729,68 @@ export class ThingsDatabase {
           tags: this.tagTitles(p.tags),
         };
       });
+  }
+
+  getProjectStats({ area = null } = {}) {
+    const today = this.today();
+    const allProjects = [...this.tasks.values()].filter(
+      (t) => t.type === 1 && !t.trashed && this.matchesArea(t, area)
+    );
+
+    const totalProjects = allProjects.length;
+    const openProjectsList = allProjects.filter((p) => p.status === 0);
+    const completedProjectsList = allProjects.filter((p) => p.status === 3);
+    const canceledProjectsList = allProjects.filter((p) => p.status === 2);
+
+    let totalTodos = 0;
+    let completedTodos = 0;
+    let openTodos = 0;
+    let overdueProjectsCount = 0;
+
+    const projectSummaries = allProjects.map((p) => {
+      const todos = [...this.tasks.values()].filter(
+        (t) => t.type === 0 && !t.trashed && this.projectIdOf(t) === p.uuid
+      );
+      const completed = todos.filter((t) => t.status === 3 || t.status === 2).length;
+      const open = todos.length - completed;
+      const isOverdue = p.status === 0 && Boolean(p.deadline && p.deadline < today);
+
+      if (p.status === 0) {
+        totalTodos += todos.length;
+        completedTodos += completed;
+        openTodos += open;
+        if (isOverdue) overdueProjectsCount++;
+      }
+
+      return {
+        id: p.uuid,
+        title: p.title,
+        status: p.status === 3 ? "completed" : p.status === 2 ? "canceled" : "open",
+        area: p.area ? this.areas.get(p.area)?.title || p.area : null,
+        areaId: p.area || null,
+        deadline: p.deadline || null,
+        overdue: isOverdue,
+        totalTasks: todos.length,
+        completedTasks: completed,
+        openTasks: open,
+        percentComplete: todos.length > 0 ? Math.round((completed / todos.length) * 100) : 0,
+      };
+    });
+
+    return {
+      totalProjects,
+      openProjects: openProjectsList.length,
+      completedProjects: completedProjectsList.length,
+      canceledProjects: canceledProjectsList.length,
+      overdueProjects: overdueProjectsCount,
+      activeProjectsTodos: {
+        total: totalTodos,
+        completed: completedTodos,
+        open: openTodos,
+        overallPercentComplete: totalTodos > 0 ? Math.round((completedTodos / totalTodos) * 100) : 0,
+      },
+      projects: projectSummaries,
+    };
   }
 
   findProject(identifier) {

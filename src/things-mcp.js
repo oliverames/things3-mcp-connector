@@ -315,6 +315,8 @@ export class ThingsMCP extends McpAgent {
         inputSchema: {
           limit: z.number().optional().default(50).describe("Max items to return (default: 50)"),
           status: z.enum(["all", "completed", "canceled"]).optional().default("all").describe("Filter by status"),
+          since: z.string().optional().describe("Filter items completed/canceled on or after this date (ISO 8601 or YYYY-MM-DD)"),
+          until: z.string().optional().describe("Filter items completed/canceled on or before this date (ISO 8601 or YYYY-MM-DD)"),
         },
         annotations: {
           title: "Get Logbook History",
@@ -324,10 +326,10 @@ export class ThingsMCP extends McpAgent {
           openWorldHint: false,
         },
       },
-      async ({ limit, status }) => {
+      async ({ limit, status, since, until }) => {
         const client = await getClient();
         const db = await client.syncDatabase();
-        return textResult(db.getLogbook(limit, status));
+        return textResult(db.getLogbook({ limit, status, since, until }));
       }
     );
 
@@ -1351,9 +1353,205 @@ export class ThingsMCP extends McpAgent {
       }
     );
 
-    // ==========================================
-    // PROMPTS (Workflow Guides)
-    // ==========================================
+    // 35. things_set_checklist
+    server.registerTool(
+      "things_set_checklist",
+      {
+        title: "Set Checklist Items",
+        description: "Atomically replace the entire checklist of a to-do with a new list of items.",
+        inputSchema: {
+          id: z.string().describe("UUID of the to-do"),
+          items: z.array(z.union([
+            z.string(),
+            z.object({
+              title: z.string().describe("Checklist item title"),
+              completed: z.boolean().optional().describe("Whether item is completed"),
+              canceled: z.boolean().optional().describe("Whether item is canceled"),
+              status: z.enum(["open", "completed", "canceled"]).optional().describe("Item status"),
+            }),
+          ])).describe("Array of checklist item titles or item objects"),
+        },
+        annotations: {
+          title: "Set Checklist Items",
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ id, items }) => {
+        const client = await getClient();
+        const result = await client.setChecklist(id, items);
+        return textResult(result);
+      }
+    );
+
+    // 36. things_update_tag
+    server.registerTool(
+      "things_update_tag",
+      {
+        title: "Update Tag",
+        description: "Update a tag's title, keyboard shortcut, or parent tag.",
+        inputSchema: {
+          id: z.string().describe("Tag UUID"),
+          title: z.string().optional().describe("New tag title"),
+          shortcut: z.string().nullable().optional().describe("Keyboard shortcut character (e.g. 'e'), or null/empty to clear"),
+          parent: z.string().nullable().optional().describe("Parent tag UUID or name, or null/empty to unparent"),
+        },
+        annotations: {
+          title: "Update Tag",
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ id, title, shortcut, parent }) => {
+        const client = await getClient();
+        await client.updateTag(id, { title, shortcut, parent });
+        return textResult(`Tag ${id} updated.`);
+      }
+    );
+
+    // 37. things_delete_tag
+    server.registerTool(
+      "things_delete_tag",
+      {
+        title: "Delete Tag",
+        description: "Permanently delete a tag from Things 3.",
+        inputSchema: {
+          id: z.string().describe("Tag UUID"),
+        },
+        annotations: {
+          title: "Delete Tag",
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ id }) => {
+        const client = await getClient();
+        await client.deleteTag(id);
+        return textResult(`Tag ${id} deleted.`);
+      }
+    );
+
+    // 38. things_delete_area
+    server.registerTool(
+      "things_delete_area",
+      {
+        title: "Delete Area",
+        description: "Delete an area from Things 3. Can optionally trash or unassign all projects and to-dos inside it.",
+        inputSchema: {
+          id: z.string().describe("Area UUID"),
+          delete_contents: z.boolean().optional().default(false).describe("If true, trashes contained projects and to-dos; if false (default), keeps them and unassigns area"),
+        },
+        annotations: {
+          title: "Delete Area",
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ id, delete_contents }) => {
+        const client = await getClient();
+        const result = await client.deleteArea(id, { deleteContents: delete_contents });
+        return textResult(`Area ${id} deleted${result.contentsPurged ? " (contents trashed)" : " (contents unassigned)"}.`);
+      }
+    );
+
+    // 39. things_batch_update_projects
+    server.registerTool(
+      "things_batch_update_projects",
+      {
+        title: "Batch Update Projects",
+        description: "Perform a batch operation across multiple projects simultaneously (complete, cancel, trash, reschedule, set area, or set deadlines/dates).",
+        inputSchema: {
+          ids: z.array(z.string()).describe("Array of project UUIDs"),
+          operation: z.enum(["complete", "cancel", "trash", "reschedule", "set_area", "set_dates"]).describe("Batch operation to perform"),
+          when: z.enum(["today", "tomorrow", "anytime", "someday"]).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional().describe("Required when operation is 'reschedule' or 'set_dates'"),
+          area: z.string().optional().describe("Area title or UUID when operation is 'set_area' or 'set_dates'"),
+          deadline: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Deadline (YYYY-MM-DD) to set"),
+          completion_date: z.string().optional().describe("Completion date in ISO 8601 (applies when completing/canceling projects)"),
+          creation_date: z.string().optional().describe("Creation date in ISO 8601"),
+        },
+        annotations: {
+          title: "Batch Update Projects",
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      async ({ ids, operation, when, area, deadline, completion_date, creation_date }) => {
+        const client = await getClient();
+        const result = await client.batchUpdateProjects(ids, operation, {
+          when,
+          area,
+          deadline,
+          completionDate: completion_date,
+          creationDate: creation_date,
+        });
+        return textResult(`Batch ${operation} applied to ${result.count} projects.`);
+      }
+    );
+
+    // 40. things_import_csv
+    server.registerTool(
+      "things_import_csv",
+      {
+        title: "Import Tasks from CSV",
+        description: "Import tasks into Things 3 from CSV exports (supports Asana, Todoist, OmniFocus, and standard spreadsheet formats) with automatic mapping of titles, notes, due dates, creation dates, completion dates, and project/area assignment.",
+        inputSchema: {
+          csv_data: z.string().describe("Raw CSV text content"),
+          default_project: z.string().optional().describe("Optional default project name or UUID for tasks without a project"),
+          default_area: z.string().optional().describe("Optional default area name or UUID for tasks without an area"),
+        },
+        annotations: {
+          title: "Import Tasks from CSV",
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      async ({ csv_data, default_project, default_area }) => {
+        const client = await getClient();
+        const result = await client.importCsv(csv_data, {
+          defaultProject: default_project,
+          defaultArea: default_area,
+        });
+        return textResult(result);
+      }
+    );
+
+    // 41. things_get_project_stats
+    server.registerTool(
+      "things_get_project_stats",
+      {
+        title: "Get Project Statistics",
+        description: "Get a comprehensive progress summary across all projects (or a specific area), including completion percentages, overdue project counts, and to-do velocity.",
+        inputSchema: {
+          area: z.string().optional().describe("Optional Area title or UUID to filter projects by"),
+        },
+        annotations: {
+          title: "Get Project Statistics",
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ area }) => {
+        const client = await getClient();
+        const db = await client.syncDatabase();
+        return textResult(db.getProjectStats({ area }));
+      }
+    );
+
+    // ==========================================\n    // PROMPTS (Workflow Guides)\n    // ==========================================
 
     server.registerPrompt(
       "daily-planning",
@@ -1418,6 +1616,30 @@ export class ThingsMCP extends McpAgent {
 1. Ask me what outcome or milestone I want to achieve.
 2. Outline the logical phases, and propose creating a project (things_create_project) with section headings (things_create_heading).
 3. Populate each section with clear, bite-sized next actions (things_add_todo) with checklist items where helpful.`,
+            },
+          },
+        ],
+      })
+    );
+
+    server.registerPrompt(
+      "asana-migration-audit",
+      {
+        title: "Asana Migration Audit",
+        description: "Guide a complete migration audit from Asana to Things 3, verifying imported projects, sections, tasks, and historical completion dates.",
+      },
+      () => ({
+        messages: [
+          {
+            role: "user",
+            content: {
+              type: "text",
+              text: `Audit and execute a migration from Asana to Things 3:
+1. Ask the user for their Asana CSV export or JSON data (or provide a preview with things_import_csv).
+2. Use things_get_project_stats to inspect the current state of Things 3 projects before importing.
+3. Import the tasks using things_import_csv (or things_import_json), ensuring sections map to headings, completed tasks preserve completion dates, and projects map to Things projects.
+4. Call things_get_logbook with since/until parameters to verify historical completed tasks were preserved accurately.
+5. Re-run things_get_project_stats to confirm project counts and task totals match expectations.`,
             },
           },
         ],

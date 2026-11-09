@@ -7,6 +7,8 @@ import {
   crc32,
   localDate,
   schedulingFields,
+  parseCSV,
+  convertCsvToThingsJson,
 } from "../src/things-client.js";
 
 function fakeCloud({ head = 10 } = {}) {
@@ -394,4 +396,215 @@ test("schedulingFields supports tomorrow and batchUpdateTodos can set dates", as
   assert.equal(change.p.sp, Date.parse(compDate) / 1000);
   assert.equal(change.p.cd, Date.parse(createDate) / 1000);
   assert.equal(change.p.dd, Date.UTC(2026, 8, 15) / 1000);
+});
+
+test("getLogbook filters by since and until dates", () => {
+  const db = new ThingsDatabase();
+  const t1 = Date.parse("2026-08-01T12:00:00Z") / 1000;
+  const t2 = Date.parse("2026-08-15T12:00:00Z") / 1000;
+  const t3 = Date.parse("2026-08-30T12:00:00Z") / 1000;
+
+  db.applyChangeMap({ "todo-early": { t: 0, e: "Task6", p: { tt: "Early Done", tp: 0, ss: 3, sp: t1, tr: false } } });
+  db.applyChangeMap({ "todo-mid": { t: 0, e: "Task6", p: { tt: "Mid Done", tp: 0, ss: 3, sp: t2, tr: false } } });
+  db.applyChangeMap({ "todo-late": { t: 0, e: "Task6", p: { tt: "Late Done", tp: 0, ss: 3, sp: t3, tr: false } } });
+
+  const all = db.getLogbook();
+  assert.equal(all.length, 3);
+
+  const filtered = db.getLogbook({ since: "2026-08-10", until: "2026-08-20" });
+  assert.equal(filtered.length, 1);
+  assert.equal(filtered[0].title, "Mid Done");
+
+  const sinceOnly = db.getLogbook({ since: "2026-08-20" });
+  assert.equal(sinceOnly.length, 1);
+  assert.equal(sinceOnly[0].title, "Late Done");
+});
+
+test("getProjectStats calculates summary metrics and progress accurately", () => {
+  const db = new ThingsDatabase();
+  db.applyChangeMap({ "area-1": { t: 0, e: "Area3", p: { tt: "Work" } } });
+  db.applyChangeMap({ "proj-done": { t: 0, e: "Task6", p: { tt: "Finished Project", tp: 1, ss: 3, ar: ["area-1"], tr: false } } });
+  db.applyChangeMap({
+    "proj-active": {
+      t: 0,
+      e: "Task6",
+      p: {
+        tt: "Active Project",
+        tp: 1,
+        ss: 0,
+        ar: ["area-1"],
+        dd: Date.UTC(2020, 0, 1) / 1000, // overdue deadline in past
+        tr: false,
+      },
+    },
+  });
+
+  db.applyChangeMap({ "t-1": { t: 0, e: "Task6", p: { tt: "Task 1", tp: 0, ss: 3, pr: ["proj-active"], tr: false } } });
+  db.applyChangeMap({ "t-2": { t: 0, e: "Task6", p: { tt: "Task 2", tp: 0, ss: 0, pr: ["proj-active"], tr: false } } });
+
+  const stats = db.getProjectStats();
+  assert.equal(stats.totalProjects, 2);
+  assert.equal(stats.openProjects, 1);
+  assert.equal(stats.completedProjects, 1);
+  assert.equal(stats.overdueProjects, 1);
+  assert.equal(stats.activeProjectsTodos.total, 2);
+  assert.equal(stats.activeProjectsTodos.completed, 1);
+  assert.equal(stats.activeProjectsTodos.open, 1);
+  assert.equal(stats.activeProjectsTodos.overallPercentComplete, 50);
+
+  const activeProj = stats.projects.find((p) => p.id === "proj-active");
+  assert.equal(activeProj.overdue, true);
+  assert.equal(activeProj.percentComplete, 50);
+});
+
+test("parseCSV and convertCsvToThingsJson properly handle Asana export format", () => {
+  const csv = `Task ID,Created At,Completed At,Name,Section/Column,Due Date,Notes,Projects,Tags
+1001,2026-08-01,2026-08-15,Implement Auth,Backend,2026-08-20,"Auth with OAuth2, JWT",Website,security; urgent
+1002,2026-08-02,,Design Landing Page,Frontend,2026-08-25,Figma designs,Website,design`;
+
+  const parsed = convertCsvToThingsJson(csv, { defaultArea: "Engineering" });
+  assert.equal(parsed.length, 2);
+
+  const item1 = parsed[0];
+  assert.equal(item1.attributes.title, "Implement Auth");
+  assert.equal(item1.attributes.notes, "Auth with OAuth2, JWT");
+  assert.equal(item1.attributes.completed, true);
+  assert.equal(item1.attributes["completion-date"], "2026-08-15");
+  assert.equal(item1.attributes.deadline, "2026-08-20");
+  assert.equal(item1.attributes.heading, "Backend");
+  assert.equal(item1.attributes.list, "Website");
+  assert.deepEqual(item1.attributes.tags, ["security", "urgent"]);
+
+  const item2 = parsed[1];
+  assert.equal(item2.attributes.title, "Design Landing Page");
+  assert.equal(item2.attributes.completed, false);
+  assert.deepEqual(item2.attributes.tags, ["design"]);
+});
+
+test("batchUpdateProjects applies changes across projects", async () => {
+  const proj1 = "PROJ_1";
+  const proj2 = "PROJ_2";
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method, headers: init.headers, body: init.body });
+    const json = (data, status = 200) => new Response(JSON.stringify(data), { status });
+    if (String(url).includes("/commit")) return json({ "server-head-index": 11 });
+    if (String(url).endsWith("/history/KEY")) return json({ "latest-server-index": 10, "latest-schema-version": 301 });
+    if (String(url).includes("/items")) {
+      return json({
+        schema: 301,
+        "current-item-index": 10,
+        items: [
+          { [proj1]: { t: 0, e: "Task6", p: { tt: "Project 1", tp: 1, ss: 0, tr: false } } },
+          { [proj2]: { t: 0, e: "Task6", p: { tt: "Project 2", tp: 1, ss: 0, tr: false } } },
+        ],
+      });
+    }
+    throw new Error(`unexpected ${url}`);
+  };
+
+  const client = new ThingsCloudClient({ email: "a@b.c", password: "pw", historyKey: "KEY", fetchImpl });
+  await client.batchUpdateProjects([proj1, proj2], "complete", { completionDate: "2026-08-25T12:00:00Z" });
+
+  const commit = calls.find((c) => c.url.includes("/commit"));
+  const changes = Object.values(JSON.parse(commit.body));
+  assert.equal(changes.length, 2);
+  assert.equal(changes[0].p.ss, 3);
+  assert.equal(changes[1].p.ss, 3);
+  assert.equal(changes[0].p.sp, Date.parse("2026-08-25T12:00:00Z") / 1000);
+});
+
+test("setChecklist replaces checklist items atomically", async () => {
+  const taskId = "TASK_WITH_CHECKLIST";
+  const existingChecklistId = "OLD_CL_1";
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method, headers: init.headers, body: init.body });
+    const json = (data, status = 200) => new Response(JSON.stringify(data), { status });
+    if (String(url).includes("/commit")) return json({ "server-head-index": 11 });
+    if (String(url).endsWith("/history/KEY")) return json({ "latest-server-index": 10, "latest-schema-version": 301 });
+    if (String(url).includes("/items")) {
+      return json({
+        schema: 301,
+        "current-item-index": 10,
+        items: [
+          { [taskId]: { t: 0, e: "Task6", p: { tt: "Parent Task", tp: 0, ss: 0, tr: false } } },
+          { [existingChecklistId]: { t: 0, e: "ChecklistItem3", p: { tt: "Old Step", ts: [taskId], ss: 0 } } },
+        ],
+      });
+    }
+    throw new Error(`unexpected ${url}`);
+  };
+
+  const client = new ThingsCloudClient({ email: "a@b.c", password: "pw", historyKey: "KEY", fetchImpl });
+  const result = await client.setChecklist(taskId, [
+    "New Step 1",
+    { title: "New Step 2", completed: true },
+  ]);
+
+  assert.equal(result.count, 2);
+  const commit = calls.find((c) => c.url.includes("/commit"));
+  const changes = JSON.parse(commit.body);
+  // Contains deletion of old checklist item
+  assert.ok(changes[existingChecklistId]);
+  assert.equal(changes[existingChecklistId].t, 2); // type 2 = delete
+
+  // Contains 2 newly created checklist items
+  const createdKeys = Object.keys(changes).filter((id) => id !== existingChecklistId);
+  assert.equal(createdKeys.length, 2);
+  const item1 = changes[createdKeys[0]];
+  const item2 = changes[createdKeys[1]];
+  assert.equal(item1.p.tt, "New Step 1");
+  assert.equal(item1.p.ss, 0);
+  assert.equal(item2.p.tt, "New Step 2");
+  assert.equal(item2.p.ss, 3);
+});
+
+test("updateTag, deleteTag, and deleteArea commit proper wire changes", async () => {
+  const tagId = "TAG_1";
+  const areaId = "AREA_1";
+  const taskId = "TASK_IN_AREA";
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method, headers: init.headers, body: init.body });
+    const json = (data, status = 200) => new Response(JSON.stringify(data), { status });
+    if (String(url).includes("/commit")) return json({ "server-head-index": 11 });
+    if (String(url).endsWith("/history/KEY")) return json({ "latest-server-index": 10, "latest-schema-version": 301 });
+    if (String(url).includes("/items")) {
+      return json({
+        schema: 301,
+        "current-item-index": 10,
+        items: [
+          { [tagId]: { t: 0, e: "Tag4", p: { tt: "Old Tag", ix: 0 } } },
+          { [areaId]: { t: 0, e: "Area3", p: { tt: "Old Area", ix: 0 } } },
+          { [taskId]: { t: 0, e: "Task6", p: { tt: "In Area", tp: 0, ar: [areaId], ss: 0, tr: false } } },
+        ],
+      });
+    }
+    throw new Error(`unexpected ${url}`);
+  };
+
+  const client = new ThingsCloudClient({ email: "a@b.c", password: "pw", historyKey: "KEY", fetchImpl });
+
+  // Update Tag
+  await client.updateTag(tagId, { title: "New Tag Title", shortcut: "k" });
+  const tagCommit = calls[calls.length - 1];
+  const tagChange = Object.values(JSON.parse(tagCommit.body))[0];
+  assert.equal(tagChange.p.tt, "New Tag Title");
+  assert.equal(tagChange.p.sh, "k");
+
+  // Delete Tag
+  await client.deleteTag(tagId);
+  const delTagCommit = calls[calls.length - 1];
+  const delTagChange = Object.values(JSON.parse(delTagCommit.body))[0];
+  assert.equal(delTagChange.t, 2);
+
+  // Delete Area (unassigning contents)
+  await client.deleteArea(areaId, { deleteContents: false });
+  const delAreaCommit = calls[calls.length - 1];
+  const delAreaChanges = JSON.parse(delAreaCommit.body);
+  assert.ok(delAreaChanges[taskId]);
+  assert.deepEqual(delAreaChanges[taskId].p.ar, []);
+  assert.ok(delAreaChanges[areaId]);
+  assert.equal(delAreaChanges[areaId].t, 2);
 });

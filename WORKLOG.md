@@ -1,5 +1,17 @@
 # Things MCP connector worklog
 
+## 2026-11-09 - Things 3.24 crashed on ids the connector minted; ids and dates now validated
+
+**What happened**: Things 3.24.2 beta on the Mac crashed on launch in `LegacySCHistoryPerformSync` (precondition in `decodeBase58String`, entity `Task7`). Things ids are a 16-byte UUID in Bitcoin-style base58 (leading zero bytes become leading "1"s), and the app decodes each into a 16-byte buffer. `generateUUID()` produced 22 random base58 characters, which need 17 bytes about 45% of the time: values above 2^128, or a leading "1". All 2,077 native keys in the history decode to exactly 16 bytes; 689 connector-era keys did not. Earlier oversized ids were test items created and deleted before the Mac pulled them, so they collapsed away. Today's BCBS import left 135 live items with bad ids, starting with the "BCBS VT" area at history index 1154. The Mac's cursor was 1153.
+
+**Repair**: Two corrective commits (indexes 1355 and 1356) re-created each bad entity under a valid id with its full collapsed properties, repointed 85 children, and deleted the old keys. Indexes 1355 and 1356 covered 128 items with values above 2^128 and 7 items with a leading "1". The Mac pulled the create/delete pairs in one session, launched, and synced to 1356 with 839 tasks matching the cloud. Pre-repair history is saved in the session scratchpad.
+
+**What changed**: `generateUUID()` encodes 16 random bytes canonically. `isThingsId()` and `validateChangeMap()` run inside `commitChanges`, which every write goes through. They refuse any entity id or `pr`/`agr`/`ar`/`tg`/`ts`/`rt`/`dl`/`pn` reference that does not decode to exactly 16 bytes. They also refuse non-numeric or millisecond timestamps (`cd`, `md`, `sp`, `lai`) and calendar dates (`sr`, `tir`, `dd`) that are not at midnight UTC. `parseIsoDate` rejects millisecond values. `import_json` refuses an `id` on a create, which used to fork items when a caller forgot `"operation": "update"`. Test fixtures used fake ids like `PROJ_1`; they now use real-format ids. Server version is 1.2.0.
+
+**Verification**: `npm test` passes 21 tests, including regressions built from the real bad ids. Deployed as Worker version `ee98b5b0-355b-42be-972a-688be48bad92`. Live checks: an `import_json` create with an id was refused with nothing written; `add_todo` minted `8irbC9h8z4DRLmykur2NNS`, which decodes to 16 bytes and was then purged; Things on the Mac stayed running.
+
+---
+
 ## 2026-11-09 - Match Things JSON format: dates, updates, and bulk support
 
 **What changed**:

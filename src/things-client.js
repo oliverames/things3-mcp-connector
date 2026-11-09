@@ -43,13 +43,18 @@ export function dateToTimestamp(dateStr) {
 // ISO 8601 string, Date, or unix timestamp -> unix seconds.
 export function parseIsoDate(value) {
   if (value === null || value === undefined || value === "") return null;
-  if (typeof value === "number") return value;
-  if (value instanceof Date) return value.getTime() / 1000;
-  const ms = Date.parse(value);
-  if (Number.isNaN(ms)) {
-    throw new Error(`Invalid ISO 8601 date "${value}".`);
+  let seconds;
+  if (typeof value === "number") seconds = value;
+  else if (value instanceof Date) seconds = value.getTime() / 1000;
+  else {
+    const ms = Date.parse(value);
+    if (Number.isNaN(ms)) throw new Error(`Invalid ISO 8601 date "${value}".`);
+    seconds = ms / 1000;
   }
-  return ms / 1000;
+  if (!Number.isFinite(seconds) || seconds < 0 || seconds > 4102444800) {
+    throw new Error(`Invalid date ${JSON.stringify(value)}: expected ISO 8601 or unix seconds, not milliseconds.`);
+  }
+  return seconds;
 }
 
 export function timestampToDate(ts) {
@@ -94,13 +99,85 @@ export function toUnixTimestamp(date = new Date()) {
   return date.getTime() / 1000;
 }
 
-// Things identifiers are 22-character base58 strings.
+// Things identifiers are a 16-byte UUID in Bitcoin-style base58: leading zero bytes become
+// leading "1"s, so an id is usually 22 characters and sometimes 21. Things decodes every id into
+// a 16-byte buffer and traps (crashing the Mac app's sync) when an id needs more bytes. Twenty-two
+// random base58 characters overflow about 45% of the time, which is what broke sync on 2026-11-09.
 const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-export function generateUUID() {
-  const bytes = crypto.getRandomValues(new Uint8Array(22));
+const THINGS_ID_BYTES = 16;
+
+export function encodeBase58(bytes) {
+  let zeros = 0;
+  while (zeros < bytes.length && bytes[zeros] === 0) zeros++;
+  let n = 0n;
+  for (const b of bytes) n = (n << 8n) | BigInt(b);
   let out = "";
-  for (let i = 0; i < 22; i++) out += BASE58[bytes[i] % BASE58.length];
-  return out;
+  while (n > 0n) {
+    out = BASE58[Number(n % 58n)] + out;
+    n /= 58n;
+  }
+  return "1".repeat(zeros) + out;
+}
+
+// Number of bytes an id decodes to, or -1 when it is not base58 at all.
+export function base58ByteLength(id) {
+  if (typeof id !== "string" || id.length === 0) return -1;
+  let zeros = 0;
+  while (zeros < id.length && id[zeros] === "1") zeros++;
+  let n = 0n;
+  for (const ch of id) {
+    const digit = BASE58.indexOf(ch);
+    if (digit < 0) return -1;
+    n = n * 58n + BigInt(digit);
+  }
+  let bytes = 0;
+  for (; n > 0n; n >>= 8n) bytes++;
+  return zeros + bytes;
+}
+
+export function isThingsId(id) {
+  return base58ByteLength(id) === THINGS_ID_BYTES;
+}
+
+export function generateUUID() {
+  return encodeBase58(crypto.getRandomValues(new Uint8Array(THINGS_ID_BYTES)));
+}
+
+// Property keys that hold arrays of ids, and keys that hold unix-second timestamps.
+const ID_LIST_KEYS = ["pr", "agr", "ar", "tg", "ts", "rt", "dl", "pn"];
+const TIMESTAMP_KEYS = ["cd", "md", "sp", "lai"];
+const CALENDAR_DATE_KEYS = ["sr", "tir", "dd"];
+const LATEST_TIMESTAMP = 4102444800; // 2100-01-01; anything later is milliseconds or garbage
+
+// Throws before anything reaches Things Cloud if a change carries an id or date that the Things
+// apps cannot decode. Every write funnels through commitChanges, which calls this.
+export function validateChangeMap(body) {
+  const problems = [];
+  for (const [id, change] of Object.entries(body)) {
+    if (!isThingsId(id)) problems.push(`entity id "${id}" is not a Things id`);
+    if (![0, 1, 2].includes(change?.t)) problems.push(`${id}: change type ${change?.t} is not 0, 1, or 2`);
+    if (typeof change?.e !== "string" || !/^[A-Za-z]+\d+$/.test(change.e)) {
+      problems.push(`${id}: entity "${change?.e}" is not a versioned entity name`);
+    }
+    const p = change?.p || {};
+    for (const key of ID_LIST_KEYS) {
+      if (!(key in p)) continue;
+      if (!Array.isArray(p[key])) problems.push(`${id}: ${key} must be an array of ids`);
+      else for (const ref of p[key]) if (!isThingsId(ref)) problems.push(`${id}: ${key} reference "${ref}" is not a Things id`);
+    }
+    for (const key of [...TIMESTAMP_KEYS, ...CALENDAR_DATE_KEYS]) {
+      const v = p[key];
+      if (v === null || v === undefined) continue;
+      if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > LATEST_TIMESTAMP) {
+        problems.push(`${id}: ${key} must be unix seconds, got ${JSON.stringify(v)}`);
+      } else if (CALENDAR_DATE_KEYS.includes(key) && v % 86400 !== 0) {
+        problems.push(`${id}: ${key} must be midnight UTC, got ${v}`);
+      }
+    }
+  }
+  if (problems.length) {
+    throw new Error(`Refusing to write data Things cannot decode:\n- ${problems.slice(0, 20).join("\n- ")}`);
+  }
 }
 
 // CRC-32 of the UTF-8 text; Things stores it as "ch" on note objects.
@@ -451,6 +528,7 @@ export class ThingsCloudClient {
     const body = {};
     for (const change of changes) Object.assign(body, change);
     if (!Object.keys(body).length) return { serverHeadIndex: null };
+    validateChangeMap(body);
 
     await this.ensureHistoryKey();
     // A fresh cached database already knows the head index, so a write costs one request.
@@ -1017,6 +1095,18 @@ export class ThingsCloudClient {
       });
     };
 
+    // The connector mints every new id itself. An id on a create usually means the caller meant
+    // "operation": "update"; writing it would fork or overwrite an item, so refuse instead.
+    const rejectCallerIds = (list, where) => {
+      for (const entry of list || []) {
+        if ((entry.operation || "create") === "create" && entry.id) {
+          throw new Error(`${where} "${entry.id}" has an id but no "operation": "update". Ids are only accepted on updates; new items get their ids from Things.`);
+        }
+      }
+    };
+    rejectCallerIds(items, "Item");
+    for (const item of items) rejectCallerIds(item.attributes?.items, "Project child");
+
     for (const item of items) {
       const type = item.type || "to-do";
       const operation = item.operation || "create";
@@ -1047,7 +1137,7 @@ export class ThingsCloudClient {
           addChecklist(attrs, item.id);
         }
       } else if (type === "project") {
-        const projectUUID = item.id || generateUUID();
+        const projectUUID = generateUUID();
         const areaId = attrs["area-id"]
           ? db.resolveRef("area", attrs["area-id"])
           : attrs.area
@@ -1080,7 +1170,7 @@ export class ThingsCloudClient {
           const subType = sub.type || "to-do";
           const subAttrs = sub.attributes || {};
           if (subType === "heading") {
-            headingUUID = sub.id || generateUUID();
+            headingUUID = generateUUID();
             const headingChange = buildTaskCreate({
               title: subAttrs.title || "Section",
               type: 2,
@@ -1092,7 +1182,7 @@ export class ThingsCloudClient {
             changes.push({ [headingUUID]: headingChange });
             db.applyChangeMap({ [headingUUID]: headingChange });
           } else if (subType === "to-do") {
-            const todoUUID = sub.id || generateUUID();
+            const todoUUID = generateUUID();
             const subStatus = subAttrs.completed === true ? 3 : subAttrs.canceled === true ? 2 : (subAttrs.status === "completed" ? 3 : subAttrs.status === "canceled" ? 2 : 0);
             const change = buildTaskCreate({
               title: subAttrs.title || "Untitled",
@@ -1119,7 +1209,7 @@ export class ThingsCloudClient {
           }
         }
       } else if (type === "to-do") {
-        const todoUUID = item.id || generateUUID();
+        const todoUUID = generateUUID();
         let project = null;
         let heading = null;
         let area = null;

@@ -1166,7 +1166,7 @@ export class ThingsMCP extends McpAgent {
       "things_import_json",
       {
         title: "Import Things JSON",
-        description: "Batch import complex structured projects, headings, to-dos, checklists, and tags or update existing items using Things 3 JSON format in a single atomic sync commit.",
+        description: "Batch import complex structured projects, headings, to-dos, checklists, and tags or update existing items using Things 3 JSON format in a single atomic sync commit. To change an existing item, pass {\"operation\": \"update\", \"id\": \"<Things id>\"}; an id without operation update is refused. New items always get ids minted by Things' own format. Dates are ISO 8601 (or unix seconds), never milliseconds. The whole batch is validated and rejected before writing if any id, reference, or date is one Things cannot decode.",
         inputSchema: {
           payload: z.any().describe("Things JSON array or object containing projects or to-dos to create or update"),
         },

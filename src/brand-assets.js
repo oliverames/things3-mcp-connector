@@ -4,7 +4,7 @@ export const CONNECTOR_MCP_URL = `${CONNECTOR_ORIGIN}/mcp`;
 export const REMOTE_SERVER_INFO = {
   name: "Things 3",
   title: "Things 3",
-  version: "1.1.0",
+  version: "1.2.0",
   description:
     "Direct personal cloud connector for Things 3 tasks, projects, and inbox via Things Cloud. Operates headlessly without requiring your Mac to be powered on.",
   icons: [

@@ -4,6 +4,10 @@ import {
   ThingsCloudClient,
   ThingsDatabase,
   buildTaskCreate,
+  generateUUID,
+  isThingsId,
+  validateChangeMap,
+  parseIsoDate,
   crc32,
   localDate,
   schedulingFields,
@@ -140,7 +144,7 @@ test("creating a to-do with completed and completion-date", async () => {
 });
 
 test("updating the notes and both dates on an existing completed to-do", async () => {
-  const existingId = "EXISTING_TODO_UUID";
+  const existingId = generateUUID();
   const initialCreated = Date.parse("2026-08-01T10:00:00Z") / 1000;
   const initialStop = Date.parse("2026-08-10T12:00:00Z") / 1000;
   const calls = [];
@@ -234,7 +238,7 @@ test("an update on an id that doesn't exist", async () => {
 });
 
 test("a completion date on a project", async () => {
-  const existingProjectId = "PROJECT_UUID";
+  const existingProjectId = generateUUID();
   const calls = [];
   const fetchImpl = async (url, init = {}) => {
     calls.push({ url: String(url), method: init.method, headers: init.headers, body: init.body });
@@ -282,7 +286,7 @@ test("a completion date on a project", async () => {
 });
 
 test("importJson creates project with completed and completion-date, and to-do with list-id does not land in Inbox", async () => {
-  const areaId = "AREA_UUID";
+  const areaId = generateUUID();
   const calls = [];
   const fetchImpl = async (url, init = {}) => {
     calls.push({ url: String(url), method: init.method, headers: init.headers, body: init.body });
@@ -349,7 +353,7 @@ test("schedulingFields supports tomorrow and batchUpdateTodos can set dates", as
   assert.equal(sched.st, 2);
   assert.ok(sched.sr > 0);
 
-  const todoId = "BATCH_TODO_UUID";
+  const todoId = generateUUID();
   const calls = [];
   const fetchImpl = async (url, init = {}) => {
     calls.push({ url: String(url), method: init.method, headers: init.headers, body: init.body });
@@ -482,8 +486,8 @@ test("parseCSV and convertCsvToThingsJson properly handle Asana export format", 
 });
 
 test("batchUpdateProjects applies changes across projects", async () => {
-  const proj1 = "PROJ_1";
-  const proj2 = "PROJ_2";
+  const proj1 = generateUUID();
+  const proj2 = generateUUID();
   const calls = [];
   const fetchImpl = async (url, init = {}) => {
     calls.push({ url: String(url), method: init.method, headers: init.headers, body: init.body });
@@ -515,8 +519,8 @@ test("batchUpdateProjects applies changes across projects", async () => {
 });
 
 test("setChecklist replaces checklist items atomically", async () => {
-  const taskId = "TASK_WITH_CHECKLIST";
-  const existingChecklistId = "OLD_CL_1";
+  const taskId = generateUUID();
+  const existingChecklistId = generateUUID();
   const calls = [];
   const fetchImpl = async (url, init = {}) => {
     calls.push({ url: String(url), method: init.method, headers: init.headers, body: init.body });
@@ -561,9 +565,9 @@ test("setChecklist replaces checklist items atomically", async () => {
 });
 
 test("updateTag, deleteTag, and deleteArea commit proper wire changes", async () => {
-  const tagId = "TAG_1";
-  const areaId = "AREA_1";
-  const taskId = "TASK_IN_AREA";
+  const tagId = generateUUID();
+  const areaId = generateUUID();
+  const taskId = generateUUID();
   const calls = [];
   const fetchImpl = async (url, init = {}) => {
     calls.push({ url: String(url), method: init.method, headers: init.headers, body: init.body });
@@ -607,4 +611,43 @@ test("updateTag, deleteTag, and deleteArea commit proper wire changes", async ()
   assert.deepEqual(delAreaChanges[taskId].p.ar, []);
   assert.ok(delAreaChanges[areaId]);
   assert.equal(delAreaChanges[areaId].t, 2);
+});
+
+// Regression for 2026-11-09: Things 3.24 decodes every id into 16 bytes and crashes the Mac app's
+// sync on anything larger. The two bad ids below are real ones the old generator wrote.
+test("ids are 16-byte base58 and ids Things cannot decode are rejected", () => {
+  for (let i = 0; i < 5000; i++) assert.ok(isThingsId(generateUUID()));
+
+  assert.ok(isThingsId("StNiG2avHMHrcvDVCZHHh5")); // native, 22 characters
+  assert.ok(isThingsId("FAGR63ag8YZfXwXJx6E95")); // native, 21 characters
+  assert.ok(!isThingsId("fq2hP6DE61h8fAqsQsHsEB")); // 129-bit value
+  assert.ok(!isThingsId("1HP7bZKWw9EJc6jZzUkCdT")); // leading "1" is a zero byte: 17 bytes
+  assert.ok(!isThingsId("54ac9b6c-49ce-4f21-9079-74c1324f6a2a"));
+  assert.ok(!isThingsId("0OIl0OIl0OIl0OIl0OIl0O"));
+  assert.ok(!isThingsId(""));
+});
+
+test("a commit with a bad id, reference, or date is refused before it reaches Things Cloud", async () => {
+  const task = (p = {}) => ({ t: 1, e: "Task6", p });
+  const good = generateUUID();
+  assert.doesNotThrow(() => validateChangeMap({ [good]: task({ pr: [generateUUID()], cd: 1794089397.169, dd: 1798848000 }) }));
+  assert.throws(() => validateChangeMap({ fq2hP6DE61h8fAqsQsHsEB: task() }), /not a Things id/);
+  assert.throws(() => validateChangeMap({ [good]: task({ pr: ["1HP7bZKWw9EJc6jZzUkCdT"] }) }), /pr reference/);
+  assert.throws(() => validateChangeMap({ [good]: task({ cd: 1794089397169 }) }), /cd must be unix seconds/);
+  assert.throws(() => validateChangeMap({ [good]: task({ sp: "2026-11-09T16:00:00Z" }) }), /sp must be unix seconds/);
+  assert.throws(() => validateChangeMap({ [good]: task({ dd: 1798848001 }) }), /midnight UTC/);
+  assert.throws(() => parseIsoDate(1794089397169), /not milliseconds/);
+  assert.equal(parseIsoDate("2026-11-09T16:00:00Z"), 1794240000);
+
+  // An id on an import_json create (a forgotten "operation": "update") is refused, not written.
+  const { calls, fetchImpl } = fakeCloud();
+  const client = new ThingsCloudClient({ email: "a@b.c", password: "pw", historyKey: "KEY", fetchImpl });
+  for (const id of ["54ac9b6c-49ce-4f21-9079-74c1324f6a2a", generateUUID()]) {
+    await assert.rejects(client.importJson([{ type: "to-do", id, attributes: { title: "x" } }]), /only accepted on updates/);
+  }
+  await assert.rejects(
+    client.importJson([{ type: "project", attributes: { title: "p", items: [{ type: "to-do", id: generateUUID(), attributes: { title: "x" } }] } }]),
+    /only accepted on updates/
+  );
+  assert.ok(!calls.some((c) => c.url.includes("/commit")));
 });

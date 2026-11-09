@@ -47,9 +47,10 @@ export default {
       if (assetRes.status !== 404) {
         const headers = new Headers(assetRes.headers);
         headers.set("Access-Control-Allow-Origin", "*");
-        // robots.txt and sitemap.xml change; icons are content-stable.
+        // These paths are not versioned, so none of them may be immutable: the
+        // icons changed in place on 2026-11-09. Crawler files change more often.
         const crawlerFile = url.pathname.endsWith(".txt") || url.pathname.endsWith(".xml");
-        headers.set("Cache-Control", crawlerFile ? "public, max-age=3600" : "public, max-age=31536000, immutable");
+        headers.set("Cache-Control", crawlerFile ? "public, max-age=3600" : "public, max-age=86400");
         return new Response(assetRes.body, { status: assetRes.status, headers });
       }
     }

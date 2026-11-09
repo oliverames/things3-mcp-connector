@@ -14,7 +14,7 @@
 
 ## 2026-11-09 - Icons trimmed to fill their canvas
 
-The icons were the 1024px Things tile (824px of artwork inside 100px of transparent margin) scaled down whole, so the tile covered 80% of every canvas: a 3px empty border on the 32px favicon and transparent corners on the 180px apple-touch icon, which iOS fills black. Regenerated the favicons (16/32/48/96), `favicon.ico` (48/32/16), `icon-192/256/512` from the trimmed tile, and made `apple-touch-icon.png` an opaque full-bleed square (checked fully opaque). `icon-1024.png` is the unchanged source art. Search Console has no `things3mcp.org` property yet for the account used here.
+The icons were the 1024px Things tile (824px of artwork inside 100px of transparent margin) scaled down whole, so the tile covered 80% of every canvas: a 3px empty border on the 32px favicon and transparent corners on the 180px apple-touch icon, which iOS fills black. Regenerated the favicons (16/32/48/96), `favicon.ico` (48/32/16), `icon-192/256/512` from the trimmed tile, and made `apple-touch-icon.png` an opaque full-bleed square (checked fully opaque). `icon-1024.png` is the unchanged source art. `things3mcp.org` is now a verified Search Console Domain property (DNS TXT via the Cloudflare authorization; leave it in place). Its sitemap was submitted (2 pages, success) and indexing of the home page was requested.
 
 ## 2026-11-09 - Same Search Console hardening as the YNAB connector
 

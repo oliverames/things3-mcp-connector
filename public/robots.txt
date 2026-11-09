@@ -1,4 +1,10 @@
 User-agent: *
 Allow: /
+Disallow: /mcp
+Disallow: /sse
+Disallow: /authorize
+Disallow: /token
+Disallow: /register
+Disallow: /callback
 
 Sitemap: https://things3mcp.org/sitemap.xml

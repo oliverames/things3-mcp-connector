@@ -1,5 +1,44 @@
 # Things MCP connector worklog
 
+## 2026-11-09 - Repeat rule edit that moves the next day, and stop with notes, tags, and checklist items (uncommitted, not deployed)
+
+Source: the second sampling session in the orchestrating session's `repeat-edit-shapes.md` (Things 3.24.2, history indexes after 1716). Nothing was written to Things Cloud and nothing was deployed; the work is covered by tests against the mocked fetch only.
+
+**Rule edit that moves the next day** (`planRepeatUpdate` in `src/things-client.js`)
+- The `rule` action no longer refuses a rule that does not fall on the template's `tir`. The new next day is `repeat.starts` when given, otherwise the first day the new rule falls on, counted from the old `tir` or from today when the old `tir` is in the past.
+- The write is one update on the template: `{ rr, md, icsd, tir }`. `rr` keeps the old `rr.sr`, `rr.ia` is the template's `tir` before the edit, and `tir` and `icsd` are both the new next day. `ti` and `icc` are not written. The recorded update also carried `ti`, which the app happened to rewrite.
+- When the new rule falls on the current `tir` and `repeat.starts` is absent or names that day, the write is still `{ md, rr }`.
+- The result carries `nextOccurrence`, `previousNextOccurrence`, and `nextDayMoved`.
+- Removed `repeatDaysNear`, which only served the old refusal message.
+
+**Stop with notes, tags, and checklist items**
+- The second record confirms that the new to-do gets the template's notes (with the CRC-32 in `nt.ch`) and tags, which `buildRepeatStopCreate` already wrote.
+- New `buildRepeatStopChecklistCreate`. Each checklist item of the template is created again for the new to-do with `lt` true, `md` null, `cd` equal to the new to-do's `cd`, `ts` the new to-do, the recorded `xx`, `ss` and `sp` carried over, and `ix` counting from 0 in the template's order. The template's own items are tombstoned. Commit order as recorded: the new to-do, the new items, the item tombstones, the detached occurrences, the template tombstone.
+- The refusal for a template with checklist items is gone. New ids come from one ordered pool, so a plan rebuilt after a conflict names the same items.
+
+**Refusals that remain**
+- `rule`: a paused template; an after-completion rule on either side; an old rule that is not a plain rule (for example a deadline offset in `ts`); a template with no `tir`; `repeat.starts` before the current next day, in the past, or on a day the rule does not fall on; an end date before the new next day.
+- `stop`: a paused template; `ato` or the deadline sentinel in `dd`; a `tir` that is today, past, or missing.
+- Any action on a trashed template or on a to-do that is neither a template nor an occurrence.
+
+**Validator**
+- A template update with `rr` must be exactly `{ md, rr }` or exactly `{ md, rr, tir, icsd }`. `tir` and `icsd` stay refused on a template in any other update. In both forms `rr.sr` is the old `sr` and `rr.ia` is the old `tir`. The four-key form also needs `tir` equal to `icsd`, later than the old `tir`, not before today, on a day the new rule falls on, and not after the rule's end date. The two-key form still needs the rule to fall on the old `tir`.
+- A checklist create with `lt` true or `md` null, or one whose parent is a stop create, must have `lt` true, `md` null, a stop create in the same commit as its parent, and that create's `cd`.
+- A stop create must come with the template's checklist items, one for one: same title, `ss`, and `sp`, and `ix` 0, 1, 2 in the template's order. The existing dangling-reference check already refuses a commit that leaves the template's own items behind.
+
+**Tests**: 113 pass (`npm test`). Both recorded commits are compared key for key with the clock set to the recorded write (`md` and `cd` to the millisecond). Also covered: `repeat.starts` naming a later day, a `tir` in the past, status and stop date carried to the new items, and the validator refusing each near miss of both shapes.
+
+**Differences from the records**
+- `ti` is left out of the rule edit, as instructed.
+- Entities are written as `Task6`, like every other write of the connector; the app wrote `Task7`.
+- The ids of the new to-do and items are generated, and timestamps have millisecond precision.
+
+**Not verified**
+- Nothing here has been read by a Things app. One supervised live run of each shape is still needed.
+- The move was recorded once, with an interval of 1 and no `repeat.starts`. Whether the app would pick the same next day for an interval above 1, and whether it accepts a later day chosen with `repeat.starts` when the rule also falls on the current next day, is not known.
+- Which of the two recorded template items was "One" is not in the record, and their `ix` values are not either. `ix` counting from 0 matches the record but a template whose items have other `ix` values was not recorded.
+- Items with a status other than open were not recorded; `ss` and `sp` are carried over as instructed.
+
 ## 2026-11-09 - Remaining hardening items from the audit (uncommitted, not deployed)
 
 These five were declined in the audit pass as small benefit and are now done. Nothing was written to Things Cloud and nothing was deployed; all of it is covered by tests against a mocked fetch. No new wire shape is written: every change sends the same entities and keys as before.

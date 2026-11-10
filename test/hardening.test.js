@@ -1342,15 +1342,86 @@ test("things_update_repeat rule: writes md and the new rr on the template, exact
   assert.deepEqual([commits[1].body[S.template].p.rr.ia, commits[1].body[S.template].p.rr.sr], [S.nov10, S.nov9]);
 });
 
-test("things_update_repeat rule: an edit that would move the next day, or any unsampled case, is refused with nothing written", async (t) => {
+// Second sampling session: a daily template (created by the connector) whose next day is
+// 2026-11-10, changed to weekly on Friday in the app. The app also rewrote ti, which is incidental
+// and not written here.
+const MOVE_TEMPLATE = "QWDpWqkzjS5Tny3BX2js2X";
+const SAMPLED_MOVE = JSON.parse(
+  '{"ti":-543,"rr":{"of":[{"wd":5}],"rrv":4,"tp":0,"ts":0,"fu":256,"ia":1794268800,"fa":1,"sr":1794182400,"rc":0,"ed":64092211200},"md":1794276589.185753,"icsd":1794528000,"tir":1794528000}'
+);
+const moveHistory = (templateProps = {}) => {
+  const [project, , template] = sampledHistory(templateProps);
+  return [project, { [MOVE_TEMPLATE]: template[S.template] }];
+};
+
+test("things_update_repeat rule: a rule that moves the next day writes md, rr, tir, and icsd, exactly as sampled", async (t) => {
+  at(t, 1794276589.185753);
+  const { client, commits } = cloud(moveHistory());
+  const result = await client.updateRepeat(MOVE_TEMPLATE, { action: "rule", repeat: { frequency: "weekly", weekdays: ["fri"] } });
+  assert.equal(commits.length, 1);
+  const { ti, ...sampled } = SAMPLED_MOVE;
+  assert.equal(ti, -543);
+  assert.deepEqual(commits[0].body, { [MOVE_TEMPLATE]: { t: 1, e: "Task6", p: { ...sampled, md: ms(1794276589.185753) } } });
+  assert.deepEqual(Object.keys(commits[0].body[MOVE_TEMPLATE].p), ["rr", "md", "icsd", "tir"]);
+  assert.deepEqual([result.repeatRule, result.nextOccurrence, result.previousNextOccurrence, result.nextDayMoved], ["Every week on Friday", "2026-11-13", "2026-11-10", true]);
+  const read = (await client.syncDatabase()).getTask(MOVE_TEMPLATE);
+  assert.deepEqual([read.repeatRule, read.repeat.nextOccurrence], ["Every week on Friday", "2026-11-13"]);
+
+  // repeat.starts names a later day the rule falls on, even when the rule also falls on the current one.
+  const later = cloud(moveHistory());
+  const r2 = await later.client.updateRepeat(MOVE_TEMPLATE, { action: "rule", repeat: { frequency: "daily", starts: "2026-11-12" } });
+  const p2 = later.commits[0].body[MOVE_TEMPLATE].p;
+  assert.deepEqual(Object.keys(p2).sort(), ["icsd", "md", "rr", "tir"]);
+  assert.deepEqual([p2.tir, p2.icsd, p2.rr.ia, p2.rr.sr, r2.nextOccurrence], [1794441600, 1794441600, S.nov10, S.nov9, "2026-11-12"]);
+
+  // A next day left in the past moves to the first matching day counted from today (2026-11-09), not from it.
+  const nov3 = 1793664000;
+  const stale = cloud(moveHistory({ tir: nov3, icsd: nov3 }));
+  const r3 = await stale.client.updateRepeat(MOVE_TEMPLATE, { action: "rule", repeat: { frequency: "weekly", weekdays: ["wed", "sat"] } });
+  const p3 = stale.commits[0].body[MOVE_TEMPLATE].p;
+  assert.deepEqual([p3.tir, p3.icsd, p3.rr.ia, r3.nextOccurrence], [1794355200, 1794355200, nov3, "2026-11-11"]);
+  const stale2 = cloud(moveHistory({ tir: nov3, icsd: nov3 }));
+  await assert.rejects(stale2.client.updateRepeat(MOVE_TEMPLATE, { action: "rule", repeat: { frequency: "daily", starts: "2026-11-05" } }), /repeat\.starts \(2026-11-05\) is in the past/);
+  assert.equal(stale2.commits.length, 0);
+
+  // The validator accepts exactly the sampled move and refuses each near miss.
+  const db = await cloud(moveHistory()).client.syncDatabase();
+  const upd = (p) => ({ [MOVE_TEMPLATE]: { t: 1, e: "Task6", p } });
+  const good = { ...sampled, md: 1794276589.186 };
+  const fri = 1794528000;
+  assert.doesNotThrow(() => validateChangeMap(upd(good), db));
+  refused(upd({ ...good, ti: -543 }), db, /ti would change a repeating template/);
+  refused(upd({ ...good, icc: 1 }), db, /icc would change a repeating template/);
+  refused(upd({ md: good.md, rr: good.rr, tir: fri }), db, /tir would change a repeating template/);
+  refused(upd({ md: good.md, rr: good.rr, icsd: fri }), db, /icsd would change a repeating template/);
+  refused(upd({ md: good.md, tir: fri, icsd: fri }), db, /tir would change a repeating template/);
+  refused(upd({ md: good.md, rr: good.rr }), db, /does not fall on the template's next day 2026-11-10/);
+  refused(upd({ ...good, icsd: fri + 86400 }), db, /tir and icsd must both be the new next day/);
+  refused(upd({ ...good, icsd: null }), db, /tir and icsd must both be the new next day/);
+  refused(upd({ ...good, tir: S.nov10, icsd: S.nov10 }), db, /can only move later than 2026-11-10/);
+  refused(upd({ ...good, tir: S.nov9, icsd: S.nov9 }), db, /can only move later/);
+  refused(upd({ ...good, tir: fri - 86400, icsd: fri - 86400 }), db, /does not fall on the new next day 2026-11-12/);
+  refused(upd({ ...good, rr: { ...good.rr, ia: fri } }), db, /rr\.ia must be the template's next day \(tir\) before the edit/);
+  refused(upd({ ...good, rr: { ...good.rr, sr: S.nov10 } }), db, /rr\.sr must stay the old rule's sr/);
+  refused(upd({ ...good, rr: { ...good.rr, ed: S.nov10 + 86400 } }), db, /ends before the new next day/);
+  refused(upd({ ...good, rr: null }), db, /cannot be cleared/);
+  const staleDb = await cloud(moveHistory({ tir: nov3, icsd: nov3 })).client.syncDatabase();
+  const nov6 = 1793923200;
+  refused(upd({ ...good, rr: { ...good.rr, ia: nov3 }, tir: nov6, icsd: nov6 }), staleDb, /cannot be before today/);
+  const pausedDb = await cloud(moveHistory({ icp: true })).client.syncDatabase();
+  refused(upd(good), pausedDb, /the template is paused/);
+});
+
+test("things_update_repeat rule: unsampled cases are refused with nothing written", async (t) => {
   at(t, 1794274921.023453);
   const { client, commits } = cloud(sampledHistory());
   const no = (id, args, pattern) => assert.rejects(client.updateRepeat(id, args), pattern);
   const rule = (repeat) => ({ action: "rule", repeat });
-  await no(S.template, rule({ frequency: "weekly", weekdays: ["wed"] }), /next day of this repeat is 2026-11-10.*nearest days it does fall on: 2026-11-11\)/);
-  await no(S.template, rule({ frequency: "weekly", weekdays: ["mon", "wed"] }), /nearest days it does fall on: 2026-11-09 and 2026-11-11\)/);
-  await no(S.template, rule({ frequency: "monthly", month_days: [15] }), /nearest days it does fall on: 2026-11-15\)/);
-  await no(S.template, rule({ frequency: "daily", starts: "2026-11-12" }), /repeat\.starts \(2026-11-12\) is not the next day of this repeat \(2026-11-10\)/);
+  await no(S.template, rule({ frequency: "daily", starts: "2026-11-09" }), /repeat\.starts \(2026-11-09\) is before the next day of this repeat \(2026-11-10\).*earlier was not sampled/);
+  await no(S.template, rule({ frequency: "weekly", weekdays: ["fri"], starts: "2026-11-12" }), /2026-11-12 is not a day the new rule falls on\. The next one is 2026-11-13/);
+  await no(S.template, rule({ frequency: "weekly", weekdays: ["fri"], starts: "2026-11-10" }), /2026-11-10 is not a day the new rule falls on\. The next one is 2026-11-13/);
+  await no(S.template, rule({ frequency: "weekly", weekdays: ["fri"], ends: { on: "2026-11-11" } }), /repeat\.ends\.on 2026-11-11 is before the new next day 2026-11-13/);
+  await no(S.template, rule({ frequency: "daily", starts: "soon" }), /repeat\.starts must be a date/);
   await no(S.template, rule({ frequency: "daily", interval: 4, after_completion: true }), /after completion was not sampled/);
   await no(S.template, rule({ frequency: "hourly" }), /Supported repeats/);
   await no(S.template, { action: "rule" }, /needs a repeat object/);
@@ -1475,9 +1546,6 @@ test("things_update_repeat stop: unsampled cases are refused, and the validator 
     const c = cloud(history);
     return [assert.rejects.bind(null, c.client.updateRepeat(S.template, { action: "stop" })), c];
   };
-  const item = generateUUID();
-  const [withChecklist, c1] = stop([...sampledHistory(), { [item]: buildChecklistCreate({ title: "step", task: S.template }) }]);
-  await withChecklist(/has checklist items.*Trashing the template \(things_delete_todo/);
   const [paused, c2] = stop(sampledHistory({ icp: true }));
   await paused(/is paused.*Resume it first/);
   const [withReminder, c3] = stop(sampledHistory({ ato: 32400 }));
@@ -1488,7 +1556,7 @@ test("things_update_repeat stop: unsampled cases are refused, and the validator 
   await dueToday(/next day of the repeating to-do \S+ is 2026-11-09; only a repeat whose next day is in the future/);
   const [inTrash, c6] = stop(sampledHistory({ tr: true }));
   await inTrash(/is in the Trash/);
-  assert.equal([c1, c2, c3, c4, c5, c6].reduce((n, c) => n + c.commits.length, 0), 0);
+  assert.equal([c2, c3, c4, c5, c6].reduce((n, c) => n + c.commits.length, 0), 0);
 
   const { client } = cloud(sampledHistory());
   const db = await client.syncDatabase();
@@ -1508,6 +1576,113 @@ test("things_update_repeat stop: unsampled cases are refused, and the validator 
   bad({ icsd: S.nov10 }, /needs icsd null/);
   bad({ tir: S.nov9 }, /sr and tir on the same day/);
   bad({ sr: 1794355200, tir: 1794355200 }, /must be on the template's next day/);
+});
+
+// Second sampling session: Stop on a template with notes, one tag, and two checklist items.
+const B = {
+  project: "JVH7o2GV7gnw7YsLPKuCZP",
+  tag: "H96sVJwE7VJveAnv7itmux",
+  template: "42z5x6HRuXwRLnakSF6teh",
+  occurrence: "2ERKk97mjgwvtiBNL8cYVZ",
+  one: "TKnz93jLYf8GVtyVrDmG5e",
+  two: "JSvw5KYxebS5HuDk6u2jz1",
+  sampledNewTodo: "UigGY7zyRphxNeq29WvYSn",
+};
+const SAMPLED_STOP_B = {
+  ...SAMPLED_STOP_CREATE,
+  ...JSON.parse('{"tt":"Stop sample B","sr":1794268800,"tir":1794268800,"st":2,"lt":true,"md":null,"ato":null,"dd":null,"rt":[],"rr":null,"ix":0,"ti":0,"tg":["H96sVJwE7VJveAnv7itmux"],"nt":{"t":1,"ch":2335530048,"v":"Sample **notes**","_t":"tx"},"pr":["JVH7o2GV7gnw7YsLPKuCZP"]}'),
+};
+const SAMPLED_STOP_B_ITEMS = [
+  JSON.parse('{"ix":0,"cd":1794276623.623518,"ts":["UigGY7zyRphxNeq29WvYSn"],"sp":null,"ss":0,"xx":{"sn":{},"_t":"oo"},"tt":"One","md":null,"lt":true}'),
+  JSON.parse('{"lt":true,"cd":1794276623.623518,"ts":["UigGY7zyRphxNeq29WvYSn"],"sp":null,"ss":0,"xx":{"sn":{},"_t":"oo"},"md":null,"tt":"Two","ix":1}'),
+];
+const stopHistoryB = ({ one = {}, two = {} } = {}) => {
+  const task = (p) => ({ t: 0, e: "Task6", p: { ...buildTaskCreate({ title: "Stop sample B", when: "anytime", project: B.project, now: 1794276500, timeZone: TZ }).p, ...p } });
+  const item = (title, index, p) => ({ t: 0, e: "ChecklistItem3", p: { ...buildChecklistCreate({ title, task: B.template, index, now: 1794276500 }).p, ...p } });
+  return [
+    { [B.project]: { t: 0, e: "Task6", p: { ...buildTaskCreate({ title: "Samples B", type: 1, when: "anytime", now: 1794276400, timeZone: TZ }).p } } },
+    { [B.tag]: { t: 0, e: "Tag4", p: { tt: "sample", sh: null, pn: [], ix: 0, xx: { sn: {}, _t: "oo" } } } },
+    { [B.occurrence]: task({ st: 1, sr: S.nov9, tir: S.nov9, rt: [B.template] }) },
+    {
+      [B.template]: task({
+        sr: null,
+        st: 2,
+        tir: S.nov10,
+        icc: 1,
+        icsd: S.nov10,
+        nt: noteObject("Sample **notes**"),
+        tg: [B.tag],
+        rr: { of: [{ dy: 0 }], rrv: 4, tp: 0, ts: 0, fu: 16, ia: S.nov9, fa: 1, sr: S.nov9, rc: 0, ed: 64092211200 },
+      }),
+    },
+    { [B.one]: item("One", 0, one) },
+    { [B.two]: item("Two", 1, two) },
+  ];
+};
+
+test("things_update_repeat stop: notes, tags, and checklist items go to the new to-do in one commit, exactly as sampled", async (t) => {
+  at(t, 1794276623.623518);
+  const { client, commits } = cloud(stopHistoryB());
+  const result = await client.updateRepeat(B.template, { action: "stop" });
+  assert.equal(commits.length, 1);
+  const body = commits[0].body;
+  const ids = Object.keys(body);
+  const [newTodo, copy1, copy2] = ids;
+  assert.deepEqual(ids.slice(3), [B.one, B.two, B.occurrence, B.template]);
+  assert.equal(ids.length, 7);
+  assert.equal(newTodo, result.newTodoId);
+  const cd = ms(1794276623.623518);
+  assert.deepEqual(body[newTodo], { t: 0, e: "Task6", p: { ...SAMPLED_STOP_B, cd } });
+  assert.deepEqual(Object.keys(body[newTodo].p).sort(), Object.keys(SAMPLED_STOP_CREATE).sort());
+  assert.equal(body[newTodo].p.nt.ch, 2335530048);
+  assert.deepEqual(body[copy1], { t: 0, e: "ChecklistItem3", p: { ...SAMPLED_STOP_B_ITEMS[0], ts: [newTodo], cd } });
+  assert.deepEqual(body[copy2], { t: 0, e: "ChecklistItem3", p: { ...SAMPLED_STOP_B_ITEMS[1], ts: [newTodo], cd } });
+  assert.deepEqual(Object.keys(body[copy1].p), Object.keys(SAMPLED_STOP_B_ITEMS[0]));
+  assert.deepEqual(body[B.one], { t: 2, e: "ChecklistItem3", p: {} });
+  assert.deepEqual(body[B.two], { t: 2, e: "ChecklistItem3", p: {} });
+  assert.deepEqual(body[B.occurrence], { t: 1, e: "Task6", p: { rt: [] } });
+  assert.deepEqual(body[B.template], { t: 2, e: "Task6", p: {} });
+  assert.deepEqual([result.checklistItemsCopied, result.scheduledDate, result.detachedOccurrences], [2, "2026-11-10", [B.occurrence]]);
+
+  const db = await client.syncDatabase();
+  const made = db.getTask(newTodo);
+  assert.deepEqual([made.title, made.notes, made.when, made.projectId], ["Stop sample B", "Sample **notes**", "2026-11-10", B.project]);
+  assert.deepEqual(db.resolveChecklistItems(newTodo).map((c) => [c.title, c.status]), [["One", "open"], ["Two", "open"]]);
+  assert.deepEqual(db.checklistItemsFor(B.template), []);
+
+  // Status and stop date are carried over, and ix counts from 0 in the template's order.
+  const other = cloud(stopHistoryB({ one: { ix: 9 }, two: { ix: 4, ss: 3, sp: 1794270000 } }));
+  await other.client.updateRepeat(B.occurrence, { action: "stop" });
+  const [, first, second] = Object.values(other.commits[0].body);
+  assert.deepEqual([first.p.tt, first.p.ix, first.p.ss, first.p.sp], ["Two", 0, 3, 1794270000]);
+  assert.deepEqual([second.p.tt, second.p.ix, second.p.ss, second.p.sp], ["One", 1, 0, null]);
+  assert.deepEqual([first.p.lt, first.p.md, first.p.cd], [true, null, cd]);
+
+  // The validator accepts exactly this commit and refuses each near miss.
+  const before = await cloud(stopHistoryB()).client.syncDatabase();
+  assert.doesNotThrow(() => validateChangeMap(body, before));
+  const withChange = (id, p) => ({ ...body, [id]: { ...body[id], p: { ...body[id].p, ...p } } });
+  const without = (id) => Object.fromEntries(Object.entries(body).filter(([k]) => k !== id));
+  const stopItem = /a checklist item created when a repeat is stopped needs lt true, md null, and the cd of the new to-do/;
+  refused(withChange(copy1, { md: cd }), before, stopItem);
+  refused(withChange(copy1, { lt: false }), before, stopItem);
+  refused(withChange(copy1, { lt: false, md: cd }), before, stopItem);
+  refused(withChange(copy2, { cd: cd + 1 }), before, stopItem);
+  refused(withChange(copy2, { ts: [B.occurrence] }), before, stopItem);
+  const templateItems = /must get the template's checklist items/;
+  refused(without(copy2), before, templateItems);
+  refused(withChange(copy2, { tt: "Three" }), before, templateItems);
+  refused(withChange(copy2, { ix: 5 }), before, templateItems);
+  refused(withChange(copy1, { ss: 3, sp: cd }), before, templateItems);
+  refused({ ...body, [generateUUID()]: body[copy1] }, before, templateItems);
+  refused(without(B.one), before, /parent task still references deleted item/);
+  refused(withChange(newTodo, { nt: { ...SAMPLED_STOP_B.nt, ch: 0 } }), before, /is not the CRC-32 of the text/);
+  refused(withChange(newTodo, { tg: [generateUUID()] }), before, /is not an existing tag/);
+  // The shape belongs to a stop only: an ordinary new checklist item cannot have lt true or md null.
+  const plain = buildChecklistCreate({ title: "step", task: B.occurrence, now: cd });
+  assert.doesNotThrow(() => validateChangeMap({ [generateUUID()]: plain }, before));
+  refused({ [generateUUID()]: { ...plain, p: { ...plain.p, md: null } } }, before, stopItem);
+  refused({ [generateUUID()]: { ...plain, p: { ...plain.p, lt: true } } }, before, stopItem);
 });
 
 // --- hardening 2026-11-09: rebuild after a conflict, batch fields, closed projects, credentials, time zone ---

@@ -177,8 +177,9 @@ const KNOWN_ENTITY_NAMES = new Set(Object.values(ENTITY));
 const entityFamily = (name) => String(name).replace(/\d+$/, "");
 
 // A repeating template may only change these; scheduling keys belong to the Things apps. `rr` and
-// `icp` are accepted only in the two shapes sampled from Things 3.24.2 (a rule edit that keeps the
-// next day, and pause or resume); see the template checks in validateAgainstDatabase.
+// `icp` are accepted only in the shapes sampled from Things 3.24.2 (a rule edit that keeps the next
+// day, one that moves it and so also writes tir and icsd, and pause or resume); see the template
+// checks in validateAgainstDatabase.
 const TEMPLATE_SAFE_KEYS = new Set(["tt", "nt", "tg", "tr", "md", "pr", "agr", "ar", "ix", "rr", "icp"]);
 
 const isNum = (v) => typeof v === "number" && Number.isFinite(v);
@@ -263,6 +264,8 @@ function offsetProblems(entries, freq) {
 // the day (sr and tir, which must be equal).
 const STOP_CREATE_FIXED = { tp: 0, ss: 0, sp: null, tr: false, st: 2, sb: 0, ato: null, dd: null, dds: null, rmd: null, icp: false, do: 0, lai: null, lt: true, icc: 0, ti: 0, md: null, icsd: null, rp: null, acrd: null, rr: null };
 const isStopCreate = (change) => change?.t === 0 && entityFamily(change.e) === "Task" && isPlainObject(change.p) && (change.p.lt === true || change.p.md === null);
+// The keys of the rule edit that moves the next day (the app also rewrote ti, which is incidental).
+const RULE_MOVE_KEYS = ["md", "rr", "tir", "icsd"];
 
 // Structural equality for JSON values, ignoring key order.
 function sameJson(a, b) {
@@ -465,21 +468,6 @@ export function firstRepeatDay(repeat, from) {
   throw new Error("The repeat rule has no matching day.");
 }
 
-// The days nearest to `day` that the rule falls on: the last one before it (not before `earliest`)
-// and the first one on or after it.
-function repeatDaysNear(repeat, day, earliest) {
-  const rule = parseRepeat(repeat);
-  const near = [];
-  for (let d = addDays(day, -1), i = 0; d >= earliest && i < 3290; d = addDays(d, -1), i += 1) {
-    if (repeatMatchesDay(rule, d)) {
-      near.push(d);
-      break;
-    }
-  }
-  near.push(firstRepeatDay(repeat, day));
-  return near;
-}
-
 // The first day of a new repeating to-do: `starts` when given, otherwise the next matching day.
 // A start in the past or on a day the rule skips is refused instead of moved.
 export function repeatStartDay(repeat, starts, today) {
@@ -599,6 +587,16 @@ export function validateChangeMap(body, db = null) {
     } else if (family === "ChecklistItem") {
       if ("ts" in p && !(Array.isArray(p.ts) && p.ts.length === 1)) add("a checklist item needs exactly one parent task in ts");
       if ("sp" in p && "ss" in p && (p.ss === 0) !== (p.sp === null)) add("sp must be null exactly when ss is 0");
+      // Stopping a repeat re-creates the template's checklist items for the new to-do with lt true,
+      // md null, and the new to-do's cd. No other checklist create looks like that, and the new
+      // to-do takes no other kind of item.
+      if (change.t === 0) {
+        const parent = Array.isArray(p.ts) ? body[p.ts[0]] : undefined;
+        const underStop = isStopCreate(parent);
+        if ((p.lt === true || p.md === null || underStop) && !(underStop && p.lt === true && p.md === null && p.cd === parent.p.cd)) {
+          add("a checklist item created when a repeat is stopped needs lt true, md null, and the cd of the new to-do, which must be created in the same commit; no other checklist create may have lt true or md null");
+        }
+      }
       if ("nt" in p) add("a checklist item has no note");
     } else if (family === "Tag" && "sh" in p && p.sh !== null && typeof p.sh !== "string") add("sh must be a string or null");
     if ((family === "Area" || family === "Tag") && change.t === 0 && !p.tt) add("a new area or tag needs a title");
@@ -668,20 +666,33 @@ function validateAgainstDatabase(body, db) {
 
     if (change.t === 0 && isPlainObject(p.rr) && isNum(p.tir) && p.tir < todayTs) add("a new repeating template cannot start before today");
     if (change.t === 1 && before?.recurrenceRule) {
-      for (const key of Object.keys(p)) if (!TEMPLATE_SAFE_KEYS.has(key)) add(`${key} would change a repeating template; edit repeating to-dos in Things`);
-      // The rule edit sampled from Things: md and rr only, the next day (tir) unchanged, rr.sr kept
-      // from the old rule and rr.ia on the next day. Nothing else about a rule may be written.
+      // The two rule edits sampled from Things. Both keep rr.sr from the old rule and put rr.ia on
+      // the template's next day (tir) as it was before the edit. When the new rule falls on that
+      // day the edit is md and rr only. When the next day moves, tir and icsd are written too, both
+      // on the new day, which is later, not before today, and a day the new rule falls on. Nothing
+      // else about a rule may be written.
+      const moves = "rr" in p && sameKeys(p, RULE_MOVE_KEYS);
+      for (const key of Object.keys(p)) {
+        if (!TEMPLATE_SAFE_KEYS.has(key) && !(moves && (key === "tir" || key === "icsd"))) add(`${key} would change a repeating template; edit repeating to-dos in Things`);
+      }
       if ("rr" in p) {
         const no = (why) => add(`rr would change a repeating template in a way Things was not seen to write: ${why}`);
         const old = before.recurrenceRule;
         const tir = tirOf(before);
-        if (!sameKeys(p, ["md", "rr"])) no("a rule edit writes exactly md and rr");
+        const fallsOn = (ts) => repeatMatchesDay({ unit: RR_UNITS[p.rr.fu], of: p.rr.of }, timestampToDate(ts));
+        if (!moves && !sameKeys(p, ["md", "rr"])) no("a rule edit writes exactly md and rr, or md, rr, tir, and icsd when the next day moves");
         else if (!isPlainObject(p.rr)) no("a rule cannot be cleared by an update");
         else if (before.instanceCreationPaused) no("the template is paused");
         else if (old.tp !== 0 || p.rr.tp !== 0) no("only a fixed-schedule rule can replace a fixed-schedule rule");
         else if (p.rr.sr !== old.sr) no("rr.sr must stay the old rule's sr");
-        else if (tir === null || p.rr.ia !== tir) no("rr.ia must be the template's next day (tir)");
-        else if (!repeatMatchesDay({ unit: RR_UNITS[p.rr.fu], of: p.rr.of }, before.todayRefDate)) no(`the new rule does not fall on the template's next day ${before.todayRefDate}`);
+        else if (tir === null || p.rr.ia !== tir) no("rr.ia must be the template's next day (tir) before the edit");
+        else if (!moves) {
+          if (!fallsOn(tir)) no(`the new rule does not fall on the template's next day ${before.todayRefDate}, and tir and icsd are not moved with it`);
+        } else if (!isNum(p.tir) || p.icsd !== p.tir) no("tir and icsd must both be the new next day");
+        else if (p.tir <= tir) no(`the next day can only move later than ${before.todayRefDate}`);
+        else if (p.tir < todayTs) no("the new next day cannot be before today");
+        else if (!fallsOn(p.tir)) no(`the new rule does not fall on the new next day ${timestampToDate(p.tir)}`);
+        else if (isNum(p.rr.ed) && p.rr.ed < p.tir) no("the new rule ends before the new next day");
       }
       if ("icp" in p && !sameKeys(p, ["icp", "md"])) add("icp would change a repeating template; pause and resume write exactly icp and md");
     } else if (change.t === 1 && "icp" in p) add("icp applies to repeating templates only");
@@ -695,6 +706,15 @@ function validateAgainstDatabase(body, db) {
       const template = stoppedTemplates.length === 1 ? db.tasks.get(stoppedTemplates[0]) : null;
       if (!template) add("the to-do created when a repeat is stopped must come with the tombstone of exactly one repeating template");
       else if (tirOf(template) !== p.sr) add("the to-do created when a repeat is stopped must be on the template's next day (tir)");
+      else {
+        // Its checklist is the template's, item for item and in the template's order.
+        const want = db.checklistItemsFor(template.uuid);
+        const got = Object.values(body)
+          .filter((c) => c.t === 0 && entityFamily(c.e) === "ChecklistItem" && c.p.ts?.[0] === id)
+          .sort((x, y) => x.p.ix - y.p.ix);
+        const same = got.length === want.length && want.every((c, i) => got[i].p.ix === i && got[i].p.tt === (c.title ?? "") && got[i].p.ss === (c.status ?? 0) && got[i].p.sp === (c.stopDate ?? null));
+        if (!same) add("the to-do created when a repeat is stopped must get the template's checklist items, each with its title, ss, and sp, and ix counting from 0 in the template's order");
+      }
     }
 
     if (["pr", "agr", "ar", "tp"].some((k) => k in p) || change.t === 0) {
@@ -946,6 +966,7 @@ export function buildRepeatingTaskCreate({ repeat, start, ...task }) {
 // The plain to-do Things creates for the next day when a repeat is stopped (Items > Repeat > Stop,
 // sampled from Things 3.24.2). Every value is the sampled one except title, notes, tags, container,
 // and ix, which come from the template, cd, and the day. Keys are in the order Things wrote them.
+// The second sample (a template with notes and a tag) shows nt and tg copied from the template.
 export function buildRepeatStopCreate({ title, notes = "", tags = [], project = null, heading = null, area = null, index = 0, day, now = toUnixTimestamp() }) {
   return {
     t: 0,
@@ -986,6 +1007,16 @@ export function buildRepeatStopCreate({ title, notes = "", tags = [], project = 
       rr: null,
       xx: EMPTY_XX(),
     },
+  };
+}
+
+// A template's checklist item re-created for the to-do a stopped repeat leaves behind (sampled from
+// Things 3.24.2): lt true, md null, cd the new to-do's cd, status and stop date carried over.
+export function buildRepeatStopChecklistCreate({ title, task, index, status = 0, stopDate = null, now }) {
+  return {
+    t: 0,
+    e: ENTITY.checklist,
+    p: { ix: index, cd: now, ts: [task], sp: stopDate, ss: status, xx: EMPTY_XX(), tt: title, md: null, lt: true },
   };
 }
 
@@ -1655,17 +1686,20 @@ export class ThingsCloudClient {
     // Everything below is decided from the template as it is now, so it is planned inside the
     // commit and planned again from the refreshed database after a conflict.
     const now = toUnixTimestamp();
-    const newId = generateUUID();
+    // One ordered pool of new ids, so a plan rebuilt after a conflict names the same new items.
+    const ids = [];
     let plan;
     await this.commitChanges((db) => {
-      plan = this.planRepeatUpdate(db, id, { action, repeat }, now, newId);
+      let n = 0;
+      plan = this.planRepeatUpdate(db, id, { action, repeat }, now, () => (ids[n] ??= generateUUID(), ids[n++]));
       return plan.changes;
     });
     return plan.result;
   }
 
-  // The changes and the tool result for one things_update_repeat call against `db`.
-  planRepeatUpdate(db, id, { action, repeat }, now, newId) {
+  // The changes and the tool result for one things_update_repeat call against `db`. `mintId`
+  // returns the ids of the items a stop creates, in order.
+  planRepeatUpdate(db, id, { action, repeat }, now, mintId) {
     const given = this.requireKind(db, id, 0);
     let template = given;
     if (!given.recurrenceRule) {
@@ -1694,25 +1728,39 @@ export class ThingsCloudClient {
       if (isPlainObject(repeat) && repeat.after_completion === true) throw new Error(`Changing a rule to repeat after completion was not sampled from Things. ${inThings}`);
       if (paused) throw new Error(`The repeating to-do ${tid} is paused, and editing the rule of a paused repeat was not sampled from Things. Resume it first (action "resume"), then edit the rule. Nothing was changed.`);
       if (!nextDay) throw new Error(`The repeating to-do ${tid} has no next day. ${inThings}`);
-      const near = repeatDaysNear(repeat, nextDay, today < nextDay ? today : nextDay);
-      const starts = isPlainObject(repeat) ? repeat.starts : undefined;
-      if (starts !== undefined && starts !== null && starts !== nextDay) {
-        throw new Error(`repeat.starts (${starts}) is not the next day of this repeat (${nextDay}). An edit that moves the next day was not sampled from Things, so only a rule that falls on ${nextDay} can be written; leave repeat.starts out. ${inThings}`);
+      const rule = parseRepeat(repeat);
+      const starts = repeat.starts;
+      const hasStarts = starts !== undefined && starts !== null;
+      let newDay = nextDay;
+      if (hasStarts ? starts !== nextDay : !repeatMatchesDay(rule, nextDay)) {
+        // The next day moves: to repeat.starts, or to the first day the new rule falls on, counted
+        // from the current next day and never from before today.
+        if (!hasStarts) newDay = firstRepeatDay(repeat, nextDay < today ? today : nextDay);
+        else {
+          if (!isDateString(starts)) throw new Error('repeat.starts must be a date "YYYY-MM-DD". Nothing was changed.');
+          dateToTimestamp(starts);
+          if (starts < nextDay) throw new Error(`repeat.starts (${starts}) is before the next day of this repeat (${nextDay}). An edit that moves the next day earlier was not sampled from Things. ${inThings}`);
+          if (starts < today) throw new Error(`repeat.starts (${starts}) is in the past; the next day of a repeat cannot move to before today (${today}). Nothing was changed.`);
+          newDay = starts;
+        }
       }
-      if (near.at(-1) !== nextDay) {
-        throw new Error(`The next day of this repeat is ${nextDay}, and the new rule does not fall on it (nearest days it does fall on: ${near.join(" and ")}). An edit that moves the next day was not sampled from Things. ${inThings}`);
+      if (!repeatMatchesDay(rule, newDay)) {
+        throw new Error(`${newDay} is not a day the new rule falls on. The next one is ${firstRepeatDay(repeat, newDay < today ? today : newDay)}; give that as repeat.starts or leave repeat.starts out. Nothing was changed.`);
       }
-      // The builder's rule for a first day of nextDay (so ia is nextDay), with the old rule's sr.
+      // The builder's rule for a first day of nextDay (so ia is the next day before the edit), with
+      // the old rule's sr.
       const rr = { ...buildRepeatRule(repeat, nextDay), sr: old.sr };
+      const moved = newDay !== nextDay;
+      const day = dateToTimestamp(newDay);
+      if (moved && isNum(rr.ed) && rr.ed < day) throw new Error(`repeat.ends.on ${timestampToDate(rr.ed)} is before the new next day ${newDay}. Nothing was changed.`);
       return {
-        changes: [{ [tid]: { t: 1, e: ENTITY.task, p: { md: now, rr } } }],
-        result: { ...base, changed: true, repeatRule: describeRepeatRule(rr).summary, nextOccurrence: nextDay },
+        changes: [{ [tid]: { t: 1, e: ENTITY.task, p: moved ? { rr, md: now, icsd: day, tir: day } : { md: now, rr } } }],
+        result: { ...base, changed: true, repeatRule: describeRepeatRule(rr).summary, nextOccurrence: newDay, previousNextOccurrence: nextDay, nextDayMoved: moved },
       };
     }
 
     // stop
     const trashInstead = `Trashing the template (things_delete_todo with id ${tid}) also ends the repeat. Nothing was changed.`;
-    if (db.checklistItemsFor(tid).length) throw new Error(`The repeating to-do ${tid} has checklist items, and how Things carries them over when a repeat is stopped was not sampled. ${trashInstead}`);
     if (paused) throw new Error(`The repeating to-do ${tid} is paused, and stopping a paused repeat was not sampled from Things. Resume it first (action "resume"), then stop it. ${trashInstead}`);
     if (template.deadlineSentinel || (template.reminderSeconds !== null && template.reminderSeconds !== undefined)) {
       throw new Error(`The repeating to-do ${tid} adds deadlines or reminders, and stopping such a repeat was not sampled from Things. Stop it in Things. ${trashInstead}`);
@@ -1720,6 +1768,7 @@ export class ThingsCloudClient {
     if (!nextDay || nextDay <= today) {
       throw new Error(`The next day of the repeating to-do ${tid} is ${nextDay || "not set"}; only a repeat whose next day is in the future can be stopped here (the sampled case). Open Things so it creates the due occurrence, then stop again. ${trashInstead}`);
     }
+    const newId = mintId();
     const create = buildRepeatStopCreate({
       title: template.title,
       notes: template.notes || "",
@@ -1732,9 +1781,21 @@ export class ThingsCloudClient {
       now,
     });
     const open = [...db.tasks.values()].filter((t) => t.repeatingTemplates?.includes(tid) && !t.trashed && !t.status);
+    // The template's checklist items are re-created for the new to-do, in order, and its own are
+    // tombstoned with it.
+    const items = db.checklistItemsFor(tid);
+    const copies = items.map((c, i) => ({
+      [mintId()]: buildRepeatStopChecklistCreate({ title: c.title ?? "", task: newId, index: i, status: c.status ?? 0, stopDate: c.stopDate ?? null, now }),
+    }));
     return {
-      changes: [{ [newId]: create }, ...open.map((t) => ({ [t.uuid]: { t: 1, e: ENTITY.task, p: { rt: [] } } })), { [tid]: { t: 2, e: ENTITY.task, p: {} } }],
-      result: { ...base, changed: true, stopped: true, newTodoId: newId, scheduledDate: nextDay, detachedOccurrences: open.map((t) => t.uuid) },
+      changes: [
+        { [newId]: create },
+        ...copies,
+        ...items.map((c) => ({ [c.uuid]: { t: 2, e: ENTITY.checklist, p: {} } })),
+        ...open.map((t) => ({ [t.uuid]: { t: 1, e: ENTITY.task, p: { rt: [] } } })),
+        { [tid]: { t: 2, e: ENTITY.task, p: {} } },
+      ],
+      result: { ...base, changed: true, stopped: true, newTodoId: newId, scheduledDate: nextDay, checklistItemsCopied: items.length, detachedOccurrences: open.map((t) => t.uuid) },
     };
   }
 

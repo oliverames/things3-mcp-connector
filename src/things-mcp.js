@@ -760,13 +760,13 @@ export class ThingsMCP extends McpAgent {
       "things_update_repeat",
       {
         title: "Update Repeat",
-        description: "Edit the rule of a repeating to-do, pause it, resume it, or stop it. Takes the template id (from things_get_repeating_todos) or the id of one of its occurrences, and exactly one action. \"rule\" replaces the rule with \"repeat\" and keeps the next day: the new rule must fall on the repeat's current next occurrence day, otherwise the edit is refused and names the nearest days the rule does fall on (change it in Things then). \"pause\" stops new occurrences until \"resume\". \"stop\" ends the repeat for good: the template is deleted, open occurrences become ordinary to-dos, a plain to-do is created for the next day, and completed or trashed occurrences are left alone. Stop is refused for a template with checklist items; trashing the template with things_delete_todo is the alternative.",
+        description: "Edit the rule of a repeating to-do, pause it, resume it, or stop it. Takes the template id (from things_get_repeating_todos) or the id of one of its occurrences, and exactly one action. \"rule\" replaces the rule with \"repeat\". If the new rule falls on the repeat's current next occurrence day, that day is kept. Otherwise the next day moves to the first day on or after it that the new rule falls on (never before today), or to \"repeat.starts\" when given; the result names the new next day. \"pause\" stops new occurrences until \"resume\". \"stop\" ends the repeat for good: the template is deleted, open occurrences become ordinary to-dos, a plain to-do is created for the next day with the template's title, notes, tags, and checklist items, and completed or trashed occurrences are left alone. Stop is refused for a repeat that is paused, adds deadlines or reminders, or whose next day is not in the future; trashing the template with things_delete_todo is the alternative.",
         inputSchema: {
           id: z.string().describe("UUID of the repeating template, or of one of its occurrences"),
           action: z.enum(["rule", "pause", "resume", "stop"]).describe("What to do: 'rule' (needs repeat), 'pause', 'resume', or 'stop'"),
           repeat: repeatSchema
             .optional()
-            .describe("The new rule, for action 'rule' only. Same options as the repeat of things_add_todo. repeat.starts may be left out or must equal the repeat's current next occurrence day. A rule that repeats after completion is refused."),
+            .describe("The new rule, for action 'rule' only. Same options as the repeat of things_add_todo. repeat.starts is the new next occurrence day: leave it out to keep the current one or move to the first day the new rule falls on, or name a day that is on or after the current next day, not in the past, and one the rule falls on. A rule that repeats after completion is refused."),
         },
         annotations: {
           title: "Update Repeat",
@@ -780,10 +780,10 @@ export class ThingsMCP extends McpAgent {
         const client = await getClient();
         const r = await client.updateRepeat(id, { action, repeat });
         const name = `repeating to-do "${r.title}" (template ID: ${r.id})`;
-        if (action === "rule") return textResult(`Changed the rule of ${name}. Rule: ${r.repeatRule}. Next day: ${r.nextOccurrence} (unchanged).`);
+        if (action === "rule") return textResult(`Changed the rule of ${name}. Rule: ${r.repeatRule}. Next day: ${r.nextOccurrence} (${r.nextDayMoved ? `moved from ${r.previousNextOccurrence}` : "unchanged"}).`);
         if (action === "stop") {
           return textResult(
-            `Stopped ${name}. The template is deleted. Created to-do ${r.newTodoId} for ${r.scheduledDate}. Open occurrences made ordinary to-dos: ${r.detachedOccurrences.length ? r.detachedOccurrences.join(", ") : "none"}.`
+            `Stopped ${name}. The template is deleted. Created to-do ${r.newTodoId} for ${r.scheduledDate}${r.checklistItemsCopied ? ` with ${r.checklistItemsCopied} checklist item${r.checklistItemsCopied === 1 ? "" : "s"}` : ""}. Open occurrences made ordinary to-dos: ${r.detachedOccurrences.length ? r.detachedOccurrences.join(", ") : "none"}.`
           );
         }
         if (!r.changed) return textResult(`The ${name} was already ${r.paused ? "paused" : "running"}; nothing was written.`);

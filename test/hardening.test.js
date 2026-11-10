@@ -1155,3 +1155,99 @@ test("tool descriptions say that repeat rules cannot be edited or cleared", () =
     assert.match(tool, /trashing the template/i, name);
   }
 });
+
+// --- password encoding ------------------------------------------------------------------------------
+
+test("encodePassword escapes once, exactly as the Swift client does", () => {
+  assert.equal(ThingsCloudClient.encodePassword("p@ss w!rd*'()~"), "p%40ss%20w%21rd%2A%27%28%29~");
+  assert.equal(ThingsCloudClient.encodePassword("100%"), "100%25");
+});
+
+// --- closing a project closes its open to-dos -------------------------------------------------------
+
+// A project with a heading, a trashed heading, and one to-do of every kind the close must tell apart.
+function projectFixture() {
+  const ids = Object.fromEntries(
+    ["proj", "head", "deadHead", "open", "underHead", "done", "canceled", "trashed", "underDeadHead", "template", "elsewhere"].map((k) => [k, generateUUID()])
+  );
+  const template = { [ids.template]: buildRepeatingTaskCreate({ title: "daily", repeat: { frequency: "daily" }, start: localDate(TZ), project: ids.proj, timeZone: TZ }) };
+  const items = [
+    project(ids.proj),
+    heading(ids.head, ids.proj),
+    heading(ids.deadHead, ids.proj, { tr: true }),
+    todo(ids.open, { pr: [ids.proj] }),
+    todo(ids.underHead, { agr: [ids.head] }),
+    todo(ids.done, { pr: [ids.proj], ss: 3, sp: 1700000000 }),
+    todo(ids.canceled, { pr: [ids.proj], ss: 2, sp: 1700000000 }),
+    todo(ids.trashed, { pr: [ids.proj], tr: true }),
+    todo(ids.underDeadHead, { agr: [ids.deadHead] }),
+    template,
+    todo(ids.elsewhere),
+  ];
+  return { ids, items };
+}
+
+test("completing a project completes its open to-dos in the same commit and nothing else", async () => {
+  const { ids, items } = projectFixture();
+  const { client, commits } = cloud(items);
+  const result = await client.updateProject(ids.proj, { status: "completed" });
+  assert.equal(commits.length, 1);
+  const body = commits[0].body;
+  assert.deepEqual(Object.keys(body).sort(), [ids.proj, ids.open, ids.underHead].sort());
+  const { md, sp } = body[ids.proj].p;
+  assert.equal(body[ids.proj].p.ss, 3);
+  for (const id of [ids.open, ids.underHead]) assert.deepEqual(body[id], { t: 1, e: "Task6", p: { md, ss: 3, sp } });
+  assert.deepEqual(result, { id: ids.proj, updated: true, todosClosed: 2 });
+});
+
+test("a completion date on the project is the stop date of the to-dos closed with it", async () => {
+  const { ids, items } = projectFixture();
+  const { client, commits } = cloud(items);
+  await client.updateProject(ids.proj, { status: "completed", completionDate: "2026-01-02T03:04:05Z" });
+  const body = commits[0].body;
+  assert.equal(body[ids.proj].p.sp, 1767323045);
+  assert.equal(body[ids.open].p.sp, 1767323045);
+});
+
+test("canceling projects in a batch cancels their open to-dos and reports the count", async () => {
+  const { ids, items } = projectFixture();
+  const empty = generateUUID();
+  const { client, commits } = cloud([...items, project(empty)]);
+  const result = await client.batchUpdateProjects([ids.proj, empty], "cancel");
+  const body = commits[0].body;
+  assert.deepEqual(Object.keys(body).sort(), [ids.proj, empty, ids.open, ids.underHead].sort());
+  const { md, sp } = body[ids.proj].p;
+  for (const id of [ids.open, ids.underHead]) assert.deepEqual(body[id].p, { md, ss: 2, sp });
+  assert.equal(result.todosClosed, 2);
+  assert.deepEqual(result.items.map((i) => i.todosClosed), [2, 0]);
+});
+
+test("reopening, trashing, or editing a project leaves its to-dos alone", async () => {
+  const { ids, items } = projectFixture();
+  const { client, commits } = cloud(items);
+  await client.updateProject(ids.proj, { status: "completed" });
+  const reopened = await client.updateProject(ids.proj, { status: "open" });
+  assert.deepEqual(Object.keys(commits[1].body), [ids.proj]);
+  assert.equal("todosClosed" in reopened, false);
+  await client.updateProject(ids.proj, { title: "renamed" });
+  assert.deepEqual(Object.keys(commits[2].body), [ids.proj]);
+  const batch = await client.batchUpdateProjects([ids.proj], "trash");
+  assert.deepEqual(Object.keys(commits[3].body), [ids.proj]);
+  assert.equal("todosClosed" in batch, false);
+  assert.equal("todosClosed" in batch.items[0], false);
+});
+
+test("an import_json update that closes a project closes its to-dos, one change per id", async () => {
+  const { ids, items } = projectFixture();
+  const { client, commits } = cloud(items);
+  const result = await client.importJson([
+    { type: "to-do", operation: "update", id: ids.open, attributes: { title: "renamed" } },
+    { type: "project", operation: "update", id: ids.proj, attributes: { canceled: true } },
+  ]);
+  const body = commits[0].body;
+  assert.deepEqual(Object.keys(body).sort(), [ids.proj, ids.open, ids.underHead].sort());
+  const { md, sp } = body[ids.proj].p;
+  assert.deepEqual(body[ids.open].p, { md, tt: "renamed", ss: 2, sp });
+  assert.deepEqual(body[ids.underHead].p, { md, ss: 2, sp });
+  assert.equal(result.items.find((i) => i.id === ids.proj).todosClosed, 2);
+});

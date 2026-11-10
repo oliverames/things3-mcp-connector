@@ -60,10 +60,13 @@ export class ThingsMCP extends McpAgent {
       return this._clientPromise;
     };
 
+    // Closing a project closes its open to-dos in the same commit; say how many.
+    const closedNote = (n) => (n === undefined ? "" : `, ${n} open to-do${n === 1 ? "" : "s"} closed with it`);
+
     // Batches are one atomic commit: either every listed item was written, or the call fails and none were.
     const batchSummary = (result, noun) =>
       `Batch ${result.operation} committed atomically for ${result.count} ${noun} (all written together).\n` +
-      result.items.map((item) => `- ${item.title || "Untitled"} (${item.id}): ${item.result}`).join("\n");
+      result.items.map((item) => `- ${item.title || "Untitled"} (${item.id}): ${item.result}${closedNote(item.todosClosed)}`).join("\n");
 
     const textResult = (data) => ({
       content: [
@@ -895,7 +898,7 @@ export class ThingsMCP extends McpAgent {
       "things_update_project",
       {
         title: "Update Project",
-        description: "Update a project's title, notes, area, deadline, completion_date, creation_date, or mark it completed/canceled.",
+        description: "Update a project's title, notes, area, deadline, completion_date, creation_date, or mark it completed/canceled. As in the Things app, completing a project also completes every open to-do in it (including those under its headings), and canceling it cancels them, in the same commit and with the same completion date; the result says how many. To-dos already completed, canceled, or trashed, headings, and repeating templates are not touched. Reopening a project does not reopen its to-dos.",
         inputSchema: {
           project_id: z.string().describe("Project UUID"),
           title: z.string().optional().describe("New title"),
@@ -917,7 +920,7 @@ export class ThingsMCP extends McpAgent {
       },
       async ({ project_id, title, notes, area, deadline, status, completion_date, creation_date, trashed }) => {
         const client = await getClient();
-        await client.updateProject(project_id, {
+        const result = await client.updateProject(project_id, {
           title,
           notes,
           area,
@@ -927,7 +930,7 @@ export class ThingsMCP extends McpAgent {
           creationDate: creation_date,
           trashed,
         });
-        return textResult(`Project ${project_id} updated successfully.`);
+        return textResult(`Project ${project_id} updated successfully${closedNote(result.todosClosed)}.`);
       }
     );
 
@@ -1198,7 +1201,7 @@ export class ThingsMCP extends McpAgent {
       "things_import_json",
       {
         title: "Import Things JSON",
-        description: "Batch import complex structured projects, headings, to-dos, checklists, and tags or update existing items using Things 3 JSON format in a single atomic sync commit. To change an existing item, pass {\"operation\": \"update\", \"id\": \"<Things id>\"}; an id without operation update is refused. New items always get ids minted by Things' own format. Dates are ISO 8601 (or unix seconds), never milliseconds. On an update, 'checklist-items' replaces the checklist, 'append-checklist-items' adds to it, and 'add-tags' adds tags. The whole batch is validated and rejected before writing if any id, reference, or date is one Things cannot decode.",
+        description: "Batch import complex structured projects, headings, to-dos, checklists, and tags or update existing items using Things 3 JSON format in a single atomic sync commit. To change an existing item, pass {\"operation\": \"update\", \"id\": \"<Things id>\"}; an id without operation update is refused. An update that completes or cancels a project also completes or cancels every open to-do in it (as the Things app does) and reports the count. New items always get ids minted by Things' own format. Dates are ISO 8601 (or unix seconds), never milliseconds. On an update, 'checklist-items' replaces the checklist, 'append-checklist-items' adds to it, and 'add-tags' adds tags. The whole batch is validated and rejected before writing if any id, reference, or date is one Things cannot decode.",
         inputSchema: {
           payload: z.any().describe("Things JSON array or object containing projects or to-dos to create or update"),
         },
@@ -1214,7 +1217,7 @@ export class ThingsMCP extends McpAgent {
         const client = await getClient();
         const result = await client.importJson(payload);
         const itemLines = result.items.map(
-          (item) => `- ${item.type} "${item.title || item.id}" (${item.id}): ${item.operation}`
+          (item) => `- ${item.type} "${item.title || item.id}" (${item.id}): ${item.operation}${closedNote(item.todosClosed)}`
         );
         const summary = `Imported Things JSON: created ${result.projectsCreated} projects and ${result.todosCreated} to-dos, updated ${result.projectsUpdated} projects and ${result.todosUpdated} to-dos (${result.totalEntities} total entities).`;
         return textResult(`${summary}\n\nItem results:\n${itemLines.join("\n")}`);
@@ -1500,7 +1503,7 @@ export class ThingsMCP extends McpAgent {
       "things_batch_update_projects",
       {
         title: "Batch Update Projects",
-        description: "Perform a batch operation across multiple projects simultaneously (complete, cancel, trash, reschedule, set area, or set deadlines/dates).",
+        description: "Perform a batch operation across multiple projects simultaneously (complete, cancel, trash, reschedule, set area, or set deadlines/dates). As in the Things app, 'complete' also completes every open to-do in each project (including those under its headings) and 'cancel' cancels them, in the same commit; the result gives the count per project. Completed, canceled, and trashed to-dos, headings, and repeating templates are not touched.",
         inputSchema: {
           ids: z.array(z.string()).describe("Array of project UUIDs"),
           operation: z.enum(["complete", "cancel", "trash", "reschedule", "set_area", "set_dates"]).describe("Batch operation to perform"),

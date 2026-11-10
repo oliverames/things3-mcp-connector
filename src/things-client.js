@@ -903,11 +903,9 @@ export class ThingsCloudClient {
     this._dbCheckedAt = 0;
   }
 
+  // Single-escaped, as the Swift client does; which form Things Cloud itself wants is unverified.
   static encodePassword(rawPassword) {
-    return encodeURIComponent(rawPassword).replace(
-      /[!*'();:@&=+$,/?%#\[\]]/g,
-      (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`
-    );
+    return encodeURIComponent(rawPassword).replace(/[!*'()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
   }
 
   static commonHeaders(password) {
@@ -1417,12 +1415,26 @@ export class ThingsCloudClient {
     throw new Error(`${uuid} is ${aKind(actual)}, not a ${wanted}; nothing was changed.${hint}`);
   }
 
+  // Completing or canceling a project closes its open to-dos in the same commit, as the Things
+  // app does: each open, untrashed to-do in the project or under its headings gets the status
+  // write of a single to-do (md, ss, sp) with the project's own timestamps. To-dos already
+  // completed, canceled, or trashed, headings, and repeating templates are left alone. Returns []
+  // when `patch` does not close the project; reopening a project reopens nothing.
+  projectCloseChanges(db, projectId, patch) {
+    if (patch.ss !== 3 && patch.ss !== 2) return [];
+    return [...db.tasks.values()]
+      .filter((t) => t.type === 0 && !t.status && db.isLive(t) && db.projectIdOf(t) === projectId && !db.inTrashedContainer(t))
+      .map((t) => ({ [t.uuid]: { t: 1, e: ENTITY.task, p: { md: patch.md, ss: patch.ss, sp: patch.sp } } }));
+  }
+
   async updateTask(uuid, updates, type) {
     const db = await this.syncDatabase();
     this.requireKind(db, uuid, type);
     const patch = this.buildTaskPatch(db, { ...updates, __uuid: uuid });
-    await this.commitChanges([{ [uuid]: { t: 1, e: ENTITY.task, p: patch } }]);
-    return { id: uuid, updated: true };
+    const closed = type === 1 ? this.projectCloseChanges(db, uuid, patch) : [];
+    await this.commitChanges([{ [uuid]: { t: 1, e: ENTITY.task, p: patch } }, ...closed]);
+    const closing = type === 1 && (patch.ss === 3 || patch.ss === 2);
+    return { id: uuid, updated: true, ...(closing ? { todosClosed: closed.length } : {}) };
   }
 
   async updateTodo(uuid, updates = {}) {
@@ -1869,7 +1881,24 @@ export class ThingsCloudClient {
         db.applyChangeMap({ [item.id]: { t: 1, e: ENTITY.task, p: patch } });
         if (type === "project") projectsUpdated++;
         else todosUpdated++;
-        itemResults.push({ id: item.id, type, operation: "updated", title: patch.tt || existing.title || "Untitled" });
+        const itemResult = { id: item.id, type, operation: "updated", title: patch.tt || existing.title || "Untitled" };
+        itemResults.push(itemResult);
+        if (type === "project" && (patch.ss === 3 || patch.ss === 2)) {
+          // Closing a project closes its open to-dos. One change per id: a to-do this import
+          // already created or updated takes the status in that change.
+          const closed = this.projectCloseChanges(db, item.id, patch);
+          for (const change of closed) {
+            const [childId] = Object.keys(change);
+            const pending = changes.find((c) => childId in c);
+            if (pending) Object.assign(pending[childId].p, { ss: patch.ss, sp: patch.sp });
+            else {
+              updated.set(childId, change[childId].p);
+              changes.push(change);
+            }
+            db.applyChangeMap(change);
+          }
+          itemResult.todosClosed = closed.length;
+        }
         // "checklist-items" replaces the checklist, as in Things JSON; "append-checklist-items" adds to it.
         const current = db.checklistItemsFor(item.id);
         if (attrs["checklist-items"] || attrs.checklist) {
@@ -2069,7 +2098,7 @@ export class ThingsCloudClient {
       throw new Error('Operation "set_dates" needs when, deadline, completion_date, or creation_date.');
     }
     const db = await this.syncDatabase();
-    return this.commitBatch(db, uuids, operation, "Project", (uuid) => db.tasks.get(uuid)?.type === 1, (uuid, now) =>
+    const result = await this.commitBatch(db, uuids, operation, "Project", (uuid) => db.tasks.get(uuid)?.type === 1, (uuid, now) =>
       this.buildTaskPatch(db, {
         __uuid: uuid,
         status: operation === "complete" ? "completed" : operation === "cancel" ? "canceled" : undefined,
@@ -2079,11 +2108,16 @@ export class ThingsCloudClient {
         deadline: options.deadline,
         completionDate: options.completionDate || options.completion_date,
         creationDate: options.creationDate || options.creation_date,
-      }, now)
+      }, now),
+      (uuid, patch) => this.projectCloseChanges(db, uuid, patch)
     );
+    if (operation === "complete" || operation === "cancel") result.todosClosed = result.items.reduce((n, item) => n + item.todosClosed, 0);
+    else for (const item of result.items) delete item.todosClosed;
+    return result;
   }
 
-  async commitBatch(db, uuids, operation, label, exists, patchFor) {
+  // `alsoFor(uuid, patch)` returns further changes that belong in the same commit as that item.
+  async commitBatch(db, uuids, operation, label, exists, patchFor, alsoFor = null) {
     const ids = [...new Set(uuids)];
     const missing = ids.filter((uuid) => !exists(uuid));
     if (missing.length) {
@@ -2091,9 +2125,18 @@ export class ThingsCloudClient {
       throw new Error(`${label} not found: ${named.join(", ")}. Nothing was written.`);
     }
     const now = toUnixTimestamp();
-    const changes = ids.map((uuid) => ({ [uuid]: { t: 1, e: ENTITY.task, p: patchFor(uuid, now) } }));
+    const changes = [];
+    const also = new Map();
+    for (const uuid of ids) {
+      const p = patchFor(uuid, now);
+      changes.push({ [uuid]: { t: 1, e: ENTITY.task, p } });
+      if (alsoFor) {
+        also.set(uuid, alsoFor(uuid, p));
+        changes.push(...also.get(uuid));
+      }
+    }
     await this.commitChanges(changes);
-    const items = ids.map((id) => ({ id, title: db.tasks.get(id)?.title || null, result: "updated" }));
+    const items = ids.map((id) => ({ id, title: db.tasks.get(id)?.title || null, result: "updated", ...(alsoFor ? { todosClosed: also.get(id).length } : {}) }));
     return { count: ids.length, operation, updated: true, items };
   }
 

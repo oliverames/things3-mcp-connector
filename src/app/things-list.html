@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Things</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    /* Things 3 palette. Text and hairlines follow the host's style variables when it sends them. */
+    --t-text: var(--color-text-primary, light-dark(#1d1d1f, #f5f5f7));
+    --t-text-2: var(--color-text-secondary, light-dark(#48484a, #c7c7cc));
+    --t-text-3: var(--color-text-tertiary, light-dark(#8a8a8e, #98989d));
+    --t-line: var(--color-border-tertiary, light-dark(rgba(0, 0, 0, .09), rgba(255, 255, 255, .12)));
+        /* Colors read from Things 3's own artwork: Completed checkbox #0062c1 / #4d94f7, Today #ffd400, deadline red #fa1955. */
+    --t-blue: light-dark(#0062c1, #65abff);
+    --t-blue-fill: light-dark(#0062c1, #4d94f7);
+    --t-red: light-dark(#ef1750, #ff5a82);
+    --t-line-tag: light-dark(rgba(5, 16, 28, .25), rgba(255, 255, 255, .33));
+    --t-chip: light-dark(rgba(60, 60, 67, .08), rgba(235, 235, 245, .12));
+    --t-canvas: light-dark(#ffffff, #1c1c1e);
+    --t-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: transparent; }
+  body {
+    font: 14px/1.4 var(--t-font);
+    color: var(--t-text);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  /* Outside a host (previews, tests) there is no chat surface behind the view, so paint a canvas. */
+  body.standalone { background: var(--t-canvas); }
+  #root { padding: 8px 16px 16px; container-type: inline-size; }
+  button { font: inherit; color: inherit; }
+  svg { display: block; flex: none; }
+  /* Glyphs that come in light and dark artwork: .gl shows in light, .gd in dark. */
+  .gd { display: none; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .gl { display: none; } :root:not([data-theme="light"]) .gd { display: block; } }
+  :root[data-theme="dark"] .gl { display: none; }
+  :root[data-theme="dark"] .gd { display: block; }
+
+  /* ---- header ---- */
+  .head { display: flex; align-items: center; gap: 10px; padding: 10px 0 14px; }
+  .head h1 { margin: 0; font-size: 22px; line-height: 1.2; font-weight: 700; letter-spacing: -.01em; }
+  .head .count { color: var(--t-text-3); font-size: 14px; font-weight: 500; margin-left: auto; font-variant-numeric: tabular-nums; }
+  .head .sub { color: var(--t-text-3); font-size: 13px; }
+  .iconbtn { margin-left: 8px; border: 0; background: transparent; color: var(--t-text-3); width: 32px; height: 32px; border-radius: 8px; display: grid; place-items: center; cursor: pointer; }
+  .iconbtn:hover { background: var(--t-chip); color: var(--t-text); }
+  .iconbtn:focus-visible, .more:focus-visible, .box:focus-visible { outline: 2px solid var(--t-blue-fill); outline-offset: 2px; }
+  .notes-head { color: var(--t-text-2); font-size: 14px; margin: -6px 0 12px; white-space: pre-line; }
+
+  /* ---- section headings ---- */
+  .sec { margin: 18px 0 2px; padding-bottom: 6px; display: flex; align-items: center; gap: 8px; border-bottom: .5px solid var(--t-line); font-size: 15px; font-weight: 700; }
+  .sec.first { margin-top: 2px; }
+  .sec.blue { color: var(--t-blue); border-bottom-color: color-mix(in srgb, var(--t-blue) 35%, transparent); }
+  .sec .n { margin-left: auto; font-size: 12px; font-weight: 500; color: var(--t-text-3); }
+
+  /* ---- rows ---- */
+  ul { list-style: none; margin: 0; padding: 0; }
+  .row { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; column-gap: 8px; align-items: start; padding: 9px 0; border-bottom: .5px solid var(--t-line); transition: opacity .35s ease; }
+  .row:last-child { border-bottom: 0; }
+  .row.done { opacity: .55; }
+  .row.done .title { text-decoration: line-through; text-decoration-color: var(--t-text-3); color: var(--t-text-3); }
+
+  .box { position: relative; width: 28px; height: 28px; margin: -4px 0 -4px -7px; padding: 0; border: 0; background: transparent; cursor: pointer; display: grid; place-items: center; border-radius: 8px; -webkit-tap-highlight-color: transparent; }
+  .box::before { content: ""; position: absolute; inset: -8px -6px; } /* 44pt touch target */
+  .box .ck { grid-area: 1 / 1; display: grid; }
+  .box .ck > svg { grid-area: 1 / 1; }
+  .box .on { opacity: 0; transform: scale(.55); transition: opacity .16s ease, transform .22s cubic-bezier(.3, 1.6, .5, 1); }
+  .box:hover .on { opacity: .35; transform: scale(.9); }
+  .box:active .on { opacity: .55; }
+  .box[aria-checked="true"] .on { opacity: 1; transform: scale(1); }
+  .box:disabled { cursor: default; }
+  .box:disabled:not([aria-checked="true"]) { opacity: .5; }
+  .box:disabled:not([aria-checked="true"]):hover .on { opacity: 0; }
+  .row.shake .box { animation: shake .36s ease; }
+  .row.shake .off { filter: invert(30%) sepia(90%) saturate(4000%) hue-rotate(335deg); }
+  @keyframes shake { 20% { transform: translateX(-3px); } 50% { transform: translateX(3px); } 80% { transform: translateX(-2px); } }
+
+  .main { min-width: 0; }
+  .title { font-size: 15px; line-height: 1.3; word-break: break-word; }
+  .proj { display: flex; align-items: center; gap: 5px; margin-top: 1px; font-size: 12px; color: var(--t-text-3); min-width: 0; }
+  .proj span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .note { margin-top: 2px; font-size: 13px; color: var(--t-text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 5px; }
+  .tag { font-size: 12px; line-height: 1; padding: 3px 8px 4px; border-radius: 99px; border: .5px solid var(--t-line-tag); color: var(--t-text-3); }
+  .prog { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--t-text-3); font-variant-numeric: tabular-nums; }
+  .err { margin-top: 4px; font-size: 12px; color: var(--t-red); }
+
+  .side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; padding-top: 1px; }
+  .when, .dl { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; line-height: 1.2; white-space: nowrap; }
+  .when { padding: 2px 7px; border-radius: 6px; background: var(--t-chip); color: var(--t-text-2); }
+  .dl { color: var(--t-text-3); font-weight: 500; }
+  .dl.hot { color: var(--t-red); }
+
+  /* ---- footers, states ---- */
+  .more { display: block; width: 100%; margin-top: 8px; padding: 10px; border: 0; border-radius: 8px; background: var(--t-chip); color: var(--t-blue); font-weight: 600; cursor: pointer; }
+  .foot { margin-top: 10px; font-size: 12px; color: var(--t-text-3); text-align: center; }
+  .empty { padding: 28px 0 20px; display: flex; flex-direction: column; align-items: center; gap: 10px; color: var(--t-text-3); font-size: 15px; }
+  .fallback { white-space: pre-wrap; font-size: 13px; color: var(--t-text-2); }
+
+  .skel { display: grid; grid-template-columns: 18px 1fr; gap: 12px; padding: 12px 0; align-items: center; }
+  .skel i { display: block; height: 18px; border-radius: 5px; background: var(--t-chip); }
+  .skel i + i { height: 12px; border-radius: 6px; }
+  .skel > i:nth-child(2) { width: var(--w, 60%); }
+  @media (prefers-reduced-motion: no-preference) { .skel i { animation: pulse 1.4s ease-in-out infinite; } }
+  @keyframes pulse { 50% { opacity: .45; } }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+  @container (max-width: 400px) {
+    #root { padding-inline: 12px; }
+    .row { grid-template-columns: 28px minmax(0, 1fr); }
+    .side { grid-column: 2; flex-direction: row; align-items: center; margin-top: 4px; }
+    .head h1 { font-size: 20px; }
+  }
+</style>
+</head>
+<body>
+<!--__GLYPHS__-->
+<div id="root" role="region" aria-label="Things to-dos">
+  <div class="skel"><i></i><i style="--w:55%"></i></div>
+  <div class="skel"><i></i><i style="--w:72%"></i></div>
+  <div class="skel"><i></i><i style="--w:40%"></i></div>
+</div>
+<script type="module">
+/*__SDK__*/
+
+const { App, applyDocumentTheme, applyHostStyleVariables } = __sdk;
+
+const INLINE_ROWS = 10;
+const SVG = "http://www.w3.org/2000/svg";
+const root = document.getElementById("root");
+const app = new App(
+  { name: "Things List", version: "1.0.0" },
+  { availableDisplayModes: ["inline", "fullscreen"] }
+);
+
+let data = null;          // the structuredContent the tool returned
+let expanded = false;     // inline view shows INLINE_ROWS until the user asks for more
+let displayMode = "inline";
+const pending = new Set(); // ids whose completion call is in flight
+const done = new Set();    // ids completed from this view
+const failed = new Map();  // id -> message shown under a row after a rollback
+
+// ---------- helpers ----------
+function el(tag, props, ...kids) {
+  const n = document.createElement(tag);
+  if (props) for (const [k, v] of Object.entries(props)) {
+    if (v == null || v === false) continue;
+    if (k === "class") n.className = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids.flat()) if (kid != null && kid !== false) n.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  return n;
+}
+function svg(w, h, vb, inner) {
+  const s = document.createElementNS(SVG, "svg");
+  s.setAttribute("width", w); s.setAttribute("height", h); s.setAttribute("viewBox", vb);
+  s.setAttribute("aria-hidden", "true");
+  s.innerHTML = inner; // static markup defined in this file only, never data
+  return s;
+}
+// Glyphs are Things 3's own artwork, inlined once as <symbol>s (see src/app/glyphs/NOTICE.md).
+function glyph(name, size, cls) {
+  const s = document.createElementNS(SVG, "svg");
+  s.setAttribute("width", size); s.setAttribute("height", size);
+  s.setAttribute("aria-hidden", "true");
+  if (cls) s.setAttribute("class", cls);
+  const u = document.createElementNS(SVG, "use");
+  u.setAttribute("href", `#gl-${name}`);
+  s.append(u);
+  return s;
+}
+// Artwork that ships in light and dark versions.
+function pair(name, size) {
+  const f = document.createDocumentFragment();
+  f.append(glyph(name, size, "gl"), glyph(`${name}-Dark`, size, "gd"));
+  return f;
+}
+const ICONS = {
+  star: (s) => pair("Source-Today", s),
+  inbox: (s) => pair("Source-Inbox", s),
+  upcoming: (s) => pair("Source-Upcoming", s),
+  anytime: (s) => pair("Source-Anytime", s),
+  someday: (s) => pair("Source-Someday", s),
+  list: (s) => glyph("Source-Logbook", s),
+  moon: (s) => pair("Source-Evening", s),
+  flag: (s, hot) => glyph(hot ? "Task-DeadlineOverdue-Template" : "Task-Deadline-Template", s),
+  checklist: (s) => glyph("Task-Checklist-Template", s),
+  repeat: (s) => glyph("Task-Repeat-Template", s),
+  // Not Things artwork: the host-level full-screen toggle.
+  expand: (s) => svg(s, s, "0 0 24 24", '<path d="M14 4h6v6M10 20H4v-6M20 4l-7 7M4 20l7-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>'),
+  collapse: (s) => svg(s, s, "0 0 24 24", '<path d="M20 10h-6V4M4 14h6v6M14 10l7-7M10 14l-7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>'),
+};
+// Things' project pie: a 11x11 sprite of 121 fills, empty to full, row by row.
+function pie(size, done, total) {
+  const i = total ? Math.round(Math.min(1, done / total) * 120) : 0;
+  const s = document.createElementNS(SVG, "svg");
+  s.setAttribute("width", size); s.setAttribute("height", size);
+  s.setAttribute("viewBox", `${(i % 11) * 32} ${Math.floor(i / 11) * 32} 32 32`);
+  s.setAttribute("aria-hidden", "true");
+  const u = document.createElementNS(SVG, "use");
+  u.setAttribute("href", "#gl-Project-Pies-400");
+  u.setAttribute("width", "352"); u.setAttribute("height", "352"); // the whole sprite at 1:1; the viewBox picks one cell
+  s.append(u);
+  return s;
+}
+
+// ---------- dates ----------
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const ymd = (s) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s || ""); return m ? Date.UTC(+m[1], +m[2] - 1, +m[3]) : null; };
+const dayDiff = (a, b) => Math.round((ymd(a) - ymd(b)) / 86400000);
+function shortDate(s, today) {
+  const t = ymd(s); if (t == null) return String(s || "");
+  const d = new Date(t);
+  const y = today && d.getUTCFullYear() !== +today.slice(0, 4) ? ` ${d.getUTCFullYear()}` : "";
+  return `${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}${y}`;
+}
+function relDay(s, today) {
+  const n = dayDiff(s, today);
+  if (n === 0) return "Today";
+  if (n === 1) return "Tomorrow";
+  if (n === -1) return "Yesterday";
+  if (n > 1 && n < 7) return DAYS[new Date(ymd(s)).getUTCDay()];
+  return shortDate(s, today);
+}
+function dayHeading(s, today) {
+  const n = dayDiff(s, today);
+  const d = new Date(ymd(s));
+  const base = `${DAYS[d.getUTCDay()].slice(0, 3)}, ${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}`;
+  return n === 0 ? `Today · ${base}` : n === 1 ? `Tomorrow · ${base}` : base;
+}
+function deadlineLabel(s, today) {
+  const n = dayDiff(s, today);
+  if (n === 0) return "today";
+  if (n < 0) return `${shortDate(s, today)} · ${-n} day${n === -1 ? "" : "s"} overdue`;
+  if (n === 1) return "tomorrow";
+  return shortDate(s, today);
+}
+
+// ---------- completion ----------
+async function complete(item, box, row) {
+  if (pending.has(item.id) || done.has(item.id)) return;
+  pending.add(item.id);
+  failed.delete(item.id);
+  // Optimistic: show it ticked and dimmed right away.
+  box.setAttribute("aria-checked", "true");
+  row.classList.add("done");
+  row.querySelector(".err")?.remove();
+  try {
+    const res = await app.callServerTool({ name: "things_complete_todo", arguments: { id: item.id } });
+    if (res?.isError) throw new Error(res.content?.find((c) => c.type === "text")?.text || "Things refused the change.");
+    done.add(item.id);
+    box.disabled = true;
+    box.setAttribute("aria-label", `Completed: ${item.title}`);
+    updateCount();
+  } catch (e) {
+    // Roll back: untick, shake, and say why.
+    box.setAttribute("aria-checked", "false");
+    row.classList.remove("done");
+    row.classList.add("shake");
+    setTimeout(() => row.classList.remove("shake"), 450);
+    const msg = `Couldn't complete this to-do. ${e?.message ? String(e.message).slice(0, 140) : ""}`.trim();
+    failed.set(item.id, msg);
+    row.querySelector(".main").append(el("div", { class: "err", role: "alert" }, msg));
+  } finally {
+    pending.delete(item.id);
+  }
+}
+
+// ---------- rendering ----------
+function renderRow(item, today, opts = {}) {
+  const isDone = item.status === "completed" || done.has(item.id);
+  const locked = item.status !== "open";
+  const box = el("button", {
+    class: "box", type: "button", role: "checkbox",
+    "aria-checked": isDone ? "true" : "false",
+    "aria-label": `${isDone ? "Completed" : "Complete"}: ${item.title}`,
+    disabled: locked || isDone || pending.has(item.id),
+  },
+    // Things' own checkbox: the faint outline, with the blue ticked box fading and springing in over it.
+    el("span", { class: "ck off" }, pair("Checkbox-Regular", 28)),
+    el("span", { class: "ck on" }, pair("Checkbox-Completed", 28)));
+  const row = el("li", { class: "row" + (isDone ? " done" : "") });
+  box.addEventListener("click", () => complete(item, box, row));
+
+  const main = el("div", { class: "main" }, el("div", { class: "title" }, item.title || "Untitled"));
+  const ctx = opts.hideContext ? null : opts.projectOnly ? item.project : item.project || item.area;
+  if (ctx) main.append(el("div", { class: "proj" }, el("span", null, ctx)));
+  if (item.notes) main.append(el("div", { class: "note" }, item.notes));
+  const chips = el("div", { class: "chips" });
+  if (item.checklistCount) chips.append(el("span", { class: "prog", title: "Checklist" }, ICONS.checklist(14), `${item.checklistCompletedCount || 0}/${item.checklistCount}`));
+  if (item.repeating) chips.append(el("span", { class: "prog", title: "Repeating" }, ICONS.repeat(14)));
+  for (const t of item.tags || []) chips.append(el("span", { class: "tag" }, t));
+  if (chips.childNodes.length) main.append(chips);
+  if (failed.has(item.id)) main.append(el("div", { class: "err", role: "alert" }, failed.get(item.id)));
+
+  const side = el("div", { class: "side" });
+  if (opts.showWhen && item.scheduledDate && item.when !== "today" && item.when !== "evening") side.append(el("span", { class: "when" }, relDay(item.scheduledDate, today)));
+  if (item.deadline) {
+    const hot = dayDiff(item.deadline, today) <= 0;
+    side.append(el("span", { class: "dl" + (hot ? " hot" : "") }, ICONS.flag(14, hot), deadlineLabel(item.deadline, today)));
+  }
+  row.append(box, main);
+  if (side.childNodes.length) row.append(side);
+  return row;
+}
+
+function section(title, count, { icon, blue, first } = {}) {
+  return el("div", { class: "sec" + (blue ? " blue" : "") + (first ? " first" : "") }, icon || null, el("span", null, title), count != null ? el("span", { class: "n" }, count) : null);
+}
+
+// Turn the payload into ordered groups: [{ title, icon, blue, items }]
+function groupsFor(d) {
+  const items = d.items || [];
+  switch (d.view) {
+    case "today": {
+      const day = items.filter((i) => i.when !== "evening");
+      const eve = items.filter((i) => i.when === "evening");
+      return [{ items: day }, ...(eve.length ? [{ title: "This Evening", icon: ICONS.moon(20), items: eve }] : [])];
+    }
+    case "upcoming": {
+      const by = new Map();
+      for (const i of items) { const k = i.scheduledDate || i.deadline || ""; (by.get(k) || by.set(k, []).get(k)).push(i); }
+      return [...by.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => ({ title: k ? dayHeading(k, d.today) : "Later", items: v }));
+    }
+    case "anytime": {
+      const by = new Map();
+      for (const i of items) { const k = i.area || ""; (by.get(k) || by.set(k, []).get(k)).push(i); }
+      const keys = [...by.keys()].sort((a, b) => (a === "" ? -1 : b === "" ? 1 : a.localeCompare(b)));
+      return keys.map((k) => ({ title: k || null, blue: true, items: by.get(k) }));
+    }
+    case "project":
+      return (d.groups || []).map((g) => ({ title: g.title || null, blue: true, items: g.items }));
+    default:
+      return [{ items }];
+  }
+}
+
+const VIEW_ICON = { today: "star", inbox: "inbox", upcoming: "upcoming", anytime: "anytime", someday: "someday" };
+
+function openCount() { return (data?.items || []).filter((i) => i.status === "open" && !done.has(i.id)).length; }
+function projectDone() { return (data.completedCount || 0) + done.size; }
+function updateCount() {
+  const n = document.querySelector(".head .count");
+  if (!n || !data) return;
+  if (data.view === "project") { n.textContent = `${projectDone()}/${data.totalCount}`; render(); } else n.textContent = String(openCount());
+}
+
+function render() {
+  root.replaceChildren();
+  if (!data) return;
+  if (data.fallbackText) { root.append(el("div", { class: "fallback" }, data.fallbackText)); return; }
+
+  const hc = app.getHostContext?.();
+  const canFull = (hc?.availableDisplayModes || []).includes("fullscreen");
+  const head = el("div", { class: "head" });
+  if (data.view === "project") {
+    head.append(pie(26, projectDone(), data.totalCount));
+    head.firstChild.style.color = "var(--t-blue-fill)";
+  } else head.append((ICONS[VIEW_ICON[data.view]] || ICONS.list)(28));
+  head.append(el("h1", null, data.title || "Things"));
+  head.append(data.view === "project"
+    ? el("span", { class: "count", title: "Completed" }, `${projectDone()}/${data.totalCount}`)
+    : el("span", { class: "count", title: "Open to-dos" }, String(openCount())));
+  if (canFull) head.append(el("button", {
+    class: "iconbtn", type: "button", "aria-label": displayMode === "fullscreen" ? "Exit full screen" : "Full screen",
+    onclick: async () => {
+      try { const r = await app.requestDisplayMode({ mode: displayMode === "fullscreen" ? "inline" : "fullscreen" }); displayMode = r.mode; render(); } catch { /* host declined */ }
+    },
+  }, (displayMode === "fullscreen" ? ICONS.collapse : ICONS.expand)(16)));
+  root.append(head);
+  if (data.view === "project" && data.notes) root.append(el("div", { class: "notes-head" }, data.notes));
+
+  const today = data.today;
+  const groups = groupsFor(data);
+  const total = groups.reduce((n, g) => n + g.items.length, 0);
+  if (!total) {
+    root.append(el("div", { class: "empty" }, ICONS.list(40), data.view === "inbox" ? "Inbox zero" : "Nothing here"));
+    return;
+  }
+
+  const limit = displayMode === "fullscreen" || expanded ? Infinity : INLINE_ROWS;
+  let shown = 0, first = true;
+  for (const g of groups) {
+    if (shown >= limit) break;
+    const slice = g.items.slice(0, limit - shown);
+    if (!slice.length) continue;
+    if (g.title) root.append(section(g.title, null, { icon: g.icon, blue: g.blue, first }));
+    const ul = el("ul");
+    for (const item of slice) ul.append(renderRow(item, today, { showWhen: data.view !== "today" && data.view !== "upcoming", hideContext: data.view === "project", projectOnly: data.view === "anytime" }));
+    root.append(ul);
+    shown += slice.length;
+    first = false;
+  }
+  if (shown < total) root.append(el("button", { class: "more", type: "button", onclick: () => { expanded = true; render(); } }, `Show ${total - shown} more`));
+  if (data.truncated) root.append(el("div", { class: "foot" }, `Showing the first ${total} of ${data.totalCount}. Ask Claude to narrow the list.`));
+}
+
+// ---------- host wiring ----------
+function applyHost(ctx) {
+  if (!ctx) return;
+  if (ctx.theme) applyDocumentTheme(ctx.theme);
+  if (ctx.styles?.variables) applyHostStyleVariables(ctx.styles.variables);
+  const i = ctx.safeAreaInsets;
+  if (i) root.style.padding = `${8 + (i.top || 0)}px ${16 + (i.right || 0)}px ${16 + (i.bottom || 0)}px ${16 + (i.left || 0)}px`;
+  if (ctx.displayMode) displayMode = ctx.displayMode;
+}
+
+app.ontoolresult = (result) => {
+  const sc = result?.structuredContent;
+  if (sc && sc.view) data = sc;
+  else data = { fallbackText: result?.content?.find((c) => c.type === "text")?.text || "No data." };
+  expanded = false; done.clear(); failed.clear();
+  render();
+};
+app.addEventListener("hostcontextchanged", (changed) => { applyHost(changed); render(); });
+app.onteardown = async () => ({});
+
+try {
+  await app.connect();
+  applyHost(app.getHostContext());
+} catch (e) {
+  document.body.classList.add("standalone");
+  root.replaceChildren(el("div", { class: "fallback" }, "This view needs an MCP Apps host."));
+}
+if (!app.getHostContext?.()) document.body.classList.add("standalone");
+</script>
+</body>
+</html>

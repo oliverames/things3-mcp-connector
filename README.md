@@ -115,11 +115,26 @@ This connector talks directly to Things Cloud using its native wire format (`Tas
 
 ---
 
+## Interactive list (MCP App)
+
+In hosts that support [MCP Apps](https://claude.com/docs/connectors/building/mcp-apps/getting-started) (Claude on the web, desktop and mobile), `things_get_today`, `things_get_inbox`, `things_get_upcoming`, `things_get_anytime`, `things_get_someday` and `things_get_project` render a Things-styled list instead of plain JSON: title, notes snippet, project or area, tags, checklist progress, scheduled date, deadline, a "This Evening" section, project headings and a progress pie. It follows the host's light and dark theme and works inline, full screen and at phone width.
+
+- **Completing a to-do:** ticking a checkbox calls the existing `things_complete_todo` tool, only on that click. The row ticks at once and rolls back with an error line if Things Cloud refuses the change. The view calls no other tool, so nothing destructive (trash, permanent delete) is reachable from it.
+- **Other hosts:** each tool still returns the same JSON text, so hosts without MCP Apps support are unaffected. The view's payload is a trimmed copy in `structuredContent` (notes cut to 140 characters, at most 200 to-dos).
+- **Sandbox domain:** the `ui://things3/list.html` resource sets `_meta.ui.domain` to the first 32 hex characters of the SHA-256 of `https://things3mcp.org/mcp` plus `.claudemcpcontent.com`. If the endpoint users add ever changes, update `CONNECTOR_BASE_URL` (or the path), because the hash covers the exact URL.
+- **Glyphs are Cultured Code's artwork:** the icons, checkbox and project pies in `src/app/glyphs/` were extracted from the Things 3 app installed on the author's Mac, for personal use (see `src/app/glyphs/NOTICE.md`). They are not ours to redistribute. The repo is private, so this is fine today. **Before the repo or the Worker is ever made public, delete that folder and replace the glyphs with original or licensed artwork.** The deployed Worker serves them inside the view resource.
+- **Editing the view:** the source is `src/app/things-list.html`. Run `npm run build:app` to inline the MCP Apps SDK client and regenerate `src/things-list-app.generated.js` (Workers have no filesystem, so the HTML ships as a string). A test fails if the generated file is stale. The view makes no network requests and declares an empty CSP allowlist.
+
+---
+
 ## Development & Testing
 
 ```bash
 # Run test suite
 npm test
+
+# Rebuild the MCP App view after editing src/app/things-list.html
+npm run build:app
 
 # Run local development server
 npm run dev

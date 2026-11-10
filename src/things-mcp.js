@@ -5,6 +5,8 @@ import { z } from "zod";
 import { ThingsCloudClient } from "./things-client.js";
 import { remoteServerInfo } from "./brand-assets.js";
 import { decryptJson } from "./credential-crypto.js";
+import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
+import { registerThingsListApp, listToolMeta, listStructured, projectStructured } from "./things-app.js";
 
 const JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema";
 
@@ -50,7 +52,8 @@ export class ThingsMCP extends McpAgent {
   }
 
   async init() {
-    const server = new McpServer(remoteServerInfo(this.env.CONNECTOR_BASE_URL || "https://things3mcp.org"), {
+    const baseUrl = this.env.CONNECTOR_BASE_URL || "https://things3mcp.org";
+    const server = new McpServer(remoteServerInfo(baseUrl), {
       instructions:
         "Things 3 to-dos. If a things-3 skill is available, load it before reading or changing data: it covers titles, scheduling, tags, reviews, and this server's quirks. Search before creating, tags must already exist, and never call things_empty_trash or permanent deletes without explicit confirmation.",
     });
@@ -107,6 +110,15 @@ export class ThingsMCP extends McpAgent {
         },
       ],
     });
+
+    // The list tools also feed the Things list MCP App. The text block is the same JSON as before,
+    // so hosts without MCP Apps support see no difference; structuredContent is what the view draws.
+    const listResult = (view, title, todos, db) => ({
+      ...textResult(todos),
+      structuredContent: listStructured({ view, title, todos, today: db.today() }),
+    });
+
+    await registerThingsListApp(server, { baseUrl });
 
     // ==========================================
     // MCP RESOURCES (Subscribed Context)
@@ -231,7 +243,8 @@ export class ThingsMCP extends McpAgent {
     // ==========================================
 
     // 1. things_get_today
-    server.registerTool(
+    registerAppTool(
+      server,
       "things_get_today",
       {
         title: "Get Today's To-Dos",
@@ -244,16 +257,19 @@ export class ThingsMCP extends McpAgent {
           idempotentHint: true,
           openWorldHint: false,
         },
+        _meta: listToolMeta,
       },
       async ({ timezone }) => {
         const client = await getClient();
         const db = await client.syncDatabase();
-        return textResult(inZone(db, timezone).getToday());
+        const zoned = inZone(db, timezone);
+        return listResult("today", "Today", zoned.getToday(), zoned);
       }
     );
 
     // 2. things_get_inbox
-    server.registerTool(
+    registerAppTool(
+      server,
       "things_get_inbox",
       {
         title: "Get Inbox To-Dos",
@@ -266,16 +282,18 @@ export class ThingsMCP extends McpAgent {
           idempotentHint: true,
           openWorldHint: false,
         },
+        _meta: listToolMeta,
       },
       async () => {
         const client = await getClient();
         const db = await client.syncDatabase();
-        return textResult(db.getInbox());
+        return listResult("inbox", "Inbox", db.getInbox(), db);
       }
     );
 
     // 3. things_get_upcoming
-    server.registerTool(
+    registerAppTool(
+      server,
       "things_get_upcoming",
       {
         title: "Get Upcoming To-Dos & Deadlines",
@@ -291,16 +309,19 @@ export class ThingsMCP extends McpAgent {
           idempotentHint: true,
           openWorldHint: false,
         },
+        _meta: listToolMeta,
       },
       async ({ days, timezone }) => {
         const client = await getClient();
         const db = await client.syncDatabase();
-        return textResult(inZone(db, timezone).getUpcoming(days));
+        const zoned = inZone(db, timezone);
+        return listResult("upcoming", "Upcoming", zoned.getUpcoming(days), zoned);
       }
     );
 
     // 4. things_get_anytime
-    server.registerTool(
+    registerAppTool(
+      server,
       "things_get_anytime",
       {
         title: "Get Anytime To-Dos",
@@ -316,16 +337,18 @@ export class ThingsMCP extends McpAgent {
           idempotentHint: true,
           openWorldHint: false,
         },
+        _meta: listToolMeta,
       },
       async ({ area, tag }) => {
         const client = await getClient();
         const db = await client.syncDatabase();
-        return textResult(db.getAnytime({ area, tag }));
+        return listResult("anytime", "Anytime", db.getAnytime({ area, tag }), db);
       }
     );
 
     // 5. things_get_someday
-    server.registerTool(
+    registerAppTool(
+      server,
       "things_get_someday",
       {
         title: "Get Someday Backlog",
@@ -338,11 +361,12 @@ export class ThingsMCP extends McpAgent {
           idempotentHint: true,
           openWorldHint: false,
         },
+        _meta: listToolMeta,
       },
       async () => {
         const client = await getClient();
         const db = await client.syncDatabase();
-        return textResult(db.getSomeday());
+        return listResult("someday", "Someday", db.getSomeday(), db);
       }
     );
 
@@ -444,7 +468,8 @@ export class ThingsMCP extends McpAgent {
     );
 
     // 10. things_get_project
-    server.registerTool(
+    registerAppTool(
+      server,
       "things_get_project",
       {
         title: "Get Project Details",
@@ -459,13 +484,14 @@ export class ThingsMCP extends McpAgent {
           idempotentHint: true,
           openWorldHint: false,
         },
+        _meta: listToolMeta,
       },
       async ({ project }) => {
         const client = await getClient();
         const db = await client.syncDatabase();
         const result = db.getProject(project);
         if (!result) throw new Error(`Project not found: ${project}`);
-        return textResult(result);
+        return { ...textResult(result), structuredContent: projectStructured(result, db.today()) };
       }
     );
 

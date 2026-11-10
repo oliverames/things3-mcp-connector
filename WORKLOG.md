@@ -1,6 +1,6 @@
 # Things MCP connector worklog
 
-## 2026-11-09 - Password encoding and closing a project's to-dos (uncommitted, not deployed)
+## 2026-11-09 - Password encoding and closing a project's to-dos (commit `3eaff0d`, deployed as Worker `9bb2877b`, both verified live)
 
 **Password encoding**: `ThingsCloudClient.encodePassword` ran `encodeURIComponent` and then escaped a character class that included `%`, so it escaped its own percent signs and `@` became `%2540`. It now escapes once and adds only `!*'()`, which is exactly what the Swift client in things-reminders-sync does: `p@ss w!rd*'()~` becomes `p%40ss%20w%21rd%2A%27%28%29~`. Which form Things Cloud itself wants is unverified. The owner's password has no special characters, so every form signs in, and no sign-in with a special character has been tried.
 

@@ -1,5 +1,21 @@
 # Things MCP connector worklog
 
+## 2026-11-10 - Things list MCP App (commit `51ed310`, deployed as Worker `f43fa5e9`)
+
+**What changed**: Added an interactive list view (`ui://things3/list.html`) for `things_get_today`, `_inbox`, `_upcoming`, `_anytime`, `_someday` and `things_get_project`. Ticking a checkbox calls `things_complete_todo`, only on click, with optimistic UI and rollback on error. Text results are unchanged; a trimmed copy goes in `structuredContent`. The glyphs (checkbox, Today star, Inbox, Anytime, Someday, Upcoming, Evening moon, flag, repeat, project pies) are vector artwork extracted from the Things 3 app (`scripts/extract-glyphs.swift`, `src/app/glyphs/`, NOTICE inside). `ui.domain` is computed for `https://things3mcp.org/mcp` exactly.
+
+**Decisions made**: Glyphs are Cultured Code artwork, so this repo must stay private or the glyphs must be replaced first (README warns). SDK stays on 1.x for now; the upgrade is issue #5. The view bundle is checked in as `src/things-list-app.generated.js` because Workers have no filesystem; a test fails if it is stale (`npm run build:app`).
+
+**Verification**: 123 of 123 tests pass. A mock-host harness rendered light, dark and 375px layouts, a tick with optimistic state and a forced-error rollback. After deploy, `https://things3mcp.org/` returned 200 and `/mcp` returned 401 without a token. Not verified: rendering inside real Claude (host theme, side panel, mobile), a live Things Cloud completion from the view, and the Evening section against real data.
+
+**Left off at**: Deployed; waiting for a real-Claude check of the Today list. Checkbox is drawn at 28px (artwork's native box is 12px); say if it should be closer to native.
+
+**Open questions**:
+- NEW: SDK 2.x and ext-apps 2.x upgrade (issue #5).
+- Still open: issues #1, #2, #4.
+
+---
+
 ## 2026-11-10 - Session closeout
 
 **What changed**: The audit fixes, repeat create, `things_update_repeat`, project close, conflict rebuild, credential storage and import changes recorded below are all deployed (Worker `a295a3e1`, head `c7d5552`). CI had been failing since `8ce82b1` because the tests import `hono` and the workflow installed nothing; it now runs `npm ci`. Related repo: `things-reminders-sync` v0.2.3.

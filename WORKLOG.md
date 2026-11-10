@@ -1,5 +1,25 @@
 # Things MCP connector worklog
 
+## 2026-11-10 - Importing a finished project, and a note on tag titles (uncommitted, not deployed)
+
+Nothing was written to Things Cloud and nothing was deployed; the work is covered by tests against the mocked fetch only.
+
+**Importing a finished project** (`planImport` in `src/things-client.js`)
+- Since 8ce82b1 the validator refuses a new open to-do in a completed or canceled project, so `things_import_json` refused a completed or canceled project that listed open to-dos.
+- When an import creates a project as completed or canceled, each to-do created in it with no completed or canceled status of its own is now created with the project's status and stop date. This covers to-dos listed in the project's `items`, those under its headings, and a later top-level to-do in the same import that names the new project or one of its headings.
+- The write is the create `buildTaskCreate` already produces for a to-do created completed or canceled, with `sp` set to the project's `sp`. No new shape is written. Headings and checklist items are created as before.
+- A to-do with its own completed or canceled status keeps its status and stop date.
+- The result carries `todosClosedWithProject` for the import and `todosClosed` on the item of each project created closed.
+- A new open to-do filed into a project that was already completed or canceled is still refused by the validator.
+- `things_import_csv` creates to-dos only, so it needed no change.
+
+**Tag titles and Apple Reminders** (`src/things-mcp.js`)
+- The descriptions of `things_create_tag` and `things_update_tag` now say that a tag title with spaces is fine in Things and is matched to its Reminders hashtag with the spaces removed. No behavior changed.
+
+**Tests**: 114 pass (`npm test`). The new test covers a completed project with open, completed, canceled, and heading to-dos, a top-level to-do filed into it by title, a canceled project with no completion date, the counts in the result, an open project, and the refusal for an existing closed project.
+
+**Not verified**: the Things apps reading these creates from a live account.
+
 ## 2026-11-09 - Repeat rule edit that moves the next day, and stop with notes, tags, and checklist items (uncommitted, not deployed)
 
 Source: the second sampling session in the orchestrating session's `repeat-edit-shapes.md` (Things 3.24.2, history indexes after 1716). Nothing was written to Things Cloud and nothing was deployed; the work is covered by tests against the mocked fetch only.

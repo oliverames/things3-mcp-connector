@@ -2196,6 +2196,18 @@ export class ThingsCloudClient {
     };
     const updated = new Map();
 
+    // A project this import creates completed or canceled takes its new open to-dos with it, as
+    // closing an existing project does: each is created with the project's status and stop date.
+    // A to-do with its own completed or canceled status keeps it.
+    const closedNew = new Map();
+    let todosClosedWithProject = 0;
+    const closingProject = (ownStatus, projectId) => (ownStatus === 0 && closedNew.get(projectId)) || null;
+    const closeWith = (closing, change) => {
+      change.p.sp = closing.sp;
+      closing.result.todosClosed++;
+      todosClosedWithProject++;
+    };
+
     // The connector mints every new id itself. An id on a create usually means the caller meant
     // "operation": "update"; writing it would fork or overwrite an item, so refuse instead.
     const rejectCallerIds = (list, where) => {
@@ -2305,7 +2317,12 @@ export class ThingsCloudClient {
         changes.push({ [projectUUID]: projectChange });
         db.applyChangeMap({ [projectUUID]: projectChange });
         projectsCreated++;
-        itemResults.push({ id: projectUUID, type: "project", operation: "created", title: attrs.title || "Untitled Project" });
+        const projectResult = { id: projectUUID, type: "project", operation: "created", title: attrs.title || "Untitled Project" };
+        itemResults.push(projectResult);
+        if (status !== 0) {
+          projectResult.todosClosed = 0;
+          closedNew.set(projectUUID, { ss: status, sp: projectChange.p.sp, result: projectResult });
+        }
 
         let headingUUID = null;
         let idx = 0;
@@ -2326,7 +2343,9 @@ export class ThingsCloudClient {
             db.applyChangeMap({ [headingUUID]: headingChange });
           } else if (subType === "to-do") {
             const todoUUID = mint();
-            const subStatus = subAttrs.completed === true ? 3 : subAttrs.canceled === true ? 2 : (subAttrs.status === "completed" ? 3 : subAttrs.status === "canceled" ? 2 : 0);
+            const ownStatus = subAttrs.completed === true ? 3 : subAttrs.canceled === true ? 2 : (subAttrs.status === "completed" ? 3 : subAttrs.status === "canceled" ? 2 : 0);
+            const closing = closingProject(ownStatus, projectUUID);
+            const subStatus = closing ? closing.ss : ownStatus;
             const change = buildTaskCreate({
               title: subAttrs.title || "Untitled",
               notes: subAttrs.notes || "",
@@ -2344,6 +2363,7 @@ export class ThingsCloudClient {
               timeZone: this.timeZone,
             });
             change.p.ix = idx++;
+            if (closing) closeWith(closing, change);
             changes.push({ [todoUUID]: change });
             db.applyChangeMap({ [todoUUID]: change });
             todosCreated++;
@@ -2378,7 +2398,10 @@ export class ThingsCloudClient {
           }
         }
 
-        const status = attrs.completed === true ? 3 : attrs.canceled === true ? 2 : (attrs.status === "completed" ? 3 : attrs.status === "canceled" ? 2 : 0);
+        const ownStatus = attrs.completed === true ? 3 : attrs.canceled === true ? 2 : (attrs.status === "completed" ? 3 : attrs.status === "canceled" ? 2 : 0);
+        // Only a project created by this import closes a new to-do; an existing closed one refuses it.
+        const closing = closingProject(ownStatus, db.projectIdOf({ project, heading }));
+        const status = closing ? closing.ss : ownStatus;
         const todoChange = buildTaskCreate({
           title: attrs.title || "Untitled",
           notes: attrs.notes || "",
@@ -2396,6 +2419,7 @@ export class ThingsCloudClient {
           now,
           timeZone: this.timeZone,
         });
+        if (closing) closeWith(closing, todoChange);
 
         changes.push({ [todoUUID]: todoChange });
         db.applyChangeMap({ [todoUUID]: todoChange });
@@ -2412,6 +2436,7 @@ export class ThingsCloudClient {
         todosCreated,
         projectsUpdated,
         todosUpdated,
+        todosClosedWithProject,
         totalEntities: changes.length,
         items: itemResults,
       },

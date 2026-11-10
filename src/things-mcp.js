@@ -1090,7 +1090,7 @@ export class ThingsMCP extends McpAgent {
       "things_create_tag",
       {
         title: "Create Tag",
-        description: "Create a new Tag in Things 3 with optional keyboard shortcut or parent tag.",
+        description: "Create a new Tag in Things 3 with optional keyboard shortcut or parent tag. A tag title with spaces is fine in Things and is matched to its Apple Reminders hashtag with the spaces removed.",
         inputSchema: {
           title: z.string().describe("Tag name"),
           shortcut: z.string().optional().describe("Optional single character shortcut"),
@@ -1251,7 +1251,7 @@ export class ThingsMCP extends McpAgent {
       "things_import_json",
       {
         title: "Import Things JSON",
-        description: "Batch import complex structured projects, headings, to-dos, checklists, and tags or update existing items using Things 3 JSON format in a single atomic sync commit. To change an existing item, pass {\"operation\": \"update\", \"id\": \"<Things id>\"}; an id without operation update is refused. An update that completes or cancels a project also completes or cancels every open to-do in it (as the Things app does) and reports the count. New items always get ids minted by Things' own format. Dates are ISO 8601 (or unix seconds), never milliseconds. On an update, 'checklist-items' replaces the checklist, 'append-checklist-items' adds to it, and 'add-tags' adds tags. The whole batch is validated and rejected before writing if any id, reference, or date is one Things cannot decode.",
+        description: "Batch import complex structured projects, headings, to-dos, checklists, and tags or update existing items using Things 3 JSON format in a single atomic sync commit. To change an existing item, pass {\"operation\": \"update\", \"id\": \"<Things id>\"}; an id without operation update is refused. An update that completes or cancels a project also completes or cancels every open to-do in it (as the Things app does) and reports the count. A project created completed or canceled does the same for the to-dos created in it, including those under its headings: each one with no completed or canceled status of its own is created with the project's status and completion date, and the result reports the count as todosClosedWithProject and as todosClosed on the project. A to-do with its own completed or canceled status keeps it, and a new open to-do filed into a project that was already completed or canceled is refused. New items always get ids minted by Things' own format. Dates are ISO 8601 (or unix seconds), never milliseconds. On an update, 'checklist-items' replaces the checklist, 'append-checklist-items' adds to it, and 'add-tags' adds tags. The whole batch is validated and rejected before writing if any id, reference, or date is one Things cannot decode.",
         inputSchema: {
           payload: z.any().describe("Things JSON array or object containing projects or to-dos to create or update"),
         },
@@ -1477,7 +1477,7 @@ export class ThingsMCP extends McpAgent {
       "things_update_tag",
       {
         title: "Update Tag",
-        description: "Update a tag's title, keyboard shortcut, or parent tag.",
+        description: "Update a tag's title, keyboard shortcut, or parent tag. A tag title with spaces is fine in Things and is matched to its Apple Reminders hashtag with the spaces removed.",
         inputSchema: {
           id: z.string().describe("Tag UUID"),
           title: z.string().optional().describe("New tag title"),

@@ -1962,3 +1962,69 @@ test("date-dependent reads can be asked in another time zone; the database and w
   }
   assert.match(src, /new ThingsCloudClient\(\{ \.\.\.creds, timeZone: this\.env\.USER_TIMEZONE \}\)/);
 });
+
+test("an import that creates a finished project creates its open to-dos with the project's status and stop date", async () => {
+  const [old, existing] = [generateUUID(), generateUUID()];
+  const { client, commits } = cloud([project(old, { tt: "Old", ss: 3, sp: 1794000000 }), todo(existing)]);
+  const done = "2026-09-01T12:00:00Z";
+  const doneTs = Date.parse(done) / 1000;
+  const ownTs = Date.parse("2026-08-01T12:00:00Z") / 1000;
+  const result = await client.importJson([
+    {
+      type: "project",
+      attributes: {
+        title: "Migrated",
+        completed: true,
+        "completion-date": done,
+        items: [
+          { type: "to-do", attributes: { title: "open" } },
+          { type: "to-do", attributes: { title: "done earlier", completed: true, "completion-date": "2026-08-01T12:00:00Z" } },
+          { type: "to-do", attributes: { title: "dropped", canceled: true, "completion-date": "2026-08-01T12:00:00Z" } },
+          { type: "heading", attributes: { title: "Part" } },
+          { type: "to-do", attributes: { title: "under heading", "checklist-items": ["step"] } },
+        ],
+      },
+    },
+    { type: "to-do", attributes: { title: "filed by title", list: "Migrated" } },
+    { type: "to-do", attributes: { title: "elsewhere" } },
+  ]);
+  assert.equal(commits.length, 1);
+  const byTitle = Object.fromEntries(Object.values(commits[0].body).map((c) => [c.p.tt, c]));
+  const closed = ["open", "under heading", "filed by title"];
+  for (const title of closed) {
+    assert.equal(byTitle[title].p.ss, 3, title);
+    assert.equal(byTitle[title].p.sp, doneTs, title);
+  }
+  assert.equal(byTitle.Migrated.p.sp, doneTs);
+  assert.deepEqual([byTitle["done earlier"].p.ss, byTitle["done earlier"].p.sp], [3, ownTs]);
+  assert.deepEqual([byTitle.dropped.p.ss, byTitle.dropped.p.sp], [2, ownTs]);
+  assert.deepEqual([byTitle.Part.p.ss, byTitle.Part.p.sp], [0, null]);
+  assert.deepEqual([byTitle.elsewhere.p.ss, byTitle.elsewhere.p.sp], [0, null]);
+  assert.equal(byTitle.step.p.ss, 0);
+  // A to-do closed with its project is written with the keys of a to-do created completed.
+  assert.deepEqual(Object.keys(byTitle.open.p).sort(), Object.keys(byTitle["done earlier"].p).sort());
+  assert.equal(result.todosClosedWithProject, 3);
+  assert.equal(result.items[0].todosClosed, 3);
+  assert.equal(result.todosCreated, 6);
+  assert.ok(!("todosClosed" in result.items[1]));
+
+  // A canceled project with no completion date: its to-dos are canceled with the project's own stop date.
+  const out = await client.importJson([
+    { type: "project", attributes: { title: "Dropped", canceled: true, items: [{ type: "to-do", attributes: { title: "a" } }, { type: "to-do", attributes: { title: "b", completed: true } }] } },
+  ]);
+  const second = Object.fromEntries(Object.values(commits[1].body).map((c) => [c.p.tt, c]));
+  assert.equal(second.Dropped.p.ss, 2);
+  assert.ok(second.Dropped.p.sp);
+  assert.deepEqual([second.a.p.ss, second.a.p.sp], [2, second.Dropped.p.sp]);
+  assert.equal(second.b.p.ss, 3);
+  assert.equal(out.todosClosedWithProject, 1);
+  assert.equal(out.items[0].todosClosed, 1);
+
+  // An open project closes nothing, and a project that already existed closed still refuses.
+  const open = await client.importJson([{ type: "project", attributes: { title: "Live", items: [{ type: "to-do", attributes: { title: "c" } }] } }]);
+  assert.equal(open.todosClosedWithProject, 0);
+  assert.ok(!("todosClosed" in open.items[0]));
+  assert.equal(Object.values(commits[2].body).find((c) => c.p.tt === "c").p.ss, 0);
+  await assert.rejects(client.importJson([{ type: "to-do", attributes: { title: "x", list: old } }]), /is completed, so a new open to-do cannot be filed into it/);
+  assert.equal(commits.length, 3);
+});

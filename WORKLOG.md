@@ -1,5 +1,21 @@
 # Things MCP connector worklog
 
+## 2026-11-10 - Session closeout
+
+**What changed**: The audit fixes, repeat create, `things_update_repeat`, project close, conflict rebuild, credential storage and import changes recorded below are all deployed (Worker `a295a3e1`, head `c7d5552`). CI had been failing since `8ce82b1` because the tests import `hono` and the workflow installed nothing; it now runs `npm ci`. Related repo: `things-reminders-sync` v0.2.3.
+
+**Verification**: 114 tests pass. Verified live against Things 3.24.2: repeat create, rule edit (with and without a moved next day), pause, resume, stop with notes, tags and checklist, project close, finished-project import, sign-in after the password and credential changes, and an invalid `timezone` being refused.
+
+**Left off at**: Nothing in progress. Test projects are in the Things Trash.
+
+**Open questions**:
+- NEW: password escaping for special characters (issue #4).
+- Still open: Maildrop `clear` and `empty_trash` on a trashed project with contents (issue #1); Upcoming and the `update_area` schema (issue #2).
+- NEW: the things-3 skill reference does not yet describe the finished-project import (personal-plugins issue #25).
+- Resolved this session: issue #3 (create repeating to-dos).
+
+---
+
 ## 2026-11-10 - Importing a finished project, and a note on tag titles (commit `acb2f6c`, deployed as Worker `a295a3e1`, verified live)
 
 Nothing was written to Things Cloud and nothing was deployed; the work is covered by tests against the mocked fetch only.

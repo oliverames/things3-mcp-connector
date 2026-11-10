@@ -18,6 +18,7 @@ import {
   dateToTimestamp,
   localDate,
   addDays,
+  buildRepeatingTaskCreate,
 } from "../src/things-client.js";
 
 const TZ = "America/New_York";
@@ -1040,4 +1041,117 @@ test("things_get_account_info does not return the history key", () => {
   const tool = source.slice(start, source.indexOf("server.registerTool(", start));
   assert.ok(start > 0 && tool.includes("mailDropEmail"));
   assert.ok(!/historyKey/i.test(tool));
+});
+
+// --- creating repeating to-dos ----------------------------------------------------------------------
+
+const nextDay = (n) => addDays(localDate(TZ), n);
+
+test("a new repeating template must have the exact shape Things writes for one", () => {
+  const start = nextDay(3);
+  const make = (patch = {}) => {
+    const change = buildRepeatingTaskCreate({ title: "Stretch", repeat: { frequency: "daily" }, start });
+    Object.assign(change.p, patch);
+    return { [generateUUID()]: change };
+  };
+  const db = dbOf();
+  assert.doesNotThrow(() => validateChangeMap(make(), db));
+  refused(make({ st: 1 }), db, /new repeating template needs st 2/);
+  refused(make({ sr: day(3) }), db, /new repeating template needs sr null/);
+  refused(make({ dd: day(9) }), db, /new repeating template needs dd null/);
+  refused(make({ ato: 32400 }), db, /new repeating template needs ato null/);
+  refused(make({ ss: 3, sp: 1794200000 }), db, /new repeating template needs ss 0/);
+  refused(make({ tr: true }), db, /new repeating template needs tr false/);
+  refused(make({ tp: 1 }), db, /new repeating template needs tp 0/);
+  refused(make({ icc: 2 }), db, /new repeating template needs icc 0/);
+  refused(make({ rt: [generateUUID()] }), db, /cannot name templates in rt/);
+  refused(make({ tir: null }), db, /tir, icsd, and rr\.sr on the same first day/);
+  refused(make({ icsd: day(4) }), db, /tir, icsd, and rr\.sr on the same first day/);
+  refused(make({ tir: day(4), icsd: day(4) }), db, /tir, icsd, and rr\.sr on the same first day/);
+  // A first day before today is refused once the database is known.
+  const past = { [generateUUID()]: buildRepeatingTaskCreate({ title: "Stretch", repeat: { frequency: "daily" }, start: nextDay(-2) }) };
+  refused(past, db, /cannot start before today/);
+});
+
+test("things_add_todo with repeat: writes one template and reads it back as repeating", async () => {
+  const tagId = generateUUID();
+  const { client, commits } = cloud([tag(tagId)]);
+  const start = nextDay(7);
+  const weekday = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"][new Date(dateToTimestamp(start) * 1000).getUTCDay()];
+  const ends = nextDay(60);
+  const result = await client.createTodo({
+    title: "Take out recycling",
+    notes: "Blue bin",
+    tags: [tagId],
+    checklist: ["Flatten boxes"],
+    repeat: { frequency: "weekly", interval: 2, weekdays: [weekday], starts: start, ends: { on: ends } },
+  });
+  assert.equal(commits.length, 1);
+  const p = commits[0].body[result.id].p;
+  const ts = dateToTimestamp(start);
+  assert.equal(commits[0].body[result.id].t, 0);
+  assert.equal(commits[0].body[result.id].e, "Task6");
+  assert.deepEqual(
+    { st: p.st, sb: p.sb, sr: p.sr, tir: p.tir, icsd: p.icsd, ato: p.ato, dd: p.dd, icc: p.icc, ss: p.ss, tg: p.tg },
+    { st: 2, sb: 0, sr: null, tir: ts, icsd: ts, ato: null, dd: null, icc: 0, ss: 0, tg: [tagId] }
+  );
+  assert.equal(
+    JSON.stringify(p.rr),
+    JSON.stringify({ fu: 256, fa: 2, of: [{ wd: new Date(ts * 1000).getUTCDay() }], tp: 0, ia: ts, sr: ts, rc: 0, ts: 0, rrv: 4, ed: dateToTimestamp(ends) })
+  );
+  assert.deepEqual(repeatRuleProblems(p.rr), []);
+  assert.equal(Object.keys(commits[0].body).length, 2); // the template and its checklist item, no occurrences
+
+  assert.equal(result.repeating, true);
+  assert.equal(result.when, "repeating");
+  assert.equal(result.firstOccurrence, start);
+  assert.match(result.repeatRule, /^Every 2 weeks on /);
+
+  const db = await client.syncDatabase();
+  const read = db.getRepeatingTodos().find((t) => t.id === result.id);
+  assert.equal(read.repeating, true);
+  assert.equal(read.when, "repeating");
+  assert.equal(read.repeatRule, result.repeatRule);
+  assert.equal(read.repeat.frequency, "weekly");
+  assert.equal(read.repeat.interval, 2);
+});
+
+test("things_add_todo with repeat: the first day defaults to the next matching day, and when may name it", async () => {
+  const { client, commits } = cloud();
+  const a = await client.createTodo({ title: "Daily", repeat: { frequency: "daily" } });
+  assert.equal(a.firstOccurrence, localDate(TZ));
+  assert.equal(commits[0].body[a.id].p.tir, today());
+  const b = await client.createTodo({ title: "Daily", when: "tomorrow", repeat: { frequency: "daily", ends: { after: 5 } } });
+  assert.equal(b.firstOccurrence, nextDay(1));
+  assert.equal(commits[1].body[b.id].p.rr.rc, 5);
+  assert.ok(!("ed" in commits[1].body[b.id].p.rr));
+  const c = await client.createTodo({ title: "After", when: nextDay(2), repeat: { frequency: "daily", interval: 4, after_completion: true, starts: nextDay(2) } });
+  assert.deepEqual(commits[2].body[c.id].p.rr, { fu: 16, fa: 4, of: [], tp: 1, ia: 0, sr: day(2), rc: 0, ts: 0, rrv: 4, ed: 64092211200 });
+});
+
+test("things_add_todo with repeat: contradictory or unsupported input is refused with nothing written", async () => {
+  const { client, commits } = cloud();
+  const no = (args, pattern) => assert.rejects(client.createTodo({ title: "x", ...args }), pattern);
+  const daily = { frequency: "daily" };
+  for (const when of ["inbox", "anytime", "someday", "evening"]) await no({ when, repeat: daily }, /cannot be scheduled for/);
+  await no({ when: nextDay(1), repeat: { ...daily, starts: nextDay(2) } }, /name different first days/);
+  await no({ repeat: { ...daily, starts: nextDay(-1) } }, /cannot start in the past/);
+  await no({ repeat: daily, reminderTime: "09:00" }, /cannot be created with a reminder time/);
+  await no({ repeat: daily, deadline: nextDay(5) }, /cannot be created with a deadline/);
+  await no({ repeat: daily, completed: true }, /completed or canceled/);
+  await no({ repeat: daily, canceled: true }, /completed or canceled/);
+  await no({ repeat: { frequency: "weekly", weekdays: ["mon"], after_completion: true } }, /Supported repeats/);
+  await no({ repeat: { frequency: "yearly", month: 11, nth_weekday: { nth: "last", weekday: "thu" } } }, /not supported/);
+  await no({ repeat: { ...daily, ends: { on: nextDay(-1) } } }, /before the first day/);
+  assert.equal(commits.length, 0);
+});
+
+test("tool descriptions say that repeat rules cannot be edited or cleared", () => {
+  const source = readFileSync(new URL("../src/things-mcp.js", import.meta.url), "utf8");
+  for (const name of ["things_add_todo", "things_get_repeating_todos"]) {
+    const start = source.indexOf(`"${name}"`);
+    const tool = source.slice(start, source.indexOf("server.registerTool(", start));
+    assert.match(tool, /cannot be edited or cleared/, name);
+    assert.match(tool, /trashing the template/i, name);
+  }
 });

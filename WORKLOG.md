@@ -1,6 +1,23 @@
 # Things MCP connector worklog
 
-## 2026-11-09 - Audit fixes: delete guards, login page escaping, Today and repeating reads (not deployed, not committed)
+## 2026-11-09 - Creating repeating to-dos, issue #3 (commit `1ca7a2f`, deployed as Worker `9c6ca148`)
+
+Source: `docs/RECURRENCE.md` in things-reminders-sync (rules recorded from Things 3.24.2) and the Swift `rr(for:)` and template create there. Nothing was written to Things Cloud; the work is covered by tests only.
+
+**Writes**
+- `buildRepeatRule(repeat, start)` in `src/things-client.js` builds `rr` in the recorded key order (`fu, fa, of, tp, ia, sr, rc, ts, rrv, ed`). Shapes: daily, weekly on weekdays, monthly on day(s), last day, or nth or last weekday, yearly on a date or nth weekday of a month, after completion in days, and the three endings (never, on a date, after N times, which drops `ed`). Anything else is refused with one message that lists what is supported. There is no deadline option and no reminder time, because no template with those was recorded.
+- `things_add_todo` takes `repeat`. It writes one `Task6` create: the ordinary Someday create plus `tir = icsd = rr.sr = first day` and `rr` (`st 2, sb 0, sr null, ato null, dd null, icc 0`). No occurrence is written; the Things apps generate them.
+- `when` and `repeat`: the first day is `repeat.starts`, or the next day the rule falls on counting today. A given start must fall on the rule and not be in the past; the error names the next matching day. `when` may be omitted or name the same day (today, tomorrow, a date). Inbox, anytime, someday, evening, a disagreeing `when`, a reminder time, a deadline, and a completed or canceled status are refused.
+- Validator: a create that carries `rr` must have exactly the template fields above, with `tir`, `icsd`, and `rr.sr` on one day, and cannot start before today. `repeatRuleProblems` still runs on every rule. Nothing was loosened; updates to a template are as restricted as before.
+- No rule edit and no rule clear. The tool descriptions say so, and that trashing the template stops it.
+
+**Tests**: each of the 15 recorded rules is compared as a JSON string with the builder output for the recorded start (2026-11-09). Also: template fields, validator refusals, first-day selection, refusals for unsupported shapes, and a create through the mocked cloud that reads back with `repeating: true` and the rule in words. 87 tests pass.
+
+**Not verified**: that the Things apps generate to-dos from a template written by the connector. That needs one supervised live create.
+
+---
+
+## 2026-11-09 - Audit fixes: delete guards, login page escaping, Today and repeating reads (commit `1ca7a2f`, deployed as Worker `9c6ca148`)
 
 Source: the read-only connector audit and the Swift/JavaScript write parity audit of the same day. Each finding was reproduced against the code first: every new test fails on `8e36a3d` and passes now.
 
@@ -32,7 +49,7 @@ Source: the read-only connector audit and the Swift/JavaScript write parity audi
 
 **Unverified**: how the Things apps treat the newly refused states; the meaning of `rr.ts` as "days the to-do starts before its deadline" (docs only show `ts: 0`); that Things removes untrashed children when it empties a trashed project; `empty_trash` and Maildrop reset and clear against the live service; the CSP in a real browser OAuth round trip.
 
-**Verification**: `npm test`, 78 tests, mocked fetch only. No live calls, not deployed, not committed.
+**Verification**: `npm test`, 78 tests, mocked fetch only. Deployed 2026-11-09; a live project read returned the new repeating fields.
 
 ---
 

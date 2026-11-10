@@ -304,6 +304,161 @@ export function describeRepeatRule(rr, { hasDeadline = false } = {}) {
   };
 }
 
+// Building a repeat rule for a new template. Equal in output to things-reminders-sync's
+// ThingsRepeat.rr(for:start:), and limited to the shapes its docs/RECURRENCE.md samples from the
+// Things app. Anything else is refused: a rule the apps did not write themselves can crash them.
+const REPEAT_SUPPORTED =
+  "Supported repeats: daily; weekly on chosen weekdays; monthly on day(s) of the month, on the last day, or on the 1st to 4th or last weekday; " +
+  "yearly on a date or on the 1st to 4th weekday of a month; each every 1 to 999 units, ending never, on a date, or after N times; " +
+  "and after completion every N days with no end.";
+const REPEAT_INPUT_KEYS = ["frequency", "interval", "weekdays", "month_days", "nth_weekday", "month", "day", "starts", "ends", "after_completion"];
+const DAYS_IN_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+const unsupported = (what) => new Error(`${what} ${REPEAT_SUPPORTED}`);
+
+function nameIndex(names, value, what) {
+  const s = String(value).trim().toLowerCase();
+  const i = names.findIndex((n) => n.toLowerCase() === s || (s.length === 3 && n.toLowerCase().startsWith(s)));
+  if (i < 0) throw new Error(`Unknown ${what} "${value}". Use one of ${names.map((n) => n.slice(0, 3).toLowerCase()).join(", ")}.`);
+  return i;
+}
+
+function nthWeekdayOffset(value, { allowLast }) {
+  if (!isPlainObject(value) || !sameKeys(value, ["nth", "weekday"])) throw new Error('repeat.nth_weekday must be {nth, weekday}, for example {nth: 2, weekday: "tue"}.');
+  const last = value.nth === "last" || value.nth === -1;
+  if (last && !allowLast) throw unsupported("A yearly repeat on the last weekday of a month is not supported.");
+  if (!last && !inRange(value.nth, 1, 4)) throw unsupported(`repeat.nth_weekday.nth must be 1 to 4${allowLast ? ' or "last"' : ""}.`);
+  return { wdo: last ? -1 : value.nth, wd: nameIndex(WEEKDAYS, value.weekday, "weekday") };
+}
+
+// The validated pieces of a `repeat` input: unit code, interval, offsets, mode, and end.
+function parseRepeat(repeat) {
+  if (!isPlainObject(repeat)) throw new Error("repeat must be an object with at least a frequency.");
+  const extra = Object.keys(repeat).filter((k) => !REPEAT_INPUT_KEYS.includes(k));
+  if (extra.length) throw unsupported(`Unknown repeat option${extra.length > 1 ? "s" : ""} ${extra.map((k) => `"${k}"`).join(", ")}.`);
+  const has = (key) => repeat[key] !== undefined && repeat[key] !== null;
+  const fu = { daily: 16, weekly: 256, monthly: 8, yearly: 4 }[repeat.frequency];
+  if (!fu) throw unsupported(`repeat.frequency "${repeat.frequency}" is not daily, weekly, monthly, or yearly.`);
+  const unit = repeat.frequency;
+  const fa = has("interval") ? repeat.interval : 1;
+  if (!inRange(fa, 1, 999)) throw new Error("repeat.interval must be a whole number from 1 to 999.");
+  const only = (...keys) => {
+    const stray = ["weekdays", "month_days", "nth_weekday", "month", "day"].filter((k) => has(k) && !keys.includes(k));
+    if (stray.length) throw unsupported(`repeat.${stray[0]} does not apply to a ${unit} repeat${repeat.after_completion === true ? " after completion" : ""}.`);
+  };
+
+  let ends = null;
+  if (has("ends")) {
+    const e = repeat.ends;
+    if (!isPlainObject(e) || Object.keys(e).length !== 1 || !("on" in e || "after" in e)) throw new Error('repeat.ends must be {on: "YYYY-MM-DD"} or {after: N}.');
+    if ("on" in e) {
+      if (!isDateString(e.on)) throw new Error('repeat.ends.on must be a date "YYYY-MM-DD".');
+      ends = { on: dateToTimestamp(e.on) };
+    } else {
+      if (!inRange(e.after, 1, 999)) throw new Error("repeat.ends.after must be a whole number from 1 to 999.");
+      ends = { after: e.after };
+    }
+  }
+
+  if (has("after_completion") && typeof repeat.after_completion !== "boolean") throw new Error("repeat.after_completion must be true or false.");
+  if (repeat.after_completion === true) {
+    if (unit !== "daily") throw unsupported(`An after-completion repeat every ${fa} ${unit.replace(/ly$/, "")}(s) is not supported.`);
+    only();
+    if (ends) throw unsupported("An after-completion repeat with an end is not supported.");
+    return { unit, fu, fa, of: [], afterCompletion: true, ends: null };
+  }
+
+  let of;
+  if (unit === "daily") {
+    only();
+    of = [{ dy: 0 }];
+  } else if (unit === "weekly") {
+    only("weekdays");
+    if (!Array.isArray(repeat.weekdays) || !repeat.weekdays.length) throw new Error('A weekly repeat needs repeat.weekdays, for example ["mon", "thu"].');
+    of = [...new Set(repeat.weekdays.map((d) => nameIndex(WEEKDAYS, d, "weekday")))].sort((a, b) => a - b).map((wd) => ({ wd }));
+  } else if (unit === "monthly") {
+    only("month_days", "nth_weekday");
+    if (has("month_days") === has("nth_weekday")) throw new Error('A monthly repeat needs exactly one of repeat.month_days (for example [1, 15] or ["last"]) or repeat.nth_weekday.');
+    if (has("nth_weekday")) of = [nthWeekdayOffset(repeat.nth_weekday, { allowLast: true })];
+    else {
+      const days = repeat.month_days;
+      if (!Array.isArray(days) || !days.length) throw new Error('repeat.month_days must be a list of days 1 to 31, or ["last"].');
+      if (days.includes("last")) {
+        if (days.length > 1) throw unsupported('"last" together with numbered days of the month is not supported.');
+        of = [{ dy: -1 }];
+      } else {
+        if (!days.every((d) => inRange(d, 1, 31))) throw new Error('repeat.month_days must be a list of days 1 to 31, or ["last"].');
+        of = [...new Set(days)].sort((a, b) => a - b).map((d) => ({ dy: d - 1 }));
+      }
+    }
+  } else {
+    only("month", "day", "nth_weekday");
+    if (!has("month")) throw new Error("A yearly repeat needs repeat.month (1 to 12 or a month name).");
+    const mo = Number.isInteger(repeat.month) ? repeat.month - 1 : nameIndex(MONTHS, repeat.month, "month");
+    if (!inRange(mo, 0, 11)) throw new Error("repeat.month must be 1 to 12 or a month name.");
+    if (has("day") === has("nth_weekday")) throw new Error("A yearly repeat needs exactly one of repeat.day (day of the month) or repeat.nth_weekday.");
+    if (has("nth_weekday")) {
+      const { wdo, wd } = nthWeekdayOffset(repeat.nth_weekday, { allowLast: false });
+      of = [{ wdo, mo, wd }];
+    } else {
+      if (repeat.day === "last") throw unsupported("A yearly repeat on the last day of a month is not supported.");
+      if (!inRange(repeat.day, 1, DAYS_IN_MONTH[mo])) throw new Error(`repeat.day must be a day of ${MONTHS[mo]} (1 to ${DAYS_IN_MONTH[mo]}).`);
+      of = [{ dy: repeat.day - 1, mo }];
+    }
+  }
+  return { unit, fu, fa, of, afterCompletion: false, ends };
+}
+
+// The Things `rr` object for a `repeat` input whose first day is `start` (YYYY-MM-DD). Keys are
+// written in the order Things writes them.
+export function buildRepeatRule(repeat, start) {
+  const rule = parseRepeat(repeat);
+  if (!isDateString(start)) throw new Error('A repeat needs a start date "YYYY-MM-DD".');
+  const sr = dateToTimestamp(start);
+  if (rule.ends?.on !== undefined && rule.ends.on < sr) throw new Error(`repeat.ends.on ${timestampToDate(rule.ends.on)} is before the first day ${start}.`);
+  const rc = rule.ends?.after ?? 0;
+  const rr = { fu: rule.fu, fa: rule.fa, of: rule.of, tp: rule.afterCompletion ? 1 : 0, ia: rule.afterCompletion ? 0 : sr, sr, rc, ts: 0, rrv: 4 };
+  if (rc === 0) rr.ed = rule.ends?.on ?? RR_FAR_FUTURE;
+  const problems = repeatRuleProblems(rr);
+  if (problems.length) throw new Error(`Refusing to build a repeat rule Things did not write itself: ${problems.join("; ")}`);
+  return rr;
+}
+
+// Whether the rule's offsets fall on `date`. The interval is counted from the first day, so it
+// plays no part in choosing that day.
+function repeatMatchesDay(rule, date) {
+  if (rule.afterCompletion || rule.unit === "daily") return true;
+  const d = new Date(dateToTimestamp(date) * 1000);
+  const [year, month, day, weekday] = [d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCDay()];
+  const monthLength = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  return rule.of.some((e) => {
+    if ("mo" in e && e.mo !== month) return false;
+    if ("wd" in e && e.wd !== weekday) return false;
+    if ("wdo" in e) return e.wdo === -1 ? day + 7 > monthLength : Math.ceil(day / 7) === e.wdo;
+    if ("dy" in e) return e.dy === -1 ? day === monthLength : e.dy === day - 1;
+    return true;
+  });
+}
+
+// The first day on or after `from` (YYYY-MM-DD) that the rule falls on.
+export function firstRepeatDay(repeat, from) {
+  const rule = parseRepeat(repeat);
+  // Nine years covers the longest gap, February 29 across a century year that is not a leap year.
+  for (let i = 0, day = from; i < 3290; i += 1, day = addDays(day, 1)) if (repeatMatchesDay(rule, day)) return day;
+  throw new Error("The repeat rule has no matching day.");
+}
+
+// The first day of a new repeating to-do: `starts` when given, otherwise the next matching day.
+// A start in the past or on a day the rule skips is refused instead of moved.
+export function repeatStartDay(repeat, starts, today) {
+  if (starts === undefined || starts === null) return firstRepeatDay(repeat, today);
+  if (!isDateString(starts)) throw new Error('repeat.starts must be a date "YYYY-MM-DD".');
+  dateToTimestamp(starts);
+  if (starts < today) throw new Error(`A repeat cannot start in the past (${starts}). The next day this rule falls on is ${firstRepeatDay(repeat, today)}.`);
+  const next = firstRepeatDay(repeat, starts);
+  if (next !== starts) throw new Error(`${starts} is not a day this repeat falls on. The next one is ${next}; start there or leave the start out.`);
+  return starts;
+}
+
 const NOTE_KEYS = ["_t", "ch", "v", "t"];
 const EMPTY_XX_KEYS = ["_t", "sn"];
 
@@ -390,6 +545,16 @@ export function validateChangeMap(body, db = null) {
       if ("nt" in p) for (const m of noteProblems(p.nt)) add(m);
       if ("icc" in p && p.icc !== null && !inRange(p.icc, 0, Number.MAX_SAFE_INTEGER)) add("icc must be an integer >= 0");
       if ("rr" in p && p.rr !== null) for (const m of repeatRuleProblems(p.rr)) add(`rr ${m}`);
+      // A new repeating template: only the shape the Things app writes for one (an open to-do
+      // parked at st 2 with no start date, whose tir, icsd, and rr.sr are all the first day).
+      if (change.t === 0 && isPlainObject(p.rr)) {
+        const fixed = { tp: 0, ss: 0, sp: null, tr: false, st: 2, sb: 0, sr: null, ato: null, dd: null, icc: 0, rp: null, acrd: null };
+        for (const [key, want] of Object.entries(fixed)) {
+          if (p[key] !== want) add(`a new repeating template needs ${key} ${JSON.stringify(want)}, got ${JSON.stringify(p[key])}`);
+        }
+        if (!Array.isArray(p.rt) || p.rt.length) add("a new repeating template cannot name templates in rt");
+        if (!isNum(p.tir) || p.icsd !== p.tir || p.rr.sr !== p.tir) add("a new repeating template needs tir, icsd, and rr.sr on the same first day");
+      }
       for (const key of ["pr", "agr", "ar"]) if (Array.isArray(p[key]) && p[key].length > 1) add(`${key} may hold at most one id`);
     } else if (family === "ChecklistItem") {
       if ("ts" in p && !(Array.isArray(p.ts) && p.ts.length === 1)) add("a checklist item needs exactly one parent task in ts");
@@ -458,6 +623,7 @@ function validateAgainstDatabase(body, db) {
     refMust("ar", (r) => shadow.areas.has(r), "an existing area");
     refMust("rt", (r) => Boolean(taskOf(r)?.recurrenceRule), "an existing repeating template");
 
+    if (change.t === 0 && isPlainObject(p.rr) && isNum(p.tir) && p.tir < todayTs) add("a new repeating template cannot start before today");
     if (change.t === 1 && before?.recurrenceRule) {
       for (const key of Object.keys(p)) if (!TEMPLATE_SAFE_KEYS.has(key)) add(`${key} would change a repeating template; edit repeating to-dos in Things`);
     }
@@ -685,6 +851,16 @@ export function buildTaskCreate({
       xx: EMPTY_XX(),
     },
   };
+}
+
+// The hidden template of a new repeating to-do, with the fields the Things app writes for one:
+// parked at st 2 with no start date, tir and icsd on the first day, and the rule in rr. Things
+// generates the occurrences from it; none are written here.
+export function buildRepeatingTaskCreate({ repeat, start, ...task }) {
+  const rr = buildRepeatRule(repeat, start);
+  const change = buildTaskCreate({ ...task, when: "someday", reminderTime: null, deadline: null, status: 0 });
+  Object.assign(change.p, { tir: rr.sr, icsd: rr.sr, rr });
+  return change;
 }
 
 export function buildChecklistCreate({ title, task, index = 0, status = 0, now = toUnixTimestamp() }) {
@@ -1024,10 +1200,29 @@ export class ThingsCloudClient {
     canceled = undefined,
     completionDate = null,
     creationDate = null,
+    repeat = null,
   }) {
     const db = await this.syncDatabase();
     const taskUUID = generateUUID();
     const now = toUnixTimestamp();
+    // A repeating to-do is a template. Its first day comes from repeat.starts (or a dated "when"),
+    // defaulting to the next day the rule falls on; everything a template cannot carry is refused.
+    let repeatStart = null;
+    if (repeat !== null && repeat !== undefined) {
+      const not = (what) => new Error(`A repeating to-do cannot be created with ${what}. Create it without, or set that on each occurrence in Things.`);
+      if (reminderTime) throw not("a reminder time");
+      if (deadline) throw not("a deadline");
+      if (completed === true || canceled === true || status !== 0 || completionDate) throw not("a completed or canceled status");
+      const today = db.today();
+      let starts = isPlainObject(repeat) ? repeat.starts : undefined;
+      if (when !== undefined && when !== null) {
+        const whenDay = when === "today" ? today : when === "tomorrow" ? addDays(today, 1) : isDateString(when) ? when : null;
+        if (!whenDay) throw new Error(`A repeating to-do cannot be scheduled for "${when}". Leave "when" out, or give the first day as a date in "when" or repeat.starts.`);
+        if (starts !== undefined && starts !== null && starts !== whenDay) throw new Error(`"when" (${whenDay}) and repeat.starts (${starts}) name different first days. Give one of them.`);
+        starts = whenDay;
+      }
+      repeatStart = repeatStartDay(repeat, starts, today);
+    }
     // A reminder needs a date: with no "when" it goes on today, and an undated list is refused.
     if (reminderTime && UNDATED_WHEN.includes(when)) throw new Error(REMINDER_NEEDS_DATE(when));
     // A to-do in a project, heading, or area cannot sit in the Inbox; default to Anytime there.
@@ -1040,7 +1235,7 @@ export class ThingsCloudClient {
     if (completed === true) ss = 3;
     else if (canceled === true) ss = 2;
 
-    const change = buildTaskCreate({
+    const fields = {
       title,
       notes,
       when,
@@ -1055,7 +1250,8 @@ export class ThingsCloudClient {
       creationDate,
       now,
       timeZone: this.timeZone,
-    });
+    };
+    const change = repeatStart ? buildRepeatingTaskCreate({ ...fields, repeat, start: repeatStart }) : buildTaskCreate(fields);
     const changes = [{ [taskUUID]: change }];
 
     (checklist || []).forEach((item, idx) => {
@@ -1071,6 +1267,19 @@ export class ThingsCloudClient {
     });
 
     await this.commitChanges(changes);
+    if (repeatStart) {
+      return {
+        id: taskUUID,
+        title,
+        when: "repeating",
+        status: "open",
+        deadline: null,
+        reminderTime: null,
+        repeating: true,
+        repeatRule: describeRepeatRule(change.p.rr).summary,
+        firstOccurrence: repeatStart,
+      };
+    }
     return {
       id: taskUUID,
       title,

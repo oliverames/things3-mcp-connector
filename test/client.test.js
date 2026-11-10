@@ -13,6 +13,10 @@ import {
   schedulingFields,
   parseCSV,
   convertCsvToThingsJson,
+  buildRepeatRule,
+  buildRepeatingTaskCreate,
+  firstRepeatDay,
+  repeatStartDay,
 } from "../src/things-client.js";
 
 function fakeCloud({ head = 10 } = {}) {
@@ -652,4 +656,101 @@ test("a commit with a bad id, reference, or date is refused before it reaches Th
     /only accepted on updates/
   );
   assert.ok(!calls.some((c) => c.url.includes("/commit")));
+});
+
+// --- repeat rule builder ----------------------------------------------------------------------------
+
+// Every rule sampled in things-reminders-sync docs/RECURRENCE.md, as the JSON Things 3.24.2 wrote
+// for a start of Monday 2026-11-09 (1794182400). The builder must produce each one key for key.
+const SAMPLED_RULES = [
+  ["every day", { frequency: "daily" }, '{"fu":16,"fa":1,"of":[{"dy":0}],"tp":0,"ia":1794182400,"sr":1794182400,"rc":0,"ts":0,"rrv":4,"ed":64092211200}'],
+  ["every 3 days", { frequency: "daily", interval: 3 }, '{"fu":16,"fa":3,"of":[{"dy":0}],"tp":0,"ia":1794182400,"sr":1794182400,"rc":0,"ts":0,"rrv":4,"ed":64092211200}'],
+  ["weekly on Monday", { frequency: "weekly", weekdays: ["mon"] }, '{"fu":256,"fa":1,"of":[{"wd":1}],"tp":0,"ia":1794182400,"sr":1794182400,"rc":0,"ts":0,"rrv":4,"ed":64092211200}'],
+  ["every 2 weeks on Monday and Thursday", { frequency: "weekly", interval: 2, weekdays: ["Thursday", "MON"] }, '{"fu":256,"fa":2,"of":[{"wd":1},{"wd":4}],"tp":0,"ia":1794182400,"sr":1794182400,"rc":0,"ts":0,"rrv":4,"ed":64092211200}'],
+  ["weekdays", { frequency: "weekly", weekdays: ["mon", "tue", "wed", "thu", "fri"] }, '{"fu":256,"fa":1,"of":[{"wd":1},{"wd":2},{"wd":3},{"wd":4},{"wd":5}],"tp":0,"ia":1794182400,"sr":1794182400,"rc":0,"ts":0,"rrv":4,"ed":64092211200}'],
+  ["monthly on the 15th", { frequency: "monthly", month_days: [15] }, '{"fu":8,"fa":1,"of":[{"dy":14}],"tp":0,"ia":1794182400,"sr":1794182400,"rc":0,"ts":0,"rrv":4,"ed":64092211200}'],
+  ["monthly on the 1st and 15th", { frequency: "monthly", month_days: [15, 1] }, '{"fu":8,"fa":1,"of":[{"dy":0},{"dy":14}],"tp":0,"ia":1794182400,"sr":1794182400,"rc":0,"ts":0,"rrv":4,"ed":64092211200}'],
+  ["monthly on the 2nd Tuesday", { frequency: "monthly", nth_weekday: { nth: 2, weekday: "tue" } }, '{"fu":8,"fa":1,"of":[{"wdo":2,"wd":2}],"tp":0,"ia":1794182400,"sr":1794182400,"rc":0,"ts":0,"rrv":4,"ed":64092211200}'],
+  ["monthly on the last Friday", { frequency: "monthly", nth_weekday: { nth: "last", weekday: "fri" } }, '{"fu":8,"fa":1,"of":[{"wdo":-1,"wd":5}],"tp":0,"ia":1794182400,"sr":1794182400,"rc":0,"ts":0,"rrv":4,"ed":64092211200}'],
+  ["monthly on the last day", { frequency: "monthly", month_days: ["last"] }, '{"fu":8,"fa":1,"of":[{"dy":-1}],"tp":0,"ia":1794182400,"sr":1794182400,"rc":0,"ts":0,"rrv":4,"ed":64092211200}'],
+  ["yearly on November 20", { frequency: "yearly", month: 11, day: 20 }, '{"fu":4,"fa":1,"of":[{"dy":19,"mo":10}],"tp":0,"ia":1794182400,"sr":1794182400,"rc":0,"ts":0,"rrv":4,"ed":64092211200}'],
+  ["yearly on the 4th Thursday of November", { frequency: "yearly", month: "November", nth_weekday: { nth: 4, weekday: "thu" } }, '{"fu":4,"fa":1,"of":[{"wdo":4,"mo":10,"wd":4}],"tp":0,"ia":1794182400,"sr":1794182400,"rc":0,"ts":0,"rrv":4,"ed":64092211200}'],
+  ["after completion every 4 days", { frequency: "daily", interval: 4, after_completion: true }, '{"fu":16,"fa":4,"of":[],"tp":1,"ia":0,"sr":1794182400,"rc":0,"ts":0,"rrv":4,"ed":64092211200}'],
+  ["daily, ends after 5 times", { frequency: "daily", ends: { after: 5 } }, '{"fu":16,"fa":1,"of":[{"dy":0}],"tp":0,"ia":1794182400,"sr":1794182400,"rc":5,"ts":0,"rrv":4}'],
+  ["daily until 2026-12-31", { frequency: "daily", ends: { on: "2026-12-31" } }, '{"fu":16,"fa":1,"of":[{"dy":0}],"tp":0,"ia":1794182400,"sr":1794182400,"rc":0,"ts":0,"rrv":4,"ed":1798675200}'],
+];
+
+test("buildRepeatRule writes every sampled rule exactly as Things wrote it", () => {
+  for (const [name, repeat, sampled] of SAMPLED_RULES) {
+    assert.equal(JSON.stringify(buildRepeatRule(repeat, "2026-11-09")), sampled, name);
+  }
+});
+
+test("buildRepeatRule refuses what was never sampled, naming what is supported", () => {
+  const no = (repeat, pattern) => assert.throws(() => buildRepeatRule(repeat, "2026-11-09"), pattern);
+  no({ frequency: "hourly" }, /Supported repeats: daily; weekly/);
+  no({ frequency: "weekly", weekdays: ["mon"], after_completion: true }, /after-completion repeat every 1 week.*Supported repeats/);
+  no({ frequency: "monthly", interval: 2, after_completion: true }, /Supported repeats/);
+  no({ frequency: "daily", after_completion: true, ends: { after: 3 } }, /after-completion repeat with an end.*Supported repeats/);
+  no({ frequency: "yearly", month: 11, nth_weekday: { nth: "last", weekday: "thu" } }, /last weekday of a month is not supported/);
+  no({ frequency: "yearly", month: 2, day: "last" }, /last day of a month is not supported/);
+  no({ frequency: "monthly", month_days: ["last", 15] }, /"last" together with numbered days/);
+  no({ frequency: "monthly", nth_weekday: { nth: 5, weekday: "mon" } }, /nth must be 1 to 4 or "last"/);
+  no({ frequency: "daily", add_deadlines: true }, /Unknown repeat option "add_deadlines"/);
+  no({ frequency: "daily", reminder_time: "09:00" }, /Unknown repeat option "reminder_time"/);
+  no({ frequency: "daily", weekdays: ["mon"] }, /weekdays does not apply to a daily repeat/);
+  no({ frequency: "weekly" }, /needs repeat\.weekdays/);
+  no({ frequency: "weekly", weekdays: ["someday"] }, /Unknown weekday/);
+  no({ frequency: "monthly" }, /exactly one of repeat\.month_days/);
+  no({ frequency: "monthly", month_days: [1], nth_weekday: { nth: 1, weekday: "mon" } }, /exactly one of/);
+  no({ frequency: "monthly", month_days: [32] }, /days 1 to 31/);
+  no({ frequency: "yearly", day: 20 }, /needs repeat\.month/);
+  no({ frequency: "yearly", month: 2, day: 30 }, /day of February \(1 to 29\)/);
+  no({ frequency: "daily", interval: 0 }, /interval must be a whole number from 1 to 999/);
+  no({ frequency: "daily", interval: 1000 }, /interval/);
+  no({ frequency: "daily", interval: 1.5 }, /interval/);
+  no({ frequency: "daily", ends: { after: 0 } }, /ends\.after/);
+  no({ frequency: "daily", ends: { on: "2026-12-31", after: 2 } }, /repeat\.ends must be/);
+  no({ frequency: "daily", ends: { on: "2026-11-08" } }, /before the first day/);
+  no({ frequency: "daily", ends: { on: "2026-02-30" } }, /does not exist/);
+  no("daily", /repeat must be an object/);
+});
+
+test("first day of a repeat: next matching day by default, a given start must match", () => {
+  const monday = "2026-11-09";
+  assert.equal(firstRepeatDay({ frequency: "daily" }, monday), monday);
+  assert.equal(firstRepeatDay({ frequency: "weekly", weekdays: ["mon"] }, monday), monday);
+  assert.equal(firstRepeatDay({ frequency: "weekly", weekdays: ["thu", "sun"] }, monday), "2026-11-12");
+  assert.equal(firstRepeatDay({ frequency: "monthly", month_days: [1, 15] }, monday), "2026-11-15");
+  assert.equal(firstRepeatDay({ frequency: "monthly", month_days: ["last"] }, monday), "2026-11-30");
+  assert.equal(firstRepeatDay({ frequency: "monthly", month_days: [31] }, monday), "2026-12-31");
+  assert.equal(firstRepeatDay({ frequency: "monthly", nth_weekday: { nth: 2, weekday: "tue" } }, monday), "2026-11-10");
+  assert.equal(firstRepeatDay({ frequency: "monthly", nth_weekday: { nth: "last", weekday: "fri" } }, monday), "2026-11-27");
+  assert.equal(firstRepeatDay({ frequency: "yearly", month: 11, day: 20 }, monday), "2026-11-20");
+  assert.equal(firstRepeatDay({ frequency: "yearly", month: 11, nth_weekday: { nth: 4, weekday: "thu" } }, monday), "2026-11-26");
+  assert.equal(firstRepeatDay({ frequency: "yearly", month: 2, day: 29 }, monday), "2028-02-29");
+  assert.equal(firstRepeatDay({ frequency: "daily", interval: 4, after_completion: true }, monday), monday);
+
+  const weekly = { frequency: "weekly", weekdays: ["thu"] };
+  assert.equal(repeatStartDay(weekly, undefined, monday), "2026-11-12");
+  assert.equal(repeatStartDay(weekly, "2026-11-19", monday), "2026-11-19");
+  assert.throws(() => repeatStartDay(weekly, "2026-11-13", monday), /not a day this repeat falls on. The next one is 2026-11-19/);
+  assert.throws(() => repeatStartDay(weekly, "2026-11-05", monday), /cannot start in the past.*2026-11-12/);
+});
+
+test("buildRepeatingTaskCreate writes the template fields of the Things app", () => {
+  const repeat = { frequency: "weekly", weekdays: ["mon", "thu"] };
+  const plain = buildTaskCreate({ title: "Water plants", when: "someday", now: 1794200000.5 });
+  const { t, e, p } = buildRepeatingTaskCreate({ title: "Water plants", repeat, start: "2026-11-09", now: 1794200000.5 });
+  assert.equal(t, 0);
+  assert.equal(e, "Task6");
+  assert.deepEqual(Object.keys(p), Object.keys(plain.p));
+  assert.deepEqual(
+    { st: p.st, sb: p.sb, sr: p.sr, tir: p.tir, icsd: p.icsd, ato: p.ato, dd: p.dd, icc: p.icc, ss: p.ss, sp: p.sp, tr: p.tr, tp: p.tp, rt: p.rt, rp: p.rp, acrd: p.acrd },
+    { st: 2, sb: 0, sr: null, tir: 1794182400, icsd: 1794182400, ato: null, dd: null, icc: 0, ss: 0, sp: null, tr: false, tp: 0, rt: [], rp: null, acrd: null }
+  );
+  assert.equal(JSON.stringify(p.rr), '{"fu":256,"fa":1,"of":[{"wd":1},{"wd":4}],"tp":0,"ia":1794182400,"sr":1794182400,"rc":0,"ts":0,"rrv":4,"ed":64092211200}');
+  // Everything but the first day and the rule is what an ordinary Someday create writes.
+  assert.deepEqual({ ...p, tir: null, icsd: null, rr: null, xx: null }, { ...plain.p, xx: null });
+  assert.doesNotThrow(() => validateChangeMap({ [generateUUID()]: { t, e, p } }));
 });

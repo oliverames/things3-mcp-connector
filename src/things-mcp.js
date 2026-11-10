@@ -365,7 +365,7 @@ export class ThingsMCP extends McpAgent {
       "things_get_repeating_todos",
       {
         title: "Get Repeating To-Dos",
-        description: "Fetch repeating to-do templates. Each has \"repeating\": true, \"repeatRule\" (the rule in words) and \"repeat\" (frequency, interval, next occurrence, end, deadline offset). Templates are hidden rule holders: they are left out of lists, search, and project counts, and their schedule can only be changed in Things. The to-dos they generate carry \"repeatTemplateId\".",
+        description: "Fetch repeating to-do templates. Each has \"repeating\": true, \"repeatRule\" (the rule in words) and \"repeat\" (frequency, interval, next occurrence, end, deadline offset). Templates are hidden rule holders: they are left out of lists, search, and project counts, and an existing repeat rule cannot be edited or cleared here (change it in Things), and trashing the template with things_delete_todo stops it. New ones are created with the \"repeat\" option of things_add_todo. The to-dos they generate carry \"repeatTemplateId\".",
         inputSchema: {},
         annotations: {
           title: "Get Repeating To-Dos",
@@ -663,7 +663,7 @@ export class ThingsMCP extends McpAgent {
       "things_add_todo",
       {
         title: "Add To-Do",
-        description: "Create a new to-do in Things 3 with scheduling, reminder alert, deadline, project/heading/area, checklist, and optional dates.",
+        description: "Create a new to-do in Things 3 with scheduling, reminder alert, deadline, project/heading/area, checklist, and optional dates. With \"repeat\" it creates a repeating to-do instead: a hidden template from which Things generates the occurrences. An existing repeat rule cannot be edited or cleared through this connector; trashing the template (things_delete_todo) stops it.",
         inputSchema: {
           title: z.string().describe("Title of the to-do"),
           notes: z.string().optional().describe("Notes / Markdown description"),
@@ -679,6 +679,28 @@ export class ThingsMCP extends McpAgent {
           canceled: z.boolean().optional().describe("Set true if canceled"),
           completion_date: z.string().optional().describe("Completion date in ISO 8601"),
           creation_date: z.string().optional().describe("Creation date in ISO 8601"),
+          repeat: z
+            .object({
+              frequency: z.enum(["daily", "weekly", "monthly", "yearly"]).describe("Repeat unit"),
+              interval: z.number().int().min(1).max(999).optional().describe("Every N units (default 1)"),
+              weekdays: z.array(z.string()).optional().describe("Weekly only, required: weekday names such as ['mon', 'thu']"),
+              month_days: z.array(z.union([z.number().int(), z.literal("last")])).optional().describe("Monthly: days of the month such as [1, 15], or ['last'] for the last day"),
+              nth_weekday: z
+                .object({ nth: z.union([z.number().int(), z.literal("last")]), weekday: z.string() })
+                .optional()
+                .describe("Monthly or yearly: the nth weekday, e.g. {nth: 2, weekday: 'tue'}. nth is 1 to 4, or 'last' for monthly only."),
+              month: z.union([z.number().int(), z.string()]).optional().describe("Yearly only, required: month 1 to 12 or its name"),
+              day: z.number().int().optional().describe("Yearly: day of the month"),
+              starts: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("First day (YYYY-MM-DD). Must be today or later and a day the rule falls on. Defaults to the next such day."),
+              ends: z
+                .union([z.object({ on: z.string().regex(/^\d{4}-\d{2}-\d{2}$/) }).strict(), z.object({ after: z.number().int().min(1).max(999) }).strict()])
+                .optional()
+                .describe("End: {on: 'YYYY-MM-DD'} or {after: N} times. Omit to repeat forever."),
+              after_completion: z.boolean().optional().describe("true repeats N days after each completion instead of on a fixed schedule. Daily only, with no end."),
+            })
+            .strict()
+            .optional()
+            .describe("Make this a repeating to-do. 'when' may then only be left out or give the first day ('today', 'tomorrow', or a date, equal to repeat.starts if both are given). Not allowed with repeat: reminder_time, deadline, completed, canceled, completion_date. Unsupported rules are refused."),
         },
         annotations: {
           title: "Add To-Do",
@@ -705,7 +727,13 @@ export class ThingsMCP extends McpAgent {
           canceled: args.canceled,
           completionDate: args.completion_date,
           creationDate: args.creation_date,
+          repeat: args.repeat,
         });
+        if (result.repeating) {
+          return textResult(
+            `Successfully created repeating to-do "${result.title}" (template ID: ${result.id}). Rule: ${result.repeatRule}. First day: ${result.firstOccurrence}. Things generates the occurrences. The rule cannot be edited or cleared through this connector; trashing the template stops it.`
+          );
+        }
         return textResult(`Successfully created to-do "${result.title}" (ID: ${result.id}) scheduled for ${result.when}.`);
       }
     );

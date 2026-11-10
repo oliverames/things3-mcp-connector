@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { landingPage, loginPage, privacyPage, errorPage } from "./pages.js";
 import { ThingsCloudClient } from "./things-client.js";
-import { encryptJson } from "./oauth-storage.js";
+import { encryptJson } from "./credential-crypto.js";
 
 const app = new Hono();
 
@@ -76,24 +76,9 @@ app.post("/authorize/login", async (c) => {
       );
     }
 
-    // Validate credentials directly with Things Cloud
-    let accountInfo;
-    try {
-      const client = new ThingsCloudClient({ email, password });
-      accountInfo = await client.validateAndFetchAccount();
-    } catch (err) {
-      return c.html(
-        loginPage({
-          clientName: "AI Assistant",
-          consentId,
-          queryParams: oauthParams,
-          error: err.message || "Failed to authenticate with Things Cloud. Please check your email and password.",
-        }),
-        401
-      );
-    }
-
-    // Retrieve original OAuth request info
+    // The OAuth request comes first: without a pending consent record or a valid authorization
+    // request, the password is never sent to Things Cloud, so this endpoint cannot be used on its
+    // own to test whether a password is right.
     let oauthReqInfo = null;
     if (consentId && c.env.OAUTH_KV) {
       try {
@@ -117,36 +102,47 @@ app.post("/authorize/login", async (c) => {
         headers: c.req.raw.headers,
       });
 
-      oauthReqInfo = await c.env.OAUTH_PROVIDER.parseAuthRequest(dummyReq);
+      try {
+        oauthReqInfo = await c.env.OAUTH_PROVIDER.parseAuthRequest(dummyReq);
+      } catch (_) {
+        oauthReqInfo = null;
+      }
     }
 
     if (!oauthReqInfo?.clientId) {
       return c.html(errorPage("Authorization request expired or invalid. Please restart connection from your AI client."), 400);
     }
 
-    const grantId = crypto.randomUUID();
-
-    // Store credentials securely in Durable Object
-    const credDO = c.env.OAUTH_CREDENTIALS.get(c.env.OAUTH_CREDENTIALS.idFromName(grantId));
-    await credDO.setCredentials({
-      email,
-      password,
-      historyKey: accountInfo.historyKey,
-      mailDropEmail: accountInfo.mailDropEmail,
-    });
-
-    let encryptedCredentials = null;
-    if (c.env.DATA_ENCRYPTION_KEY) {
-      encryptedCredentials = await encryptJson(
-        {
-          email,
-          password,
-          historyKey: accountInfo.historyKey,
-          mailDropEmail: accountInfo.mailDropEmail,
-        },
-        c.env.DATA_ENCRYPTION_KEY
+    // Validate credentials directly with Things Cloud
+    let accountInfo;
+    try {
+      const client = new ThingsCloudClient({ email, password });
+      accountInfo = await client.validateAndFetchAccount();
+    } catch (err) {
+      return c.html(
+        loginPage({
+          clientName: "AI Assistant",
+          consentId,
+          queryParams: oauthParams,
+          error: err.message || "Failed to authenticate with Things Cloud. Please check your email and password.",
+        }),
+        401
       );
     }
+
+    // The credentials are stored once, encrypted, in the grant's props. The provider deletes the
+    // props with the grant, both when the grant is revoked and when a new sign-in by the same
+    // user and client replaces it (completeAuthorization revokes the earlier grants by default),
+    // so nothing outlives the grant.
+    const encryptedCredentials = await encryptJson(
+      {
+        email,
+        password,
+        historyKey: accountInfo.historyKey,
+        mailDropEmail: accountInfo.mailDropEmail,
+      },
+      c.env.DATA_ENCRYPTION_KEY
+    );
 
     const scopes = Array.isArray(oauthReqInfo.scope)
       ? oauthReqInfo.scope
@@ -162,7 +158,6 @@ app.post("/authorize/login", async (c) => {
       },
       scope: scopes.length > 0 ? scopes : ["read", "write"],
       props: {
-        grantId,
         email,
         historyKey: accountInfo.historyKey,
         encryptedCredentials,

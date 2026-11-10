@@ -1,46 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
+import { encryptJson, decryptJson, readStoredCredentials } from "./credential-crypto.js";
 
-async function getEncryptionKey(rawKey) {
-  const enc = new TextEncoder();
-  const keyBytes = enc.encode(rawKey.padEnd(32, "0").slice(0, 32));
-  return await crypto.subtle.importKey(
-    "raw",
-    keyBytes,
-    { name: "AES-GCM" },
-    false,
-    ["encrypt", "decrypt"]
-  );
-}
+export { encryptJson, decryptJson };
 
-export async function encryptJson(data, secretKey) {
-  const key = await getEncryptionKey(secretKey);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const plaintext = new TextEncoder().encode(JSON.stringify(data));
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    key,
-    plaintext
-  );
-  const combined = new Uint8Array(iv.length + ciphertext.byteLength);
-  combined.set(iv, 0);
-  combined.set(new Uint8Array(ciphertext), iv.length);
-  return btoa(String.fromCharCode(...combined));
-}
-
-export async function decryptJson(encoded, secretKey) {
-  const key = await getEncryptionKey(secretKey);
-  const bytes = Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0));
-  const iv = bytes.slice(0, 12);
-  const ciphertext = bytes.slice(12);
-  const decrypted = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv },
-    key,
-    ciphertext
-  );
-  return JSON.parse(new TextDecoder().decode(decrypted));
-}
-
-// Durable Object to store credentials per grant/session
+// Per-grant credential store used by grants made before 2026-11-09. New sign-ins keep their
+// credentials only in the grant's encrypted props, which the OAuth provider deletes with the
+// grant. An old grant's copy here is deleted the next time that grant gets a token (see
+// upgradeGrantProps); until then it stays readable as a fallback.
 export class OAuthCredentials extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -55,9 +21,7 @@ export class OAuthCredentials extends DurableObject {
   }
 
   async getCredentials() {
-    const encrypted = await this.ctx.storage.get("credentials");
-    if (!encrypted) return null;
-    return await decryptJson(encrypted, this.env.DATA_ENCRYPTION_KEY);
+    return readStoredCredentials(this.ctx.storage, this.env.DATA_ENCRYPTION_KEY);
   }
 
   async clear() {

@@ -22,7 +22,7 @@ This connector talks directly to Things Cloud using its native wire format (`Tas
   - `things_batch_update_todos`: Batch complete, cancel, trash, reschedule, or set dates (`completion_date`, `creation_date`, `deadline`) across multiple to-dos simultaneously.
   - `things_import_json`: Atomic multi-entity import and update in a single sync transaction.
 - **Incremental Cached Sync**: Fast in-memory state with 15-second cache TTL, 429 rate limit backoff, and automatic pagination handling.
-- **Security & OAuth**: Cloudflare Workers OAuth 2.0 provider integration with per-user credential encryption and rotated secrets.
+- **Security & OAuth**: Cloudflare Workers OAuth 2.0 provider integration. Things credentials are stored once, inside the grant, encrypted with AES-256-GCM under a key derived from the `DATA_ENCRYPTION_KEY` secret with HKDF-SHA-256 (see Behavior Notes).
 
 ---
 
@@ -31,8 +31,8 @@ This connector talks directly to Things Cloud using its native wire format (`Tas
 ### Import & Bulk Operations
 - `things_import_json`: Import or update complex structured projects, headings, to-dos, checklists, and tags using Things JSON format in a single atomic sync commit.
 - `things_import_csv`: Import tasks into Things 3 from CSV exports (supports Asana, Todoist, OmniFocus, and standard spreadsheet formats) with automatic mapping of titles, notes, due dates, creation dates, completion dates, and project/area assignment.
-- `things_batch_update_todos`: Perform batch operations (`complete`, `cancel`, `trash`, `reschedule`, `set_dates`) across multiple to-do UUIDs.
-- `things_batch_update_projects`: Perform batch operations (`complete`, `cancel`, `trash`, `reschedule`, `set_area`, `set_dates`) across multiple project UUIDs.
+- `things_batch_update_todos`: Perform batch operations (`complete`, `cancel`, `trash`, `reschedule`, `set_dates`) across multiple to-do UUIDs. A field the operation does not use is an error.
+- `things_batch_update_projects`: Perform batch operations (`complete`, `cancel`, `trash`, `reschedule`, `set_area`, `set_dates`) across multiple project UUIDs. A field the operation does not use is an error.
 
 ### To-Dos & Checklists
 - `things_add_todo`: Create a new to-do with scheduling, reminder alert, deadline, container, checklist, and dates. The `repeat` option creates a repeating to-do (see Behavior Notes).
@@ -60,12 +60,12 @@ This connector talks directly to Things Cloud using its native wire format (`Tas
 - `things_update_heading`: Rename or permanently delete a section heading.
 
 ### Lists & Views
-- `things_get_today`: Retrieve the Today list as Things shows it: start dates that have arrived, plus undated to-dos whose deadline is today or overdue.
+- `things_get_today`: Retrieve the Today list as Things shows it: start dates that have arrived, plus undated to-dos whose deadline is today or overdue. Takes an optional `timezone`.
 - `things_get_inbox`: Retrieve unorganized Inbox to-dos.
-- `things_get_upcoming`: Retrieve future scheduled tasks and future deadlines.
+- `things_get_upcoming`: Retrieve future scheduled tasks and future deadlines. Takes an optional `timezone`.
 - `things_get_anytime`: Retrieve Anytime tasks filtered by area or tag.
 - `things_get_someday`: Retrieve Someday tasks.
-- `things_get_logbook`: Retrieve completed or canceled items sorted by completion date, with optional `since` and `until` filtering. A bare `YYYY-MM-DD` is a calendar day in the connector's time zone.
+- `things_get_logbook`: Retrieve completed or canceled items sorted by completion date, with optional `since` and `until` filtering. A bare `YYYY-MM-DD` is a calendar day in the connector's time zone, or in `timezone` when given.
 - `things_get_trash`: Retrieve trashed items.
 - `things_get_repeating_todos`: Retrieve repeating templates with their rule in words.
 
@@ -75,7 +75,7 @@ This connector talks directly to Things Cloud using its native wire format (`Tas
 - `things_empty_trash`: Permanently purge all trashed items. A trashed project or heading is purged with everything inside it.
 - `things_get_account_info`: Account status, Maildrop address, and database counts. The history key is not returned.
 - `things_manage_maildrop`: Get, reset, or clear the Maildrop address. Reset and clear invalidate the current address for good.
-- `things_get_daily_summary` / `things_get_deadlines` / `things_search`: Daily briefing, deadline overview, and search (trashed items, headings, and repeating templates are not searched).
+- `things_get_daily_summary` / `things_get_deadlines` / `things_search`: Daily briefing, deadline overview, and search (trashed items, headings, and repeating templates are not searched). The first two take an optional `timezone`.
 - `things_export_markdown`: Export an entire project or Inbox to formatted Markdown.
 - `things_get_deep_link`: Generate a `things:///show?id=...` URL.
 
@@ -106,6 +106,11 @@ This connector talks directly to Things Cloud using its native wire format (`Tas
 - **`things_import_json` updates.** `checklist-items` replaces the checklist, `append-checklist-items` adds to it, `add-tags` adds tags, and two updates for the same id are merged into one change.
 - **`things_import_csv`** files rows into projects, areas, and headings that already exist. It creates to-dos only.
 - **Login pages** escape every value they show and are served with a Content-Security-Policy that allows no scripts.
+- **Concurrent edits.** When Things Cloud rejects a commit because another device committed first, the connector syncs and tries again. Anything it computed from the old state is computed again from the new one before the retry: the full tag list of an item when a tag is added, removed, or deleted, the position of new checklist items, the checklist being replaced, the open to-dos of a project being closed, the contents of an area being deleted or a Trash being emptied, appended notes, and a whole `things_import_json` plan. A tag another device added in between is therefore kept. A plain field change (a new title, for example) is resent as it was. New items keep the same ids across retries, so a retry cannot create a duplicate. If the rebuilt change is no longer possible (the item was deleted in between), the call fails and nothing is written. Emptying the Trash after a conflict purges only what was in the Trash when the tool was called and is still there.
+- **Batch fields.** Each batch operation takes only its own fields, and any other field is an error that names it, with nothing written. For to-dos: `complete` and `cancel` take `completion_date`; `trash` takes none; `reschedule` takes `when`; `set_dates` takes `deadline`, `completion_date`, `creation_date`. Projects are the same, plus `set_area` with `area`, and `set_dates` also takes `when` and `area`.
+- **Closed projects.** A new open to-do cannot be filed into a completed or canceled project, or under one of its headings: it would be hidden in the Logbook with the project. The error names the project. A to-do created as completed or canceled is accepted there, so finished work can be imported into a finished project. Importing a completed project together with open to-dos inside it is refused for the same reason.
+- **Time zone.** "Today" is the calendar day in `USER_TIMEZONE` (America/New_York). `things_get_today`, `things_get_upcoming`, `things_get_deadlines`, `things_get_daily_summary`, and `things_get_logbook` take an optional `timezone` (an IANA name such as `Europe/Paris`; an unknown name is an error) to answer for another zone in that one call. Writes always use the configured zone: `when: "today"` means today in `USER_TIMEZONE`.
+- **Stored credentials.** The Things email and password are stored once, encrypted, in the OAuth grant. The provider deletes them with the grant when it is revoked, and when a new sign-in by the same user and client replaces it. The key is derived from `DATA_ENCRYPTION_KEY` with HKDF-SHA-256. Records written with the earlier key (the first 32 characters of the secret) still open, and are re-encrypted the next time the grant gets a token. Grants made before 2026-11-09 also kept a copy in a per-grant Durable Object; that copy is deleted the next time the grant gets a token. The sign-in form checks for a pending authorization request before it sends the password to Things Cloud.
 
 ---
 

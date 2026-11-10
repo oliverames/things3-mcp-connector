@@ -4,6 +4,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { loginPage, errorPage, withSecurityHeaders } from "../src/pages.js";
+import { encryptJson, encryptJsonLegacy, decryptJson, decryptJsonDetailed, readStoredCredentials, upgradeGrantProps } from "../src/credential-crypto.js";
+import { ThingsHandler } from "../src/things-handler.js";
 import {
   describeRepeatRule,
   ThingsCloudClient,
@@ -599,8 +601,37 @@ test("a stale-cache update is re-validated against the fresh head before a retry
       }
     },
   });
-  await assert.rejects(client.updateTodo(t, { project: p }), /pr reference/);
+  // The update is rebuilt against the fresh state, where the project no longer resolves.
+  await assert.rejects(client.updateTodo(t, { project: p }), /No project found.*nothing was written/);
   assert.equal(commits.length, 1);
+});
+
+test("a plain patch is resent unchanged after a conflict, and still re-validated", async () => {
+  const [p, t] = [generateUUID(), generateUUID()];
+  const gone = cloud([project(p), todo(t)], {
+    onCommit: (n, body, history) => {
+      if (n === 1) {
+        history.push({ [p]: { t: 2, e: "Task6", p: {} } });
+        return new Response("conflict", { status: 409 });
+      }
+    },
+  });
+  await assert.rejects(gone.client.commitChanges([{ [t]: { t: 1, e: "Task6", p: { pr: [p], st: 1 } } }]), /pr reference/);
+  assert.equal(gone.commits.length, 1);
+
+  const other = generateUUID();
+  const ok = cloud([todo(t)], {
+    onCommit: (n, body, history) => {
+      if (n === 1) {
+        history.push(todo(other));
+        return new Response("conflict", { status: 409 });
+      }
+    },
+  });
+  await ok.client.commitChanges([{ [t]: { t: 1, e: "Task6", p: { tt: "renamed", md: 1794000000 } } }]);
+  assert.equal(ok.commits.length, 2);
+  assert.deepEqual(ok.commits[1].body, ok.commits[0].body);
+  assert.match(ok.commits[1].url, /ancestor-index=2/);
 });
 
 // --- read path --------------------------------------------------------------------------------------------
@@ -1477,4 +1508,282 @@ test("things_update_repeat stop: unsampled cases are refused, and the validator 
   bad({ icsd: S.nov10 }, /needs icsd null/);
   bad({ tir: S.nov9 }, /sr and tir on the same day/);
   bad({ sr: 1794355200, tir: 1794355200 }, /must be on the template's next day/);
+});
+
+// --- hardening 2026-11-09: rebuild after a conflict, batch fields, closed projects, credentials, time zone ---
+
+// A cloud whose first commit is answered 409 after `other` (a change map from another client) landed.
+const conflictOnce = (items, other) =>
+  cloud(items, {
+    onCommit: (n, body, history) => {
+      if (n !== 1) return undefined;
+      history.push(typeof other === "function" ? other(body) : other);
+      return new Response("conflict", { status: 409 });
+    },
+  });
+
+test("adding or removing a tag after a conflict keeps the tag another client added in between", async () => {
+  const [t, a, b, c] = [generateUUID(), generateUUID(), generateUUID(), generateUUID()];
+  const items = [tag(a), tag(b), tag(c), todo(t, { tg: [a] })];
+  const theirs = { [t]: { t: 1, e: "Task6", p: { tg: [a, b], md: 1794000000.5 } } };
+
+  const add = conflictOnce(items, theirs);
+  await add.client.addTagsToTask(t, [c]);
+  assert.deepEqual(add.commits[0].body[t].p.tg, [a, c]); // built from the stale read
+  assert.deepEqual(add.commits[1].body[t].p.tg, [a, b, c]); // rebuilt: b is kept
+  assert.deepEqual((await add.client.syncDatabase()).tasks.get(t).tags, [a, b, c]);
+
+  const remove = conflictOnce(items, theirs);
+  await remove.client.removeTagsFromTask(t, [a]);
+  assert.deepEqual(remove.commits[1].body[t].p.tg, [b]);
+
+  // import_json add-tags and append-notes are the same read-modify-write.
+  const imp = conflictOnce(items, { [t]: { t: 1, e: "Task6", p: { tg: [a, b], nt: noteObject("theirs. "), md: 1794000000.5 } } });
+  await imp.client.importJson([{ type: "to-do", operation: "update", id: t, attributes: { "add-tags": [c], "append-notes": "ours" } }]);
+  assert.deepEqual(imp.commits[1].body[t].p.tg, [a, b, c]);
+  assert.equal(imp.commits[1].body[t].p.nt.v, "theirs. ours");
+});
+
+test("deleting a tag after a conflict also clears it from an item that got it in between", async () => {
+  const [t1, t2, g] = [generateUUID(), generateUUID(), generateUUID()];
+  const { client, commits } = conflictOnce([tag(g), todo(t1, { tg: [g] }), todo(t2)], { [t2]: { t: 1, e: "Task6", p: { tg: [g], md: 1794000000.5 } } });
+  await client.deleteTag(g);
+  assert.deepEqual(Object.keys(commits[0].body).sort(), [g, t1].sort());
+  assert.deepEqual(Object.keys(commits[1].body).sort(), [g, t1, t2].sort());
+  assert.deepEqual(commits[1].body[t2].p.tg, []);
+  assert.deepEqual(commits[1].body[g], { t: 2, e: "Tag4", p: {} });
+});
+
+test("checklist items added after a conflict go after the item another client added, under the same new ids", async () => {
+  const [t, c1, c2] = [generateUUID(), generateUUID(), generateUUID()];
+  const theirs = { [c2]: { t: 0, e: "ChecklistItem3", p: { tt: "theirs", ts: [t], ss: 0, ix: 1 } } };
+  const first = { [c1]: { t: 0, e: "ChecklistItem3", p: { tt: "first", ts: [t], ss: 0, ix: 0 } } };
+
+  const add = conflictOnce([todo(t), first], theirs);
+  const created = await add.client.addChecklistItems(t, ["x", "y"]);
+  const ids = created.map((c) => c.id);
+  assert.deepEqual(Object.keys(add.commits[0].body), ids);
+  assert.deepEqual(Object.keys(add.commits[1].body), ids); // a retry never mints a second set
+  assert.deepEqual(ids.map((id) => add.commits[0].body[id].p.ix), [1, 2]);
+  assert.deepEqual(ids.map((id) => add.commits[1].body[id].p.ix), [2, 3]);
+
+  // Replacing the checklist tombstones the item that arrived in between as well.
+  const set = conflictOnce([todo(t), first], theirs);
+  await set.client.setChecklist(t, ["only"]);
+  assert.ok(!(c2 in set.commits[0].body));
+  assert.deepEqual(set.commits[1].body[c2], { t: 2, e: "ChecklistItem3", p: {} });
+  assert.deepEqual(set.commits[1].body[c1], { t: 2, e: "ChecklistItem3", p: {} });
+});
+
+test("closing a project after a conflict also closes a to-do another client added to it, and an import keeps its ids", async () => {
+  const [p, t1, t2] = [generateUUID(), generateUUID(), generateUUID()];
+  const { client, commits } = conflictOnce([project(p), todo(t1, { pr: [p] })], todo(t2, { pr: [p] }));
+  const result = await client.updateProject(p, { status: "completed" });
+  assert.deepEqual(Object.keys(commits[1].body).sort(), [p, t1, t2].sort());
+  assert.equal(commits[1].body[t2].p.ss, 3);
+  assert.equal(result.todosClosed, 2);
+
+  const imp = conflictOnce([project(p)], todo(t1));
+  const out = await imp.client.importJson([{ type: "to-do", attributes: { title: "new", list: p, "checklist-items": ["a", "b"] } }]);
+  assert.deepEqual(Object.keys(imp.commits[1].body), Object.keys(imp.commits[0].body));
+  assert.equal(Object.keys(imp.commits[1].body).length, 3);
+  assert.equal(out.items[0].id, Object.keys(imp.commits[1].body)[0]);
+});
+
+test("emptying the Trash after a conflict leaves alone what was restored in between", async () => {
+  const [t1, t2] = [generateUUID(), generateUUID()];
+  const { client, commits } = conflictOnce([todo(t1, { tr: true }), todo(t2, { tr: true })], { [t2]: { t: 1, e: "Task6", p: { tr: false, md: 1794000000.5 } } });
+  const result = await client.emptyTrash();
+  assert.deepEqual(Object.keys(commits[0].body).sort(), [t1, t2].sort());
+  assert.deepEqual(Object.keys(commits[1].body), [t1]);
+  assert.equal(result.purgedCount, 1);
+});
+
+test("a batch field the operation does not use is an error that names it, with nothing written", async () => {
+  const [t, p, a] = [generateUUID(), generateUUID(), generateUUID()];
+  const { client, commits } = cloud([todo(t), project(p), area(a)]);
+  const no = (promise, field) => assert.rejects(promise, (err) => err.message.includes(`does not use "${field}"`) && /Nothing was written/.test(err.message));
+  await no(client.batchUpdateTodos([t], "complete", { when: "today" }), "when");
+  await no(client.batchUpdateTodos([t], "complete", { deadline: "2027-01-05" }), "deadline");
+  await no(client.batchUpdateTodos([t], "trash", { completion_date: "2026-08-25T12:00:00Z" }), "completion_date");
+  await no(client.batchUpdateTodos([t], "reschedule", { when: "today", creationDate: "2026-08-25T12:00:00Z" }), "creation_date");
+  await no(client.batchUpdateTodos([t], "set_dates", { deadline: "2027-01-05", when: "today" }), "when");
+  await no(client.batchUpdateProjects([p], "complete", { area: a }), "area");
+  await no(client.batchUpdateProjects([p], "trash", { deadline: "2027-01-05" }), "deadline");
+  await no(client.batchUpdateProjects([p], "set_area", { area: a, when: "someday" }), "when");
+  await no(client.batchUpdateProjects([p], "reschedule", { when: "someday", deadline: "2027-01-05" }), "deadline");
+  await assert.rejects(client.batchUpdateTodos([t], "archive"), /Unknown to-do batch operation "archive"/);
+  assert.equal(commits.length, 0);
+
+  // Fields that belong to the operation are written; absent ones (undefined, null) are not an error.
+  await client.batchUpdateTodos([t], "reschedule", { when: "someday", deadline: undefined, completionDate: null });
+  await client.batchUpdateProjects([p], "set_area", { area: a });
+  assert.equal(commits.length, 2);
+  assert.equal(commits[0].body[t].p.st, 2);
+  assert.deepEqual(commits[1].body[p].p.ar, [a]);
+});
+
+test("a new open to-do is not filed into a completed or canceled project; a finished one is", async () => {
+  const [done, dropped, live, h, hLive] = [generateUUID(), generateUUID(), generateUUID(), generateUUID(), generateUUID()];
+  const { client, commits } = cloud([
+    project(done, { tt: "Old", ss: 3, sp: 1794000000 }),
+    project(dropped, { tt: "Dropped", ss: 2, sp: 1794000000 }),
+    project(live, { tt: "Live" }),
+    heading(h, done, { tt: "Done part" }),
+    heading(hLive, live, { tt: "Live part" }),
+  ]);
+  await assert.rejects(client.createTodo({ title: "x", project: done }), /project "Old" \(.+\) is completed, so a new open to-do cannot be filed into it/);
+  await assert.rejects(client.createTodo({ title: "x", project: dropped }), /project "Dropped" \(.+\) is canceled/);
+  await assert.rejects(client.createTodo({ title: "x", heading: h }), /is completed, so a new open to-do cannot be filed into it or under its headings/);
+  await assert.rejects(client.importJson([{ type: "to-do", attributes: { title: "x", list: done } }]), /is completed/);
+  assert.equal(commits.length, 0);
+
+  await client.createTodo({ title: "finished there", project: done, completed: true, completionDate: "2026-08-25T12:00:00Z" });
+  await client.createTodo({ title: "dropped there", heading: h, canceled: true });
+  await client.createTodo({ title: "open in a live project", project: live });
+  await client.createTodo({ title: "open under a live heading", heading: hLive });
+  assert.equal(commits.length, 4);
+  assert.equal(Object.values(commits[0].body)[0].p.ss, 3);
+  assert.deepEqual(Object.values(commits[0].body)[0].p.pr, [done]);
+});
+
+test("stored credentials: HKDF round trip, and a record encrypted the old way is read and re-encrypted", async () => {
+  const secret = "s3cret-key-that-is-longer-than-thirty-two-characters";
+  const creds = { email: "a@b.c", password: "p\u00e4ss w\u00f6rd", historyKey: "KEY" };
+
+  const sealed = await encryptJson(creds, secret);
+  assert.deepEqual(await decryptJson(sealed, secret), creds);
+  assert.deepEqual(await decryptJsonDetailed(sealed, secret), { data: creds, legacy: false });
+  assert.notEqual(await encryptJson(creds, secret), sealed); // a fresh IV every time
+  assert.ok(!sealed.includes("p\u00e4ss"));
+
+  // The old key was the first 32 characters of the secret, so a secret sharing that prefix opened
+  // old records. The derived key uses the whole secret.
+  const samePrefix = secret.slice(0, 32) + "-but-different";
+  const old = await encryptJsonLegacy(creds, secret);
+  assert.deepEqual(await decryptJsonDetailed(old, secret), { data: creds, legacy: true });
+  assert.deepEqual(await decryptJson(old, samePrefix), creds);
+  await assert.rejects(decryptJson(sealed, samePrefix), /could not be decrypted/);
+  await assert.rejects(decryptJson(sealed, "another secret"), (err) => !err.message.includes("KEY") && /re-authenticate/.test(err.message));
+  await assert.rejects(encryptJson(creds, undefined), /DATA_ENCRYPTION_KEY is not set/);
+
+  // The Durable Object record is rewritten under the derived key on its first read.
+  const map = new Map([["credentials", old]]);
+  const storage = { get: async (k) => map.get(k), put: async (k, v) => void map.set(k, v) };
+  assert.deepEqual(await readStoredCredentials(storage, secret), creds);
+  assert.notEqual(map.get("credentials"), old);
+  assert.deepEqual(await decryptJsonDetailed(map.get("credentials"), secret), { data: creds, legacy: false });
+  assert.equal(await readStoredCredentials({ get: async () => undefined }, secret), null);
+});
+
+test("a grant's props are upgraded when it gets a token: re-encrypted, and the second stored copy deleted", async () => {
+  const secret = "another-long-secret-for-the-grant-props-test";
+  const creds = { email: "a@b.c", password: "pw", historyKey: "KEY" };
+  const cleared = [];
+  const clear = async (id) => void cleared.push(id);
+
+  const oldProps = { grantId: "g-1", email: "a@b.c", historyKey: "KEY", encryptedCredentials: await encryptJsonLegacy(creds, secret) };
+  const next = await upgradeGrantProps(oldProps, secret, clear);
+  assert.deepEqual(cleared, ["g-1"]);
+  assert.ok(!("grantId" in next));
+  assert.deepEqual(await decryptJsonDetailed(next.encryptedCredentials, secret), { data: creds, legacy: false });
+  assert.equal(next.email, "a@b.c");
+
+  assert.equal(await upgradeGrantProps(next, secret, clear), null); // already current: nothing to do
+  assert.equal(await upgradeGrantProps({ grantId: "g-2" }, secret, clear), null); // the copy is the only one: kept
+  assert.equal(await upgradeGrantProps({ grantId: "g-3", encryptedCredentials: await encryptJson({ email: "a@b.c" }, secret) }, secret, clear), null);
+  assert.deepEqual(cleared, ["g-1"]);
+});
+
+test("sign-in checks the OAuth request before the password reaches Things Cloud, and stores credentials only in the grant", async (t) => {
+  const secret = "sign-in-test-secret-that-is-long-enough-to-use";
+  const realFetch = globalThis.fetch;
+  const thingsCalls = [];
+  globalThis.fetch = async (url) => {
+    thingsCalls.push(String(url));
+    return new Response(JSON.stringify({ email: "a@b.c", status: "SYAccountStatusActive", "history-key": "KEY" }));
+  };
+  t.after(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  const kv = new Map();
+  const completed = [];
+  const env = {
+    DATA_ENCRYPTION_KEY: secret,
+    OAUTH_KV: { get: async (k) => kv.get(k) ?? null, put: async (k, v) => void kv.set(k, v), delete: async (k) => void kv.delete(k) },
+    OAUTH_PROVIDER: {
+      parseAuthRequest: async () => {
+        throw new Error("Invalid client");
+      },
+      completeAuthorization: async (options) => {
+        completed.push(options);
+        return { redirectTo: "https://client.example/callback?code=abc" };
+      },
+    },
+    // No OAUTH_CREDENTIALS binding: a write to the per-grant store would throw.
+  };
+  const post = (fields) =>
+    ThingsHandler.request("/authorize/login", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(fields).toString() }, env, { waitUntil() {}, passThroughOnException() {} });
+
+  // No consent record and no valid authorization request: refused without asking Things Cloud.
+  const refusedRes = await post({ email: "a@b.c", password: "guess", consentId: "nope", oauthParams: encodeURIComponent(JSON.stringify({ client_id: "x" })) });
+  assert.equal(refusedRes.status, 400);
+  assert.match(await refusedRes.text(), /Authorization request expired or invalid/);
+  assert.equal(thingsCalls.length, 0);
+  assert.equal(completed.length, 0);
+
+  // A pending consent record: the password is checked, and the grant carries the only copy.
+  kv.set("consent:c-1", JSON.stringify({ clientId: "client-1", scope: ["read", "write"] }));
+  const okRes = await post({ email: "a@b.c", password: "right", consentId: "c-1" });
+  assert.equal(okRes.status, 302);
+  assert.equal(thingsCalls.length, 1);
+  const { props, metadata } = completed[0];
+  assert.ok(!("grantId" in props) && !("password" in props) && !("credentials" in props));
+  assert.ok(!JSON.stringify({ props, metadata }).includes("right"));
+  assert.deepEqual(await decryptJsonDetailed(props.encryptedCredentials, secret), { data: { email: "a@b.c", password: "right", historyKey: "KEY", mailDropEmail: null }, legacy: false });
+});
+
+test("date-dependent reads can be asked in another time zone; the database and writes keep the configured one", () => {
+  const [east, west] = ["Pacific/Kiritimati", "Pacific/Pago_Pago"]; // UTC+14 and UTC-11: never the same calendar day
+  const eastDay = localDate(east);
+  const westDay = localDate(west);
+  assert.equal(addDays(westDay, 1), eastDay);
+  const now = Math.floor(Date.now() / 1000);
+  const [start, due, finished] = [generateUUID(), generateUUID(), generateUUID()];
+  const db = dbOf(
+    todo(start, { tt: "starts on the eastern today", st: 1, sr: dateToTimestamp(eastDay), tir: dateToTimestamp(eastDay) }),
+    todo(due, { tt: "due on the eastern today", st: 1, dd: dateToTimestamp(eastDay) }),
+    todo(finished, { tt: "finished just now", ss: 3, sp: now })
+  );
+  const titles = (list) => list.map((x) => x.title);
+
+  const inEast = db.inTimeZone(east);
+  const inWest = db.inTimeZone(west);
+  assert.deepEqual(titles(inEast.getToday()).sort(), ["due on the eastern today", "starts on the eastern today"]);
+  assert.deepEqual(titles(inWest.getToday()), []);
+  assert.deepEqual(titles(inWest.getUpcoming(3)).sort(), ["due on the eastern today", "starts on the eastern today"]);
+  assert.deepEqual(titles(inEast.getUpcoming(3)), []);
+  assert.deepEqual(titles(inEast.getDeadlines().dueToday), ["due on the eastern today"]);
+  assert.deepEqual(titles(inWest.getDeadlines().dueSoon), ["due on the eastern today"]);
+  assert.equal(inEast.getDailySummary().date, eastDay);
+  assert.equal(inEast.getDailySummary().completedTodayCount, 1);
+  assert.equal(inWest.getDailySummary().date, westDay);
+  assert.deepEqual(titles(inEast.getLogbook({ since: eastDay, until: eastDay })), ["finished just now"]);
+  assert.deepEqual(titles(inWest.getLogbook({ since: eastDay, until: eastDay })), []);
+  assert.deepEqual(titles(inWest.getLogbook({ since: westDay, until: westDay })), ["finished just now"]);
+
+  assert.equal(db.timeZone, TZ); // the shared database is not changed by a read in another zone
+  assert.equal(db.today(), localDate(TZ));
+  for (const bad of ["Mars/Olympus", "", "EST5", 5]) assert.throws(() => db.inTimeZone(bad), /is not a time zone this server knows/);
+
+  // Only the five date-dependent read tools take the argument.
+  const src = readFileSync(new URL("../src/things-mcp.js", import.meta.url), "utf8");
+  assert.equal(src.match(/timezone: timezoneArg/g).length, 5);
+  for (const tool of ["things_get_today", "things_get_upcoming", "things_get_logbook", "things_get_daily_summary", "things_get_deadlines"]) {
+    const block = src.slice(src.indexOf(`"${tool}"`), src.indexOf("server.registerTool(", src.indexOf(`"${tool}"`)));
+    assert.match(block, /timezone: timezoneArg/, tool);
+    assert.match(block, /inZone\(db, timezone\)/, tool);
+  }
+  assert.match(src, /new ThingsCloudClient\(\{ \.\.\.creds, timeZone: this\.env\.USER_TIMEZONE \}\)/);
 });

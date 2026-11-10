@@ -4,6 +4,7 @@ import { OAuthCredentials } from "./oauth-storage.js";
 import { ThingsHandler } from "./things-handler.js";
 import { CONNECTOR_RESOURCE_METADATA, CONNECTOR_ORIGIN } from "./brand-assets.js";
 import { withSecurityHeaders } from "./pages.js";
+import { upgradeGrantProps } from "./credential-crypto.js";
 
 export { ThingsMCP, OAuthCredentials };
 
@@ -19,10 +20,29 @@ const provider = new OAuthProvider({
   scopesSupported: ["read", "write"],
   resourceMetadata: CONNECTOR_RESOURCE_METADATA,
   allowPlainPKCE: false,
+  // Each time a grant gets a token, bring its stored credentials up to date: re-encrypt props
+  // still under the old key, and delete the second copy older grants kept in a Durable Object.
+  // A failure here must not block the token, and nothing about the credentials is logged.
+  tokenExchangeCallback: async ({ props }) => {
+    const workerEnv = currentEnv;
+    if (!workerEnv) return;
+    try {
+      const newProps = await upgradeGrantProps(props, workerEnv.DATA_ENCRYPTION_KEY, (grantId) =>
+        workerEnv.OAUTH_CREDENTIALS.get(workerEnv.OAUTH_CREDENTIALS.idFromName(grantId)).clear()
+      );
+      if (newProps) return { newProps };
+    } catch {
+      console.error("Stored credentials for a grant could not be upgraded; the grant is unchanged.");
+    }
+  },
 });
+
+// The provider's callbacks get no env argument; fetch records the one it was called with.
+let currentEnv = null;
 
 export default {
   async fetch(request, env, ctx) {
+    currentEnv = env;
     const url = new URL(request.url);
 
     // Plain HTTP for the connector's own host goes to HTTPS (same path and query),

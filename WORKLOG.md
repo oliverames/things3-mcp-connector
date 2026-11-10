@@ -1,5 +1,35 @@
 # Things MCP connector worklog
 
+## 2026-11-09 - Remaining hardening items from the audit (uncommitted, not deployed)
+
+These five were declined in the audit pass as small benefit and are now done. Nothing was written to Things Cloud and nothing was deployed; all of it is covered by tests against a mocked fetch. No new wire shape is written: every change sends the same entities and keys as before.
+
+**1. Read-modify-write after a conflict** (`src/things-client.js`). `commitChanges` takes either a list of change maps (a plain patch, resent unchanged as before) or a builder `(db) => list`. A builder runs against the synced database and runs again against the refreshed one before every resend, after a 409 or 412 and after a 5xx whose commit the history shows did not land. Validation, the "did it land" check, and the retry limit are unchanged. Builders mint ids and timestamps outside themselves, so every run names the same new items. Now builders: `updateTask` (so `updateTodo`, `updateProject`, `moveTodo`, and closing a project), `addTagsToTask` and `removeTagsFromTask` (through the new `retagTask`), `deleteTag` and `deleteEntity` (the `purgeChanges` cascade), `deleteArea`, `emptyTrash`, `addChecklistItems`, `setChecklist`, `convertTodoToProject`, both batches (`commitBatch`), `updateRepeat` (planned in `planRepeatUpdate`), and `importJson` (planned in `planImport`, ids from one ordered pool). Still plain lists: creates, and the single-field updates of headings, areas, tags, and checklist items. If a rebuild throws (the item is gone), the error says Things changed and nothing was written. `emptyTrash` rebuilt after a conflict purges only what was trashed at the first read and still is.
+
+**2. Batch fields.** `batchOptions` checks the options of `batchUpdateTodos` and `batchUpdateProjects` against a table per operation. A field the operation does not use is an error naming it, and so is an unknown operation. Before, `when` and `deadline` were applied on every operation. The tool descriptions list the fields per operation.
+
+**3. Closed projects.** The validator refuses the create of an open to-do whose project, directly or through its heading, is completed or canceled, and names the project. It runs on the state after the commit, so it also covers imports and retries. Allowed: a to-do created completed or canceled, and the to-do a stopped repeat leaves behind.
+
+**4. OAuth and stored credentials.**
+- (a) New `src/credential-crypto.js` (pure WebCrypto, importable in Node; `src/oauth-storage.js` re-exports from it). The AES-256-GCM key is derived with HKDF-SHA-256 from the whole secret. Decryption tries the derived key, then the old one (first 32 characters, zero-padded). The Durable Object record is re-encrypted on its first read (`readStoredCredentials`). The copy in the grant props is re-encrypted by `upgradeGrantProps`, called from the provider's `tokenExchangeCallback` in `src/index.js`, which returns `newProps`.
+- (b) The provider has no revocation hook. Instead the credentials now live only in the grant props, which the provider deletes with the grant on revocation and on replacement (`completeAuthorization` revokes earlier grants of the same user and client by default). `src/things-handler.js` no longer writes the per-grant Durable Object and no longer puts `grantId` in the props. For older grants, `upgradeGrantProps` deletes the Durable Object copy and drops `grantId` the next time the grant gets a token, once the props are known to hold readable credentials. The Durable Object class and its read fallback stay for grants that have no encrypted props.
+- (c) `POST /authorize/login` now resolves the OAuth request (consent record, or a valid authorization request rebuilt from the form) before it contacts Things Cloud. Without one it answers 400 and the password is not sent anywhere.
+
+**5. Time zone.** `ThingsDatabase.inTimeZone(zone)` returns a read-only copy in another zone, validated by `assertTimeZone`. `things_get_today`, `things_get_upcoming`, `things_get_deadlines`, `things_get_daily_summary`, and `things_get_logbook` take an optional `timezone`. The client, the validator, and every write keep `USER_TIMEZONE`.
+
+**Verification**: `npm test` passes 111 tests (99 before). One existing test changed: an update whose project was deleted during a conflict is now refused by the rebuild ("No project found ... nothing was written") instead of by the validator; a new test keeps the validator case for a plain list.
+
+**Not verified**
+- Nothing ran in the Workers runtime. `src/index.js`, `src/things-mcp.js`, and `src/oauth-storage.js` import `cloudflare:workers` or the agents package and were only syntax-checked. The `tokenExchangeCallback` wiring (it reads the env recorded by `fetch`, and returns `newProps`) and the `timezone` argument at the tool layer need a `wrangler dev` or deployed check.
+- Whether Things Cloud answers a stale `ancestor-index` with 409 or 412 is still an assumption from the audit.
+
+**Open**
+- Durable Object copies of grants that were revoked or replaced before this change cannot be found: they are named by a random id that only the deleted grant knew. Removing them means deleting the `OAuthCredentials` class in a migration once no old grant is left, which is the owner's call.
+- The sign-in form still tells a caller whether a password is right when the caller holds a valid authorization request, and anyone can make one through open client registration. Closing that needs rate limiting or closed registration, not a reorder.
+- `updateTag` and `createTag` check title uniqueness against the first read only. A tag with the same title created by another device during a conflict is not caught on the retry.
+
+---
+
 ## 2026-11-09 - Repeat rule edit, pause, resume, and stop (uncommitted, not deployed)
 
 Source: the shapes Things 3.24.2 wrote on 2026-11-09 (history indexes 1688 to 1700), recorded in the orchestrating session's `repeat-edit-shapes.md`. Nothing was written to Things Cloud; the work is covered by tests against the mocked fetch only.

@@ -4,7 +4,7 @@ import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { ThingsCloudClient } from "./things-client.js";
 import { remoteServerInfo } from "./brand-assets.js";
-import { decryptJson } from "./oauth-storage.js";
+import { decryptJson } from "./credential-crypto.js";
 
 const JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema";
 
@@ -89,6 +89,15 @@ export class ThingsMCP extends McpAgent {
     const batchSummary = (result, noun) =>
       `Batch ${result.operation} committed atomically for ${result.count} ${noun} (all written together).\n` +
       result.items.map((item) => `- ${item.title || "Untitled"} (${item.id}): ${item.result}${closedNote(item.todosClosed)}`).join("\n");
+
+    // Read tools whose answer depends on what day it is take an optional IANA time zone, for a
+    // caller who is away from the configured one. It only changes how this one answer is read:
+    // writes keep the configured zone.
+    const timezoneArg = z
+      .string()
+      .optional()
+      .describe(`IANA time zone to read "today" in for this call, e.g. "Europe/Paris". Defaults to the connector's zone (${this.env.USER_TIMEZONE || "America/New_York"}). Does not affect writes.`);
+    const inZone = (db, timezone) => (timezone ? db.inTimeZone(timezone) : db);
 
     const textResult = (data) => ({
       content: [
@@ -227,7 +236,7 @@ export class ThingsMCP extends McpAgent {
       {
         title: "Get Today's To-Dos",
         description: "Fetch the Today list as Things shows it: to-dos whose start date is today or earlier, plus to-dos with no start date whose deadline is today or overdue. Includes project/area context, deadlines, checklists, and tags.",
-        inputSchema: {},
+        inputSchema: { timezone: timezoneArg },
         annotations: {
           title: "Get Today's To-Dos",
           readOnlyHint: true,
@@ -236,10 +245,10 @@ export class ThingsMCP extends McpAgent {
           openWorldHint: false,
         },
       },
-      async () => {
+      async ({ timezone }) => {
         const client = await getClient();
         const db = await client.syncDatabase();
-        return textResult(db.getToday());
+        return textResult(inZone(db, timezone).getToday());
       }
     );
 
@@ -273,6 +282,7 @@ export class ThingsMCP extends McpAgent {
         description: "Fetch to-dos with a future start date and to-dos with a future deadline in the window, in chronological order. Matches Things' Upcoming list, so a to-do scheduled for today still appears when its deadline falls in the window. Overdue deadlines are in things_get_today and things_get_deadlines.",
         inputSchema: {
           days: z.number().optional().default(14).describe("Number of days ahead to look (default: 14)"),
+          timezone: timezoneArg,
         },
         annotations: {
           title: "Get Upcoming To-Dos",
@@ -282,10 +292,10 @@ export class ThingsMCP extends McpAgent {
           openWorldHint: false,
         },
       },
-      async ({ days }) => {
+      async ({ days, timezone }) => {
         const client = await getClient();
         const db = await client.syncDatabase();
-        return textResult(db.getUpcoming(days));
+        return textResult(inZone(db, timezone).getUpcoming(days));
       }
     );
 
@@ -347,6 +357,7 @@ export class ThingsMCP extends McpAgent {
           status: z.enum(["all", "completed", "canceled"]).optional().default("all").describe("Filter by status"),
           since: z.string().optional().describe("Filter items completed/canceled on or after this date (ISO 8601 or YYYY-MM-DD)"),
           until: z.string().optional().describe("Filter items completed/canceled on or before this date (ISO 8601 or YYYY-MM-DD)"),
+          timezone: timezoneArg,
         },
         annotations: {
           title: "Get Logbook History",
@@ -356,10 +367,10 @@ export class ThingsMCP extends McpAgent {
           openWorldHint: false,
         },
       },
-      async ({ limit, status, since, until }) => {
+      async ({ limit, status, since, until, timezone }) => {
         const client = await getClient();
         const db = await client.syncDatabase();
-        return textResult(db.getLogbook({ limit, status, since, until }));
+        return textResult(inZone(db, timezone).getLogbook({ limit, status, since, until }));
       }
     );
 
@@ -593,7 +604,7 @@ export class ThingsMCP extends McpAgent {
       {
         title: "Get Daily Summary",
         description: "Fetch a complete productivity briefing for today: tasks completed today, tasks due today, overdue tasks, and remaining Today items.",
-        inputSchema: {},
+        inputSchema: { timezone: timezoneArg },
         annotations: {
           title: "Get Daily Summary",
           readOnlyHint: true,
@@ -602,10 +613,10 @@ export class ThingsMCP extends McpAgent {
           openWorldHint: false,
         },
       },
-      async () => {
+      async ({ timezone }) => {
         const client = await getClient();
         const db = await client.syncDatabase();
-        return textResult(db.getDailySummary());
+        return textResult(inZone(db, timezone).getDailySummary());
       }
     );
 
@@ -615,7 +626,7 @@ export class ThingsMCP extends McpAgent {
       {
         title: "Get Deadlines Briefing",
         description: "Fetch all active tasks and projects with deadlines, categorized into Overdue, Due Today, Due This Week, and Future.",
-        inputSchema: {},
+        inputSchema: { timezone: timezoneArg },
         annotations: {
           title: "Get Deadlines Briefing",
           readOnlyHint: true,
@@ -624,10 +635,10 @@ export class ThingsMCP extends McpAgent {
           openWorldHint: false,
         },
       },
-      async () => {
+      async ({ timezone }) => {
         const client = await getClient();
         const db = await client.syncDatabase();
-        return textResult(db.getDeadlines());
+        return textResult(inZone(db, timezone).getDeadlines());
       }
     );
 
@@ -1399,7 +1410,7 @@ export class ThingsMCP extends McpAgent {
       "things_batch_update_todos",
       {
         title: "Batch Update To-Dos",
-        description: "Perform a batch update across multiple to-dos simultaneously (e.g. complete all, trash all, reschedule all, or set dates).",
+        description: "Perform a batch update across multiple to-dos simultaneously (e.g. complete all, trash all, reschedule all, or set dates). Each operation takes only its own fields: complete and cancel take completion_date; trash takes none; reschedule takes when; set_dates takes deadline, completion_date, creation_date. Any other field is an error and nothing is written.",
         inputSchema: {
           ids: z.array(z.string()).describe("Array of to-do UUIDs"),
           operation: z.enum(["complete", "cancel", "trash", "reschedule", "set_dates"]).describe("Batch operation to perform"),
@@ -1542,7 +1553,7 @@ export class ThingsMCP extends McpAgent {
       "things_batch_update_projects",
       {
         title: "Batch Update Projects",
-        description: "Perform a batch operation across multiple projects simultaneously (complete, cancel, trash, reschedule, set area, or set deadlines/dates). As in the Things app, 'complete' also completes every open to-do in each project (including those under its headings) and 'cancel' cancels them, in the same commit; the result gives the count per project. Completed, canceled, and trashed to-dos, headings, and repeating templates are not touched.",
+        description: "Perform a batch operation across multiple projects simultaneously (complete, cancel, trash, reschedule, set area, or set deadlines/dates). As in the Things app, 'complete' also completes every open to-do in each project (including those under its headings) and 'cancel' cancels them, in the same commit; the result gives the count per project. Completed, canceled, and trashed to-dos, headings, and repeating templates are not touched. Each operation takes only its own fields: complete and cancel take completion_date; trash takes none; reschedule takes when; set_area takes area; set_dates takes when, area, deadline, completion_date, creation_date. Any other field is an error and nothing is written.",
         inputSchema: {
           ids: z.array(z.string()).describe("Array of project UUIDs"),
           operation: z.enum(["complete", "cancel", "trash", "reschedule", "set_area", "set_dates"]).describe("Batch operation to perform"),

@@ -67,6 +67,16 @@ export function timestampToDate(ts) {
   return new Date(ts * 1000).toISOString().slice(0, 10);
 }
 
+// An IANA time zone name ("Europe/Paris") as the runtime knows it, or an error that says what to send.
+export function assertTimeZone(timeZone) {
+  try {
+    if (typeof timeZone !== "string" || !timeZone.trim()) throw new RangeError("empty");
+    return new Intl.DateTimeFormat("en-CA", { timeZone: timeZone.trim() }).resolvedOptions().timeZone;
+  } catch {
+    throw new Error(`"${String(timeZone)}" is not a time zone this server knows. Use an IANA name such as "America/Los_Angeles" or "Europe/Paris".`);
+  }
+}
+
 // Calendar date in a time zone, as YYYY-MM-DD. Accepts a Date or unix seconds.
 export function localDate(timeZone = DEFAULT_TIME_ZONE, when = new Date()) {
   const date = typeof when === "number" ? new Date(when * 1000) : when;
@@ -697,6 +707,18 @@ function validateAgainstDatabase(body, db) {
       else if (t.type === 2 && (t.area || t.heading || !t.project)) add("a heading belongs to exactly one project and nothing else");
     }
 
+    // A new open to-do in a completed or canceled project (directly or under one of its headings)
+    // would be hidden in the Logbook with it. Finished work can still be filed there: a to-do
+    // created completed or canceled is allowed. The to-do a stopped repeat leaves behind takes the
+    // template's place and is not a new filing.
+    if (change.t === 0 && t.type === 0 && !t.status && !t.recurrenceRule && !isStopCreate(change)) {
+      const container = taskOf(shadow.projectIdOf(t));
+      if (container?.type === 1 && (container.status === 3 || container.status === 2)) {
+        const state = container.status === 3 ? "completed" : "canceled";
+        add(`project "${container.title || "Untitled"}" (${container.uuid}) is ${state}, so a new open to-do cannot be filed into it${t.heading ? " or under its headings" : ""}. Reopen the project, choose another one, or create the to-do as completed or canceled`);
+      }
+    }
+
     if (["st", "sr", "tp"].some((k) => k in p) && !t.recurrenceRule && typeof t.start === "number") {
       const sr = t.startDate ? dateToTimestamp(t.startDate) : null;
       if (t.type === 2 && t.start !== 1) add("a heading must have st 1");
@@ -996,6 +1018,47 @@ function statusFields(status, now) {
 // Client
 // ---------------------------------------------------------------------------
 
+// The fields each batch operation writes. A field the operation would not write is refused by
+// name: answering "updated" for a deadline that was never set would be a silent drop.
+const BATCH_FIELDS = {
+  "to-do": {
+    complete: ["completion_date"],
+    cancel: ["completion_date"],
+    trash: [],
+    reschedule: ["when"],
+    set_dates: ["deadline", "completion_date", "creation_date"],
+  },
+  project: {
+    complete: ["completion_date"],
+    cancel: ["completion_date"],
+    trash: [],
+    reschedule: ["when"],
+    set_area: ["area"],
+    set_dates: ["when", "area", "deadline", "completion_date", "creation_date"],
+  },
+};
+const BATCH_OPTION_NAMES = { when: "when", area: "area", deadline: "deadline", completionDate: "completion_date", completion_date: "completion_date", creationDate: "creation_date", creation_date: "creation_date" };
+
+// Checks the options of a batch against its operation and returns them under the names the patch
+// builder uses. Absent, null, and "" count as not given.
+function batchOptions(kind, operation, options) {
+  const allowed = BATCH_FIELDS[kind][operation];
+  if (!allowed) throw new Error(`Unknown ${kind} batch operation "${operation}"; use one of ${Object.keys(BATCH_FIELDS[kind]).join(", ")}. Nothing was written.`);
+  const given = {};
+  const unused = new Set();
+  for (const [key, value] of Object.entries(options || {})) {
+    if (value === undefined || value === null || value === "") continue;
+    const name = BATCH_OPTION_NAMES[key] || key;
+    if (!allowed.includes(name)) unused.add(name);
+    else given[name] = value;
+  }
+  if (unused.size) {
+    const takes = allowed.length ? `it takes ${allowed.map((f) => `"${f}"`).join(", ")}` : "it takes no other fields";
+    throw new Error(`Operation "${operation}" on a ${kind} batch does not use ${[...unused].map((f) => `"${f}"`).join(", ")}; ${takes}. Nothing was written.`);
+  }
+  return { when: given.when, area: given.area, deadline: given.deadline, completionDate: given.completion_date, creationDate: given.creation_date };
+}
+
 export class ThingsCloudClient {
   constructor({ email, password, historyKey = null, timeZone = DEFAULT_TIME_ZONE, fetchImpl = null }) {
     this.email = email.trim().toLowerCase();
@@ -1191,26 +1254,51 @@ export class ThingsCloudClient {
   // The body, and so every minted id, is built once: every retry resends the same ids, and a
   // commit of unknown outcome is checked against the history before anything is resent, so a
   // retry cannot duplicate a create. All changes in one call land together or not at all.
+  //
+  // `changes` is a list of change maps, or a builder `(db) => list`. A list is a plain patch: it is
+  // resent as it is after a conflict. A builder is for anything computed from the database (a full
+  // tg array, a checklist index, a cascade): it runs against the synced database, and again
+  // against the refreshed one before every resend, so a retry never writes values derived from
+  // state another client has since changed. A builder must mint its ids and timestamps outside
+  // itself, so every run names the same new items. It may return [] when nothing is left to write.
   async commitChanges(changes) {
-    const body = {};
-    for (const change of changes) Object.assign(body, change);
-    if (!Object.keys(body).length) return { serverHeadIndex: null };
+    const build = typeof changes === "function" ? changes : null;
+    const merge = (list) => {
+      const merged = {};
+      for (const change of list || []) Object.assign(merged, change);
+      return merged;
+    };
+    let body = build ? null : merge(changes);
+    if (body && !Object.keys(body).length) return { serverHeadIndex: null };
 
     await this.ensureHistoryKey();
     let db = await this.syncDatabase();
+    if (build) body = merge(build(db));
+    if (!Object.keys(body).length) return { serverHeadIndex: null };
     validateChangeMap(body, db);
-    const payload = JSON.stringify(body);
+    let payload = JSON.stringify(body);
     let ancestor = db.latestServerIndex;
 
-    // After a 409/412 or a verified miss, re-read the head and re-validate against the fresh state.
+    // After a 409/412 or a verified miss, re-read the head, rebuild what was derived from the old
+    // state, and re-validate against the fresh state.
     const refresh = async () => {
       this.invalidateCache();
       db = await this.syncDatabase({ force: true });
+      if (build) {
+        try {
+          body = merge(build(db));
+        } catch (err) {
+          throw new Error(`${err.message} (Things changed while this was being written; nothing was written.)`);
+        }
+        payload = JSON.stringify(body);
+      }
       validateChangeMap(body, db);
       ancestor = db.latestServerIndex;
     };
 
     for (let attempt = 0; ; attempt++) {
+      // A rebuild can find that another client already did the work.
+      if (!Object.keys(body).length) return { serverHeadIndex: null };
       const url = `${THINGS_CLOUD_BASE}/version/1/history/${this.historyKey}/commit?ancestor-index=${ancestor}&_cnt=1`;
       let res = null;
       let netError = null;
@@ -1531,12 +1619,18 @@ export class ThingsCloudClient {
       .map((t) => ({ [t.uuid]: { t: 1, e: ENTITY.task, p: { md: patch.md, ss: patch.ss, sp: patch.sp } } }));
   }
 
+  // The patch can depend on the item as it is (appended notes, a kept reminder, the open to-dos
+  // of a project being closed), so it is built inside the commit and rebuilt after a conflict.
   async updateTask(uuid, updates, type) {
-    const db = await this.syncDatabase();
-    this.requireKind(db, uuid, type);
-    const patch = this.buildTaskPatch(db, { ...updates, __uuid: uuid });
-    const closed = type === 1 ? this.projectCloseChanges(db, uuid, patch) : [];
-    await this.commitChanges([{ [uuid]: { t: 1, e: ENTITY.task, p: patch } }, ...closed]);
+    const now = toUnixTimestamp();
+    let patch;
+    let closed;
+    await this.commitChanges((db) => {
+      this.requireKind(db, uuid, type);
+      patch = this.buildTaskPatch(db, { ...updates, __uuid: uuid }, now);
+      closed = type === 1 ? this.projectCloseChanges(db, uuid, patch) : [];
+      return [{ [uuid]: { t: 1, e: ENTITY.task, p: patch } }, ...closed];
+    });
     const closing = type === 1 && (patch.ss === 3 || patch.ss === 2);
     return { id: uuid, updated: true, ...(closing ? { todosClosed: closed.length } : {}) };
   }
@@ -1558,7 +1652,20 @@ export class ThingsCloudClient {
     if (action === "rule" && !hasRepeat) throw new Error('The "rule" action needs a repeat object with the new rule.');
     if (action !== "rule" && hasRepeat) throw new Error(`"repeat" goes with the "rule" action only, not "${action}"; nothing was changed.`);
 
-    const db = await this.syncDatabase();
+    // Everything below is decided from the template as it is now, so it is planned inside the
+    // commit and planned again from the refreshed database after a conflict.
+    const now = toUnixTimestamp();
+    const newId = generateUUID();
+    let plan;
+    await this.commitChanges((db) => {
+      plan = this.planRepeatUpdate(db, id, { action, repeat }, now, newId);
+      return plan.changes;
+    });
+    return plan.result;
+  }
+
+  // The changes and the tool result for one things_update_repeat call against `db`.
+  planRepeatUpdate(db, id, { action, repeat }, now, newId) {
     const given = this.requireKind(db, id, 0);
     let template = given;
     if (!given.recurrenceRule) {
@@ -1573,13 +1680,11 @@ export class ThingsCloudClient {
     const paused = Boolean(template.instanceCreationPaused);
     const nextDay = template.todayRefDate || null;
     const today = db.today();
-    const now = toUnixTimestamp();
 
     if (action === "pause" || action === "resume") {
       const want = action === "pause";
-      if (paused === want) return { ...base, changed: false, paused };
-      await this.commitChanges([{ [tid]: { t: 1, e: ENTITY.task, p: { icp: want, md: now } } }]);
-      return { ...base, changed: true, paused: want };
+      if (paused === want) return { changes: [], result: { ...base, changed: false, paused } };
+      return { changes: [{ [tid]: { t: 1, e: ENTITY.task, p: { icp: want, md: now } } }], result: { ...base, changed: true, paused: want } };
     }
 
     if (action === "rule") {
@@ -1599,8 +1704,10 @@ export class ThingsCloudClient {
       }
       // The builder's rule for a first day of nextDay (so ia is nextDay), with the old rule's sr.
       const rr = { ...buildRepeatRule(repeat, nextDay), sr: old.sr };
-      await this.commitChanges([{ [tid]: { t: 1, e: ENTITY.task, p: { md: now, rr } } }]);
-      return { ...base, changed: true, repeatRule: describeRepeatRule(rr).summary, nextOccurrence: nextDay };
+      return {
+        changes: [{ [tid]: { t: 1, e: ENTITY.task, p: { md: now, rr } } }],
+        result: { ...base, changed: true, repeatRule: describeRepeatRule(rr).summary, nextOccurrence: nextDay },
+      };
     }
 
     // stop
@@ -1613,7 +1720,6 @@ export class ThingsCloudClient {
     if (!nextDay || nextDay <= today) {
       throw new Error(`The next day of the repeating to-do ${tid} is ${nextDay || "not set"}; only a repeat whose next day is in the future can be stopped here (the sampled case). Open Things so it creates the due occurrence, then stop again. ${trashInstead}`);
     }
-    const newId = generateUUID();
     const create = buildRepeatStopCreate({
       title: template.title,
       notes: template.notes || "",
@@ -1626,8 +1732,10 @@ export class ThingsCloudClient {
       now,
     });
     const open = [...db.tasks.values()].filter((t) => t.repeatingTemplates?.includes(tid) && !t.trashed && !t.status);
-    await this.commitChanges([{ [newId]: create }, ...open.map((t) => ({ [t.uuid]: { t: 1, e: ENTITY.task, p: { rt: [] } } })), { [tid]: { t: 2, e: ENTITY.task, p: {} } }]);
-    return { ...base, changed: true, stopped: true, newTodoId: newId, scheduledDate: nextDay, detachedOccurrences: open.map((t) => t.uuid) };
+    return {
+      changes: [{ [newId]: create }, ...open.map((t) => ({ [t.uuid]: { t: 1, e: ENTITY.task, p: { rt: [] } } })), { [tid]: { t: 2, e: ENTITY.task, p: {} } }],
+      result: { ...base, changed: true, stopped: true, newTodoId: newId, scheduledDate: nextDay, detachedOccurrences: open.map((t) => t.uuid) },
+    };
   }
 
   // Tombstones for `ids` plus everything that would otherwise be left pointing at them: checklist
@@ -1636,9 +1744,8 @@ export class ThingsCloudClient {
   // Things keeps tr false on the to-dos inside a trashed project and removes them together with
   // it when the Trash is emptied. Live children of a project that is not trashed are left alone;
   // the validator then refuses the commit and names them.
-  purgeChanges(db, ids) {
+  purgeChanges(db, ids, now = toUnixTimestamp()) {
     const purge = new Set(ids);
-    const now = toUnixTimestamp();
     const withContents = new Set(ids.filter((id) => db.tasks.get(id)?.trashed));
     for (let grew = true; grew; ) {
       grew = false;
@@ -1676,17 +1783,19 @@ export class ThingsCloudClient {
   // item"). An id of any other kind is refused: a parent's id given by mistake must not delete
   // the parent.
   async deleteEntity(uuid, kind) {
-    const db = await this.syncDatabase();
-    if (kind === "checklist item") {
-      if (!db.checklists.has(uuid)) {
-        const actual = db.kindOf(uuid);
-        throw new Error(actual ? `${uuid} is ${aKind(actual)}, not a checklist item; nothing was deleted.` : `No checklist item with id ${uuid}.`);
-      }
-    } else {
-      if (!TASK_KINDS.includes(kind)) throw new Error(`deleteEntity needs a kind (${TASK_KINDS.join(", ")}, or checklist item).`);
-      this.requireKind(db, uuid, TASK_KINDS.indexOf(kind));
-    }
-    await this.commitChanges(this.purgeChanges(db, [uuid]));
+    if (kind !== "checklist item" && !TASK_KINDS.includes(kind)) throw new Error(`deleteEntity needs a kind (${TASK_KINDS.join(", ")}, or checklist item).`);
+    const now = toUnixTimestamp();
+    // The cascade (contents, tag and area references) is read from the database, so it is rebuilt
+    // after a conflict.
+    await this.commitChanges((db) => {
+      if (kind === "checklist item") {
+        if (!db.checklists.has(uuid)) {
+          const actual = db.kindOf(uuid);
+          throw new Error(actual ? `${uuid} is ${aKind(actual)}, not a checklist item; nothing was deleted.` : `No checklist item with id ${uuid}.`);
+        }
+      } else this.requireKind(db, uuid, TASK_KINDS.indexOf(kind));
+      return this.purgeChanges(db, [uuid], now);
+    });
     return { id: uuid, deleted: true };
   }
 
@@ -1766,21 +1875,21 @@ export class ThingsCloudClient {
   }
 
   async deleteArea(uuid, { deleteContents = false } = {}) {
-    const db = await this.syncDatabase();
-    if (!db.areas.has(uuid)) throw new Error(`No area with id ${uuid}.`);
-    const changes = [];
     const now = toUnixTimestamp();
-
-    // Items always lose the reference to the deleted area; with deleteContents they are trashed too.
-    for (const t of db.tasks.values()) {
-      if (t.area !== uuid) continue;
-      const p = { ar: [], md: now };
-      if (deleteContents && !t.trashed) p.tr = true;
-      changes.push({ [t.uuid]: { t: 1, e: ENTITY.task, p } });
-    }
-
-    changes.push({ [uuid]: { t: 2, e: ENTITY.area, p: {} } });
-    await this.commitChanges(changes);
+    // The list of items in the area is read from the database, so it is rebuilt after a conflict.
+    await this.commitChanges((db) => {
+      if (!db.areas.has(uuid)) throw new Error(`No area with id ${uuid}.`);
+      const changes = [];
+      // Items always lose the reference to the deleted area; with deleteContents they are trashed too.
+      for (const t of db.tasks.values()) {
+        if (t.area !== uuid) continue;
+        const p = { ar: [], md: now };
+        if (deleteContents && !t.trashed) p.tr = true;
+        changes.push({ [t.uuid]: { t: 1, e: ENTITY.task, p } });
+      }
+      changes.push({ [uuid]: { t: 2, e: ENTITY.area, p: {} } });
+      return changes;
+    });
     return { id: uuid, deleted: true, contentsPurged: deleteContents };
   }
 
@@ -1829,68 +1938,53 @@ export class ThingsCloudClient {
   }
 
   async deleteTag(uuid) {
-    const db = await this.syncDatabase();
-    if (!db.tags.has(uuid)) throw new Error(`No tag with id ${uuid}.`);
-    await this.commitChanges(this.purgeChanges(db, [uuid]));
+    const now = toUnixTimestamp();
+    // Removing a tag rewrites the full tg array of every item that carries it, from the database
+    // as it is when the commit is sent.
+    await this.commitChanges((db) => {
+      if (!db.tags.has(uuid)) throw new Error(`No tag with id ${uuid}.`);
+      return this.purgeChanges(db, [uuid], now);
+    });
     return { id: uuid, deleted: true };
   }
 
   // --- Checklist items --------------------------------------------------------
 
   async addChecklistItems(taskUUID, items) {
-    const db = await this.syncDatabase();
-    const task = db.tasks.get(taskUUID);
-    if (!task || task.type !== 0) throw new Error(`No to-do with id ${taskUUID}.`);
     const now = toUnixTimestamp();
-    let nextIndex = db.checklistItemsFor(taskUUID).reduce((max, c) => Math.max(max, c.index ?? 0), -1) + 1;
-
-    const changes = [];
-    const created = [];
-    for (const item of items) {
-      const id = generateUUID();
-      const title = typeof item === "string" ? item : item.title;
-      changes.push({ [id]: buildChecklistCreate({ title, task: taskUUID, index: nextIndex++, now }) });
-      created.push({ id, title, status: "open" });
-    }
-    await this.commitChanges(changes);
+    const created = items.map((item) => ({ id: generateUUID(), title: typeof item === "string" ? item : item.title, status: "open" }));
+    // The new items go after the last one the to-do has when the commit is sent.
+    await this.commitChanges((db) => {
+      const task = db.tasks.get(taskUUID);
+      if (!task || task.type !== 0) throw new Error(`No to-do with id ${taskUUID}.`);
+      const first = db.checklistItemsFor(taskUUID).reduce((max, c) => Math.max(max, c.index ?? 0), -1) + 1;
+      return created.map(({ id, title }, n) => ({ [id]: buildChecklistCreate({ title, task: taskUUID, index: first + n, now }) }));
+    });
     return created;
   }
 
   async setChecklist(taskUUID, items) {
-    const db = await this.syncDatabase();
-    const task = db.tasks.get(taskUUID);
-    if (!task || task.type !== 0) throw new Error(`No to-do with id ${taskUUID}.`);
-
-    const existingChecklist = db.checklistItemsFor(taskUUID);
-    const changes = [];
     const now = toUnixTimestamp();
-
-    for (const c of existingChecklist) {
-      changes.push({ [c.uuid]: { t: 2, e: ENTITY.checklist, p: {} } });
-    }
-
-    const created = [];
-    items.forEach((item, idx) => {
-      const id = generateUUID();
-      const title = typeof item === "string" ? item : item.title || "Untitled";
+    const fresh = items.map((item) => {
       let status = 0;
       if (typeof item === "object") {
         if (item.status === "completed" || item.completed === true) status = 3;
         else if (item.status === "canceled" || item.canceled === true) status = 2;
       }
-      changes.push({
-        [id]: buildChecklistCreate({
-          title,
-          task: taskUUID,
-          index: idx,
-          status,
-          now,
-        }),
-      });
-      created.push({ id, title, status: status === 3 ? "completed" : status === 2 ? "canceled" : "open" });
+      return { id: generateUUID(), title: typeof item === "string" ? item : item.title || "Untitled", status };
     });
+    const created = fresh.map(({ id, title, status }) => ({ id, title, status: status === 3 ? "completed" : status === 2 ? "canceled" : "open" }));
 
-    await this.commitChanges(changes);
+    // Replacing means tombstoning every item the to-do has when the commit is sent, including one
+    // another client added a moment ago.
+    await this.commitChanges((db) => {
+      const task = db.tasks.get(taskUUID);
+      if (!task || task.type !== 0) throw new Error(`No to-do with id ${taskUUID}.`);
+      return [
+        ...db.checklistItemsFor(taskUUID).map((c) => ({ [c.uuid]: { t: 2, e: ENTITY.checklist, p: {} } })),
+        ...fresh.map(({ id, title, status }, index) => ({ [id]: buildChecklistCreate({ title, task: taskUUID, index, status, now }) })),
+      ];
+    });
     return { taskId: taskUUID, checklist: created, count: created.length };
   }
 
@@ -1929,15 +2023,24 @@ export class ThingsCloudClient {
   }
 
   async emptyTrash() {
-    const db = await this.syncDatabase();
-    const trashed = [...db.tasks.values()].filter((t) => t.trashed);
+    const now = toUnixTimestamp();
+    let seen = null;
+    let trashed = [];
+    let tasksPurged = [];
+    // After a conflict the purge is rebuilt from the refreshed database, and only for items that
+    // were in the Trash when the tool was called and still are: something restored in the
+    // meantime is kept, and something trashed in the meantime waits for the next call.
+    await this.commitChanges((db) => {
+      const inTrash = [...db.tasks.values()].filter((t) => t.trashed).map((t) => t.uuid);
+      seen ??= new Set(inTrash);
+      trashed = inTrash.filter((id) => seen.has(id));
+      const changes = trashed.length ? this.purgeChanges(db, trashed, now) : [];
+      // Everything tombstoned, checklist items included; containedCount is what went with a trashed
+      // project or heading without being marked trashed itself.
+      tasksPurged = changes.filter((c) => Object.values(c)[0].t === 2).map((c) => Object.keys(c)[0]).filter((id) => db.tasks.has(id));
+      return changes;
+    });
     if (!trashed.length) return { purgedCount: 0 };
-    const changes = this.purgeChanges(db, trashed.map((t) => t.uuid));
-    await this.commitChanges(changes);
-    // Everything tombstoned, checklist items included; containedCount is what went with a trashed
-    // project or heading without being marked trashed itself.
-    const purged = changes.filter((c) => Object.values(c)[0].t === 2).map((c) => Object.keys(c)[0]);
-    const tasksPurged = purged.filter((id) => db.tasks.has(id));
     return { purgedCount: tasksPurged.length, trashedCount: trashed.length, containedCount: tasksPurged.length - trashed.length };
   }
 
@@ -1952,41 +2055,60 @@ export class ThingsCloudClient {
 
   // Turn a to-do into a project; its checklist items become to-dos inside it.
   async convertTodoToProject(uuid) {
-    const db = await this.syncDatabase();
-    const task = this.requireKind(db, uuid, 0);
-
-    const checklistItems = db.checklistItemsFor(uuid);
     const now = toUnixTimestamp();
-    const patch = { tp: 1, pr: [], agr: [], md: now };
-    // Things has no Inbox projects: a project made from an Inbox to-do goes to Anytime.
-    if (task.start === 0) Object.assign(patch, { st: 1, sb: 0 });
-    const changes = [{ [uuid]: { t: 1, e: ENTITY.task, p: patch } }];
+    const todoIds = new Map(); // checklist item id -> id of the to-do it becomes, the same on every build
+    let task;
+    let checklistItems;
+    // The checklist is read from the database, so the conversion is rebuilt after a conflict.
+    await this.commitChanges((db) => {
+      task = this.requireKind(db, uuid, 0);
+      checklistItems = db.checklistItemsFor(uuid);
+      const patch = { tp: 1, pr: [], agr: [], md: now };
+      // Things has no Inbox projects: a project made from an Inbox to-do goes to Anytime.
+      if (task.start === 0) Object.assign(patch, { st: 1, sb: 0 });
+      const changes = [{ [uuid]: { t: 1, e: ENTITY.task, p: patch } }];
 
-    checklistItems.forEach((item, idx) => {
-      const todo = buildTaskCreate({
-        title: item.title,
-        when: "anytime",
-        project: uuid,
-        status: item.status === 3 ? 3 : item.status === 2 ? 2 : 0,
-        now,
-        timeZone: this.timeZone,
+      checklistItems.forEach((item, idx) => {
+        const todo = buildTaskCreate({
+          title: item.title,
+          when: "anytime",
+          project: uuid,
+          status: item.status === 3 ? 3 : item.status === 2 ? 2 : 0,
+          now,
+          timeZone: this.timeZone,
+        });
+        todo.p.ix = idx;
+        if (!todoIds.has(item.uuid)) todoIds.set(item.uuid, generateUUID());
+        changes.push({ [todoIds.get(item.uuid)]: todo });
+        changes.push({ [item.uuid]: { t: 2, e: ENTITY.checklist, p: {} } });
       });
-      todo.p.ix = idx;
-      changes.push({ [generateUUID()]: todo });
-      changes.push({ [item.uuid]: { t: 2, e: ENTITY.checklist, p: {} } });
+      return changes;
     });
-
-    await this.commitChanges(changes);
     return { id: uuid, title: task.title, type: "project", tasksCreated: checklistItems.length };
   }
 
   // Import Things JSON (https://culturedcode.com/things/support/articles/2803573/).
   async importJson(payload) {
+    const now = toUnixTimestamp();
+    // An import reads the database (titles, appended notes, added tags, checklist indexes, the
+    // to-dos of a project it closes), so it is planned inside the commit and planned again after a
+    // conflict. New ids are handed out in order from one pool, so every plan names the same items.
+    const ids = [];
+    let plan;
+    await this.commitChanges((db) => {
+      let n = 0;
+      plan = this.planImport(db, payload, now, () => (ids[n] ??= generateUUID(), ids[n++]));
+      return plan.changes;
+    });
+    return plan.result;
+  }
+
+  // The changes and the tool result of one import against `base`. `mint()` returns the next new id.
+  planImport(base, payload, now, mint) {
     // Later items resolve titles of earlier ones, so created items are applied to a copy of the
     // cache. A refused or failed commit then leaves the cached database untouched.
-    const db = (await this.syncDatabase()).clone();
+    const db = base.clone();
     const items = Array.isArray(payload) ? payload : [payload];
-    const now = toUnixTimestamp();
     const changes = [];
     let projectsCreated = 0;
     let todosCreated = 0;
@@ -2001,7 +2123,7 @@ export class ThingsCloudClient {
         const isCanceled = typeof cl === "object" && (cl.canceled === true || cl.status === "canceled" || cl.attributes?.canceled === true);
         const status = isCompleted ? 3 : isCanceled ? 2 : 0;
         changes.push({
-          [generateUUID()]: buildChecklistCreate({
+          [mint()]: buildChecklistCreate({
             title,
             task: todoUUID,
             index: firstIndex + idx,
@@ -2097,7 +2219,7 @@ export class ThingsCloudClient {
           addChecklist(attrs, item.id, attrs["append-checklist-items"], current.reduce((max, c) => Math.max(max, c.index ?? 0), -1) + 1);
         }
       } else if (type === "project") {
-        const projectUUID = generateUUID();
+        const projectUUID = mint();
         const areaId = attrs["area-id"]
           ? db.resolveRef("area", attrs["area-id"])
           : attrs.area
@@ -2130,7 +2252,7 @@ export class ThingsCloudClient {
           const subType = sub.type || "to-do";
           const subAttrs = sub.attributes || {};
           if (subType === "heading") {
-            headingUUID = generateUUID();
+            headingUUID = mint();
             const headingChange = buildTaskCreate({
               title: subAttrs.title || "Section",
               type: 2,
@@ -2142,7 +2264,7 @@ export class ThingsCloudClient {
             changes.push({ [headingUUID]: headingChange });
             db.applyChangeMap({ [headingUUID]: headingChange });
           } else if (subType === "to-do") {
-            const todoUUID = generateUUID();
+            const todoUUID = mint();
             const subStatus = subAttrs.completed === true ? 3 : subAttrs.canceled === true ? 2 : (subAttrs.status === "completed" ? 3 : subAttrs.status === "canceled" ? 2 : 0);
             const change = buildTaskCreate({
               title: subAttrs.title || "Untitled",
@@ -2169,7 +2291,7 @@ export class ThingsCloudClient {
           }
         }
       } else if (type === "to-do") {
-        const todoUUID = generateUUID();
+        const todoUUID = mint();
         let project = null;
         let heading = null;
         let area = null;
@@ -2222,14 +2344,16 @@ export class ThingsCloudClient {
       }
     }
 
-    await this.commitChanges(changes);
     return {
-      projectsCreated,
-      todosCreated,
-      projectsUpdated,
-      todosUpdated,
-      totalEntities: changes.length,
-      items: itemResults,
+      changes,
+      result: {
+        projectsCreated,
+        todosCreated,
+        projectsUpdated,
+        todosUpdated,
+        totalEntities: changes.length,
+        items: itemResults,
+      },
     };
   }
 
@@ -2241,87 +2365,99 @@ export class ThingsCloudClient {
     return task;
   }
 
+  // Things stores tags as one full tg array, so adding or removing a tag is a read-modify-write:
+  // `tagsFor(db, task)` computes the array from the item as it is when the commit is sent, and
+  // again after a conflict, so a tag another client added in between is kept.
+  async retagTask(taskUUID, tagsFor) {
+    const now = toUnixTimestamp();
+    await this.commitChanges((db) => {
+      const task = this.taggable(db, taskUUID);
+      return [{ [taskUUID]: { t: 1, e: ENTITY.task, p: this.buildTaskPatch(db, { __uuid: taskUUID, tags: tagsFor(db, task) }, now) } }];
+    });
+    return { id: taskUUID, updated: true };
+  }
+
   async addTagsToTask(taskUUID, tagNames) {
-    const db = await this.syncDatabase();
-    const task = this.taggable(db, taskUUID);
-    const merged = [...new Set([...(task.tags || []), ...this.resolveTagIds(db, tagNames)])];
-    return this.updateTask(taskUUID, { tags: merged }, task.type);
+    return this.retagTask(taskUUID, (db, task) => [...new Set([...(task.tags || []), ...this.resolveTagIds(db, tagNames)])]);
   }
 
   async removeTagsFromTask(taskUUID, tagNames) {
-    const db = await this.syncDatabase();
-    const task = this.taggable(db, taskUUID);
-    const remove = new Set(this.resolveTagIds(db, tagNames));
-    return this.updateTask(taskUUID, { tags: (task.tags || []).filter((id) => !remove.has(id)) }, task.type);
+    return this.retagTask(taskUUID, (db, task) => {
+      const remove = new Set(this.resolveTagIds(db, tagNames));
+      return (task.tags || []).filter((id) => !remove.has(id));
+    });
   }
 
   // One commit: every item lands or none does. The result lists each item so the caller can see
   // exactly what was written; any unknown id refuses the whole batch and names every bad id.
   async batchUpdateTodos(uuids, operation, options = {}) {
-    if (operation === "reschedule" && !options.when) throw new Error('Operation "reschedule" needs "when".');
-    if (operation === "set_dates" && !(options.deadline || options.completionDate || options.completion_date || options.creationDate || options.creation_date)) {
+    const o = batchOptions("to-do", operation, options);
+    if (operation === "reschedule" && !o.when) throw new Error('Operation "reschedule" needs "when".');
+    if (operation === "set_dates" && !(o.deadline || o.completionDate || o.creationDate)) {
       throw new Error('Operation "set_dates" needs deadline, completion_date, or creation_date.');
     }
-    const db = await this.syncDatabase();
-    return this.commitBatch(db, uuids, operation, "To-do", (uuid) => db.tasks.get(uuid)?.type === 0, (uuid, now) =>
+    return this.commitBatch(uuids, operation, "To-do", (db, uuid) => db.tasks.get(uuid)?.type === 0, (db, uuid, now) =>
       this.buildTaskPatch(db, {
         __uuid: uuid,
         status: operation === "complete" ? "completed" : operation === "cancel" ? "canceled" : undefined,
         trashed: operation === "trash" ? true : undefined,
-        when: options.when,
-        deadline: options.deadline,
-        completionDate: options.completionDate || options.completion_date,
-        creationDate: options.creationDate || options.creation_date,
+        when: o.when,
+        deadline: o.deadline,
+        completionDate: o.completionDate,
+        creationDate: o.creationDate,
       }, now)
     );
   }
 
   async batchUpdateProjects(uuids, operation, options = {}) {
-    if (operation === "reschedule" && !options.when) throw new Error('Operation "reschedule" needs "when".');
-    if (operation === "set_area" && !options.area) throw new Error('Operation "set_area" needs "area".');
-    if (operation === "set_dates" && !(options.when || options.area || options.deadline || options.completionDate || options.completion_date || options.creationDate || options.creation_date)) {
+    const o = batchOptions("project", operation, options);
+    if (operation === "reschedule" && !o.when) throw new Error('Operation "reschedule" needs "when".');
+    if (operation === "set_area" && !o.area) throw new Error('Operation "set_area" needs "area".');
+    if (operation === "set_dates" && !(o.when || o.area || o.deadline || o.completionDate || o.creationDate)) {
       throw new Error('Operation "set_dates" needs when, deadline, completion_date, or creation_date.');
     }
-    const db = await this.syncDatabase();
-    const result = await this.commitBatch(db, uuids, operation, "Project", (uuid) => db.tasks.get(uuid)?.type === 1, (uuid, now) =>
+    const result = await this.commitBatch(uuids, operation, "Project", (db, uuid) => db.tasks.get(uuid)?.type === 1, (db, uuid, now) =>
       this.buildTaskPatch(db, {
         __uuid: uuid,
         status: operation === "complete" ? "completed" : operation === "cancel" ? "canceled" : undefined,
         trashed: operation === "trash" ? true : undefined,
-        when: options.when,
-        area: options.area,
-        deadline: options.deadline,
-        completionDate: options.completionDate || options.completion_date,
-        creationDate: options.creationDate || options.creation_date,
+        when: o.when,
+        area: o.area,
+        deadline: o.deadline,
+        completionDate: o.completionDate,
+        creationDate: o.creationDate,
       }, now),
-      (uuid, patch) => this.projectCloseChanges(db, uuid, patch)
+      (db, uuid, patch) => this.projectCloseChanges(db, uuid, patch)
     );
     if (operation === "complete" || operation === "cancel") result.todosClosed = result.items.reduce((n, item) => n + item.todosClosed, 0);
     else for (const item of result.items) delete item.todosClosed;
     return result;
   }
 
-  // `alsoFor(uuid, patch)` returns further changes that belong in the same commit as that item.
-  async commitBatch(db, uuids, operation, label, exists, patchFor, alsoFor = null) {
+  // `alsoFor(db, uuid, patch)` returns further changes that belong in the same commit as that item.
+  // The whole batch is built inside the commit, and built again after a conflict, because a patch
+  // can depend on the item as it is and a closed project takes its open to-dos with it.
+  async commitBatch(uuids, operation, label, exists, patchFor, alsoFor = null) {
     const ids = [...new Set(uuids)];
-    const missing = ids.filter((uuid) => !exists(uuid));
-    if (missing.length) {
-      const named = missing.map((uuid) => (db.kindOf(uuid) ? `${uuid} (${aKind(db.kindOf(uuid))})` : uuid));
-      throw new Error(`${label} not found: ${named.join(", ")}. Nothing was written.`);
-    }
     const now = toUnixTimestamp();
-    const changes = [];
-    const also = new Map();
-    for (const uuid of ids) {
-      const p = patchFor(uuid, now);
-      changes.push({ [uuid]: { t: 1, e: ENTITY.task, p } });
-      if (alsoFor) {
-        also.set(uuid, alsoFor(uuid, p));
-        changes.push(...also.get(uuid));
+    let items = [];
+    await this.commitChanges((db) => {
+      const missing = ids.filter((uuid) => !exists(db, uuid));
+      if (missing.length) {
+        const named = missing.map((uuid) => (db.kindOf(uuid) ? `${uuid} (${aKind(db.kindOf(uuid))})` : uuid));
+        throw new Error(`${label} not found: ${named.join(", ")}. Nothing was written.`);
       }
-    }
-    await this.commitChanges(changes);
-    const items = ids.map((id) => ({ id, title: db.tasks.get(id)?.title || null, result: "updated", ...(alsoFor ? { todosClosed: also.get(id).length } : {}) }));
+      const changes = [];
+      items = [];
+      for (const uuid of ids) {
+        const p = patchFor(db, uuid, now);
+        changes.push({ [uuid]: { t: 1, e: ENTITY.task, p } });
+        const also = alsoFor ? alsoFor(db, uuid, p) : null;
+        if (also) changes.push(...also);
+        items.push({ id: uuid, title: db.tasks.get(uuid)?.title || null, result: "updated", ...(also ? { todosClosed: also.length } : {}) });
+      }
+      return changes;
+    });
     return { count: ids.length, operation, updated: true, items };
   }
 
@@ -2464,6 +2600,15 @@ export class ThingsDatabase {
 
   today() {
     return localDate(this.timeZone);
+  }
+
+  // A copy whose "today" and calendar days are in another time zone, for reading only: Today,
+  // Upcoming, deadlines, the Logbook day filters, and the daily summary. Writes always go through
+  // the client's own database and its configured zone.
+  inTimeZone(timeZone) {
+    const copy = this.clone();
+    copy.timeZone = assertTimeZone(timeZone);
+    return copy;
   }
 
   // Entities are replaced, never mutated, so copying the maps is enough for an independent copy.

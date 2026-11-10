@@ -1146,13 +1146,15 @@ test("things_add_todo with repeat: contradictory or unsupported input is refused
   assert.equal(commits.length, 0);
 });
 
-test("tool descriptions say that repeat rules cannot be edited or cleared", () => {
+test("tool descriptions point at things_update_repeat for editing, pausing, and stopping a repeat", () => {
   const source = readFileSync(new URL("../src/things-mcp.js", import.meta.url), "utf8");
-  for (const name of ["things_add_todo", "things_get_repeating_todos"]) {
+  assert.doesNotMatch(source, /cannot be edited or cleared/);
+  for (const name of ["things_add_todo", "things_get_repeating_todos", "things_update_repeat"]) {
     const start = source.indexOf(`"${name}"`);
     const tool = source.slice(start, source.indexOf("server.registerTool(", start));
-    assert.match(tool, /cannot be edited or cleared/, name);
-    assert.match(tool, /trashing the template/i, name);
+    assert.match(tool, /things_update_repeat/, name);
+    assert.match(tool, /pause/, name);
+    assert.match(tool, /stop/, name);
   }
 });
 
@@ -1250,4 +1252,229 @@ test("an import_json update that closes a project closes its to-dos, one change 
   assert.deepEqual(body[ids.open].p, { md, tt: "renamed", ss: 2, sp });
   assert.deepEqual(body[ids.underHead].p, { md, ss: 2, sp });
   assert.equal(result.items.find((i) => i.id === ids.proj).todosClosed, 2);
+});
+
+// --- editing, pausing, and stopping a repeat (shapes sampled from Things 3.24.2 on 2026-11-09) ----------
+
+// The sampled history: project, today's occurrence, and the daily template whose next day is
+// 2026-11-10. The clock is set to the moment of each sampled write, so dates and md compare exactly
+// (to the millisecond; the samples carry microseconds).
+const S = {
+  project: "XN4eGArARmEF2vzS84p12i",
+  occurrence: "7FxH2V7SdsAwEvq59evaxb",
+  template: "LFwb2zkVA7nCqRm1BMEfkk",
+  nov9: 1794182400,
+  nov10: 1794268800,
+};
+const sampledTask = (p) => {
+  const create = buildTaskCreate({ title: "Repeat edit sample", when: "anytime", project: S.project, now: 1794274800, timeZone: TZ });
+  return { t: 0, e: "Task7", p: { ...create.p, ...p } };
+};
+const sampledHistory = (templateProps = {}) => [
+  { [S.project]: { t: 0, e: "Task7", p: { ...buildTaskCreate({ title: "Samples", type: 1, when: "anytime", now: 1794274700, timeZone: TZ }).p } } },
+  { [S.occurrence]: sampledTask({ st: 1, sr: S.nov9, tir: S.nov9, rt: [S.template] }) },
+  {
+    [S.template]: sampledTask({
+      sr: null,
+      st: 2,
+      tir: S.nov10,
+      icc: 1,
+      icsd: S.nov10,
+      md: 1794274843.07671,
+      rr: { of: [{ dy: 0 }], rrv: 4, tp: 0, ts: 0, fu: 16, ia: S.nov9, fa: 1, sr: S.nov9, rc: 0, ed: 64092211200 },
+      ...templateProps,
+    }),
+  },
+];
+const at = (t, seconds) => t.mock.timers.enable({ apis: ["Date"], now: Math.round(seconds * 1000) });
+const ms = (seconds) => Math.round(seconds * 1000) / 1000;
+
+test("things_update_repeat rule: writes md and the new rr on the template, exactly as sampled", async (t) => {
+  at(t, 1794274921.023453);
+  const { client, commits } = cloud(sampledHistory());
+  // An occurrence id resolves to its template through rt.
+  const result = await client.updateRepeat(S.occurrence, { action: "rule", repeat: { frequency: "weekly", weekdays: ["tue"] } });
+  assert.equal(commits.length, 1);
+  assert.deepEqual(commits[0].body, {
+    [S.template]: {
+      t: 1,
+      e: "Task6",
+      p: { md: ms(1794274921.023453), rr: { of: [{ wd: 2 }], rrv: 4, tp: 0, ts: 0, fu: 256, ia: 1794268800, fa: 1, sr: 1794182400, rc: 0, ed: 64092211200 } },
+    },
+  });
+  assert.deepEqual([result.id, result.repeatRule, result.nextOccurrence], [S.template, "Every week on Tuesday", "2026-11-10"]);
+  const read = (await client.syncDatabase()).getTask(S.template);
+  assert.deepEqual([read.repeatRule, read.repeat.nextOccurrence, read.repeat.paused], ["Every week on Tuesday", "2026-11-10", false]);
+  // repeat.starts may name the unchanged next day.
+  await client.updateRepeat(S.template, { action: "rule", repeat: { frequency: "daily", starts: "2026-11-10" } });
+  assert.deepEqual(Object.keys(commits[1].body[S.template].p).sort(), ["md", "rr"]);
+  assert.deepEqual([commits[1].body[S.template].p.rr.ia, commits[1].body[S.template].p.rr.sr], [S.nov10, S.nov9]);
+});
+
+test("things_update_repeat rule: an edit that would move the next day, or any unsampled case, is refused with nothing written", async (t) => {
+  at(t, 1794274921.023453);
+  const { client, commits } = cloud(sampledHistory());
+  const no = (id, args, pattern) => assert.rejects(client.updateRepeat(id, args), pattern);
+  const rule = (repeat) => ({ action: "rule", repeat });
+  await no(S.template, rule({ frequency: "weekly", weekdays: ["wed"] }), /next day of this repeat is 2026-11-10.*nearest days it does fall on: 2026-11-11\)/);
+  await no(S.template, rule({ frequency: "weekly", weekdays: ["mon", "wed"] }), /nearest days it does fall on: 2026-11-09 and 2026-11-11\)/);
+  await no(S.template, rule({ frequency: "monthly", month_days: [15] }), /nearest days it does fall on: 2026-11-15\)/);
+  await no(S.template, rule({ frequency: "daily", starts: "2026-11-12" }), /repeat\.starts \(2026-11-12\) is not the next day of this repeat \(2026-11-10\)/);
+  await no(S.template, rule({ frequency: "daily", interval: 4, after_completion: true }), /after completion was not sampled/);
+  await no(S.template, rule({ frequency: "hourly" }), /Supported repeats/);
+  await no(S.template, { action: "rule" }, /needs a repeat object/);
+  await no(S.template, { action: "pause", repeat: { frequency: "daily" } }, /"rule" action only/);
+  await no(S.template, { action: "clear" }, /action must be/);
+  await no(S.project, { action: "pause" }, /is a project, not a to-do/);
+  assert.equal(commits.length, 0);
+
+  // A paused template, an after-completion rule, and a plain to-do.
+  const plain = generateUUID();
+  const paused = cloud([...sampledHistory({ icp: true }), { [plain]: buildTaskCreate({ title: "plain", timeZone: TZ }) }]);
+  await assert.rejects(paused.client.updateRepeat(S.template, rule({ frequency: "weekly", weekdays: ["tue"] })), /is paused.*Resume it first/);
+  await assert.rejects(paused.client.updateRepeat(plain, { action: "pause" }), /is not a repeating to-do/);
+  const after = cloud(sampledHistory({ rr: { fu: 16, fa: 4, of: [], tp: 1, ia: 0, sr: S.nov9, rc: 0, ts: 0, rrv: 4, ed: 64092211200 } }));
+  await assert.rejects(after.client.updateRepeat(S.template, rule({ frequency: "daily" })), /not a plain fixed-schedule rule/);
+  assert.equal(paused.commits.length + after.commits.length, 0);
+
+  // The validator holds the same line for any other writer.
+  const db = await client.syncDatabase();
+  const upd = (p) => ({ [S.template]: { t: 1, e: "Task6", p } });
+  const rr = { of: [{ wd: 2 }], rrv: 4, tp: 0, ts: 0, fu: 256, ia: S.nov10, fa: 1, sr: S.nov9, rc: 0, ed: 64092211200 };
+  assert.doesNotThrow(() => validateChangeMap(upd({ md: 1794274921.023, rr }), db));
+  refused(upd({ rr }), db, /a rule edit writes exactly md and rr/);
+  refused(upd({ md: 1794274921.023, rr, tir: S.nov10 }), db, /tir would change a repeating template/);
+  refused(upd({ md: 1794274921.023, rr: null }), db, /cannot be cleared/);
+  refused(upd({ md: 1794274921.023, rr: { ...rr, sr: S.nov10 } }), db, /rr\.sr must stay the old rule's sr/);
+  refused(upd({ md: 1794274921.023, rr: { ...rr, ia: S.nov9 } }), db, /rr\.ia must be the template's next day/);
+  refused(upd({ md: 1794274921.023, rr: { ...rr, of: [{ wd: 3 }] } }), db, /does not fall on the template's next day 2026-11-10/);
+  refused(upd({ md: 1794274921.023, rr: { ...rr, fu: 16, of: [], tp: 1, ia: 0 } }), db, /only a fixed-schedule rule/);
+  refused(upd({ icp: true }), db, /pause and resume write exactly icp and md/);
+  refused(upd({ icp: "yes", md: 1794274921.023 }), db, /icp must be a boolean/);
+  refused({ [S.occurrence]: { t: 1, e: "Task6", p: { icp: true, md: 1794274921.023 } } }, db, /icp applies to repeating templates only/);
+});
+
+test("things_update_repeat pause and resume: write icp and md on the template, exactly as sampled", async (t) => {
+  at(t, 1794274947.122859);
+  const { client, commits } = cloud(sampledHistory());
+  const paused = await client.updateRepeat(S.template, { action: "pause" });
+  assert.deepEqual(commits[0].body, { [S.template]: { t: 1, e: "Task6", p: { icp: true, md: ms(1794274947.122859) } } });
+  assert.deepEqual([paused.changed, paused.paused], [true, true]);
+  const db = await client.syncDatabase();
+  assert.equal(db.getTask(S.template).repeat.paused, true);
+  assert.equal(db.getRepeatingTodos()[0].repeat.paused, true);
+  // Pausing a paused repeat writes nothing.
+  assert.deepEqual((await client.updateRepeat(S.occurrence, { action: "pause" })).changed, false);
+  assert.equal(commits.length, 1);
+
+  t.mock.timers.setTime(Math.round(1794274971.49046 * 1000));
+  await client.updateRepeat(S.occurrence, { action: "resume" });
+  assert.deepEqual(commits[1].body, { [S.template]: { t: 1, e: "Task6", p: { icp: false, md: ms(1794274971.49046) } } });
+  assert.equal((await client.syncDatabase()).getTask(S.template).repeat.paused, false);
+  assert.equal((await client.updateRepeat(S.template, { action: "resume" })).changed, false);
+  assert.equal(commits.length, 2);
+});
+
+// The sampled create, verbatim, with cd left to the clock.
+const SAMPLED_STOP_CREATE = JSON.parse(
+  '{"tp":0,"sr":1794268800,"dds":null,"rt":[],"rmd":null,"ss":0,"tr":false,"dl":[],"icp":false,"st":2,"ar":[],"tt":"Repeat edit sample","do":0,"lai":null,"tir":1794268800,"tg":[],"agr":[],"ix":0,"cd":1794274999.166278,"lt":true,"icc":0,"ti":0,"md":null,"dd":null,"ato":null,"nt":{"_t":"tx","ch":0,"v":"","t":1},"icsd":null,"pr":["XN4eGArARmEF2vzS84p12i"],"rp":null,"acrd":null,"sp":null,"sb":0,"rr":null,"xx":{"sn":{},"_t":"oo"}}'
+);
+
+test("things_update_repeat stop: one commit with the sampled create, detach, and tombstone", async (t) => {
+  at(t, 1794274999.166278);
+  const { client, commits } = cloud(sampledHistory());
+  const result = await client.updateRepeat(S.template, { action: "stop" });
+  assert.equal(commits.length, 1);
+  const body = commits[0].body;
+  const ids = Object.keys(body);
+  assert.deepEqual(ids.slice(1), [S.occurrence, S.template]);
+  assert.equal(ids.length, 3);
+  assert.equal(ids[0], result.newTodoId);
+  const create = body[ids[0]];
+  assert.deepEqual([create.t, create.e], [0, "Task6"]);
+  assert.deepEqual(Object.keys(create.p), Object.keys(SAMPLED_STOP_CREATE));
+  assert.deepEqual(create.p, { ...SAMPLED_STOP_CREATE, cd: ms(1794274999.166278) });
+  assert.deepEqual(body[S.occurrence], { t: 1, e: "Task6", p: { rt: [] } });
+  assert.deepEqual(body[S.template], { t: 2, e: "Task6", p: {} });
+  assert.deepEqual([result.scheduledDate, result.detachedOccurrences], ["2026-11-10", [S.occurrence]]);
+
+  const db = await client.syncDatabase();
+  assert.deepEqual(db.getRepeatingTodos(), []);
+  assert.equal(db.getTask(S.occurrence).repeatTemplateId, undefined);
+  const made = db.getTask(result.newTodoId);
+  assert.deepEqual([made.title, made.when, made.projectId, made.repeating], ["Repeat edit sample", "2026-11-10", S.project, undefined]);
+});
+
+test("things_update_repeat stop: every open occurrence is detached, completed and trashed ones are left alone, template fields are copied", async (t) => {
+  at(t, 1794274999.166278);
+  const [open2, done, trashed, g, a] = Array.from({ length: 5 }, generateUUID);
+  const occ = (p) => sampledTask({ st: 1, sr: S.nov9, tir: S.nov9, rt: [S.template], ...p });
+  const { client, commits } = cloud([
+    { [g]: { t: 0, e: "Tag4", p: { tt: "home", sh: null, pn: [], ix: 0, xx: { sn: {}, _t: "oo" } } } },
+    { [a]: { t: 0, e: "Area3", p: { tt: "Life", tg: [], ix: 0, xx: { sn: {}, _t: "oo" } } } },
+    ...sampledHistory({ tt: "Water plants", nt: noteObject("two cups"), tg: [g], pr: [], ar: [a], ix: -417 }),
+    { [open2]: occ({}) },
+    { [done]: occ({ ss: 3, sp: 1794270000 }) },
+    { [trashed]: occ({ tr: true }) },
+  ]);
+  const result = await client.updateRepeat(open2, { action: "stop" });
+  const body = commits[0].body;
+  assert.deepEqual(Object.keys(body), [result.newTodoId, S.occurrence, open2, S.template]);
+  assert.deepEqual(body[S.occurrence], { t: 1, e: "Task6", p: { rt: [] } });
+  assert.deepEqual(body[open2], { t: 1, e: "Task6", p: { rt: [] } });
+  assert.deepEqual(body[S.template], { t: 2, e: "Task6", p: {} });
+  assert.deepEqual(body[result.newTodoId].p, {
+    ...SAMPLED_STOP_CREATE,
+    cd: ms(1794274999.166278),
+    tt: "Water plants",
+    nt: noteObject("two cups"),
+    tg: [g],
+    pr: [],
+    ar: [a],
+    ix: -417,
+  });
+  assert.deepEqual(result.detachedOccurrences, [S.occurrence, open2]);
+  const db = await client.syncDatabase();
+  assert.deepEqual([db.tasks.get(done).repeatingTemplates, db.tasks.get(trashed).repeatingTemplates], [[S.template], [S.template]]);
+});
+
+test("things_update_repeat stop: unsampled cases are refused, and the validator only passes the stop shapes together", async (t) => {
+  at(t, 1794274999.166278);
+  const stop = (history) => {
+    const c = cloud(history);
+    return [assert.rejects.bind(null, c.client.updateRepeat(S.template, { action: "stop" })), c];
+  };
+  const item = generateUUID();
+  const [withChecklist, c1] = stop([...sampledHistory(), { [item]: buildChecklistCreate({ title: "step", task: S.template }) }]);
+  await withChecklist(/has checklist items.*Trashing the template \(things_delete_todo/);
+  const [paused, c2] = stop(sampledHistory({ icp: true }));
+  await paused(/is paused.*Resume it first/);
+  const [withReminder, c3] = stop(sampledHistory({ ato: 32400 }));
+  await withReminder(/adds deadlines or reminders/);
+  const [withDeadline, c4] = stop(sampledHistory({ dd: 64092211200 }));
+  await withDeadline(/adds deadlines or reminders/);
+  const [dueToday, c5] = stop(sampledHistory({ tir: S.nov9, icsd: S.nov9 }));
+  await dueToday(/next day of the repeating to-do \S+ is 2026-11-09; only a repeat whose next day is in the future/);
+  const [inTrash, c6] = stop(sampledHistory({ tr: true }));
+  await inTrash(/is in the Trash/);
+  assert.equal([c1, c2, c3, c4, c5, c6].reduce((n, c) => n + c.commits.length, 0), 0);
+
+  const { client } = cloud(sampledHistory());
+  const db = await client.syncDatabase();
+  const id = generateUUID();
+  const create = { t: 0, e: "Task6", p: { ...SAMPLED_STOP_CREATE } };
+  const detach = { [S.occurrence]: { t: 1, e: "Task6", p: { rt: [] } } };
+  const tombstone = { [S.template]: { t: 2, e: "Task6", p: {} } };
+  assert.doesNotThrow(() => validateChangeMap({ [id]: create, ...detach, ...tombstone }, db));
+  refused({ [id]: create }, db, /must come with the tombstone of exactly one repeating template/);
+  refused({ ...detach }, db, /rt would change a repeating occurrence/);
+  refused({ ...detach, [S.occurrence]: { t: 1, e: "Task6", p: { rt: [], md: 1794274999 } }, [id]: create, ...tombstone }, db, /rt would change a repeating occurrence/);
+  refused({ [id]: create, ...tombstone }, db, /repeat template still references deleted item/);
+  const bad = (p, pattern) => refused({ [id]: { ...create, p: { ...create.p, ...p } }, ...detach, ...tombstone }, db, pattern);
+  bad({ md: 1794274999 }, /needs md null/);
+  bad({ lt: false }, /needs lt true/);
+  bad({ st: 1 }, /needs st 2/);
+  bad({ icsd: S.nov10 }, /needs icsd null/);
+  bad({ tir: S.nov9 }, /sr and tir on the same day/);
+  bad({ sr: 1794355200, tir: 1794355200 }, /must be on the template's next day/);
 });

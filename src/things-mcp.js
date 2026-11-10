@@ -22,6 +22,28 @@ function fixListToolsSchemaDialect(server) {
   });
 }
 
+// The `repeat` input shared by things_add_todo and things_update_repeat.
+const repeatSchema = z
+  .object({
+    frequency: z.enum(["daily", "weekly", "monthly", "yearly"]).describe("Repeat unit"),
+    interval: z.number().int().min(1).max(999).optional().describe("Every N units (default 1)"),
+    weekdays: z.array(z.string()).optional().describe("Weekly only, required: weekday names such as ['mon', 'thu']"),
+    month_days: z.array(z.union([z.number().int(), z.literal("last")])).optional().describe("Monthly: days of the month such as [1, 15], or ['last'] for the last day"),
+    nth_weekday: z
+      .object({ nth: z.union([z.number().int(), z.literal("last")]), weekday: z.string() })
+      .optional()
+      .describe("Monthly or yearly: the nth weekday, e.g. {nth: 2, weekday: 'tue'}. nth is 1 to 4, or 'last' for monthly only."),
+    month: z.union([z.number().int(), z.string()]).optional().describe("Yearly only, required: month 1 to 12 or its name"),
+    day: z.number().int().optional().describe("Yearly: day of the month"),
+    starts: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("First day (YYYY-MM-DD). Must be today or later and a day the rule falls on. Defaults to the next such day."),
+    ends: z
+      .union([z.object({ on: z.string().regex(/^\d{4}-\d{2}-\d{2}$/) }).strict(), z.object({ after: z.number().int().min(1).max(999) }).strict()])
+      .optional()
+      .describe("End: {on: 'YYYY-MM-DD'} or {after: N} times. Omit to repeat forever."),
+    after_completion: z.boolean().optional().describe("true repeats N days after each completion instead of on a fixed schedule. Daily only, with no end."),
+  })
+  .strict();
+
 export class ThingsMCP extends McpAgent {
   getEventStore() {
     return undefined;
@@ -368,7 +390,7 @@ export class ThingsMCP extends McpAgent {
       "things_get_repeating_todos",
       {
         title: "Get Repeating To-Dos",
-        description: "Fetch repeating to-do templates. Each has \"repeating\": true, \"repeatRule\" (the rule in words) and \"repeat\" (frequency, interval, next occurrence, end, deadline offset). Templates are hidden rule holders: they are left out of lists, search, and project counts, and an existing repeat rule cannot be edited or cleared here (change it in Things), and trashing the template with things_delete_todo stops it. New ones are created with the \"repeat\" option of things_add_todo. The to-dos they generate carry \"repeatTemplateId\".",
+        description: "Fetch repeating to-do templates. Each has \"repeating\": true, \"repeatRule\" (the rule in words) and \"repeat\" (frequency, interval, next occurrence, end, deadline offset). Templates are hidden rule holders: they are left out of lists, search, and project counts, and \"repeat.paused\" is true while a repeat is paused. things_update_repeat edits the rule, pauses, resumes, or stops a repeat; trashing the template with things_delete_todo also ends it. New ones are created with the \"repeat\" option of things_add_todo. The to-dos they generate carry \"repeatTemplateId\".",
         inputSchema: {},
         annotations: {
           title: "Get Repeating To-Dos",
@@ -666,7 +688,7 @@ export class ThingsMCP extends McpAgent {
       "things_add_todo",
       {
         title: "Add To-Do",
-        description: "Create a new to-do in Things 3 with scheduling, reminder alert, deadline, project/heading/area, checklist, and optional dates. With \"repeat\" it creates a repeating to-do instead: a hidden template from which Things generates the occurrences. An existing repeat rule cannot be edited or cleared through this connector; trashing the template (things_delete_todo) stops it.",
+        description: "Create a new to-do in Things 3 with scheduling, reminder alert, deadline, project/heading/area, checklist, and optional dates. With \"repeat\" it creates a repeating to-do instead: a hidden template from which Things generates the occurrences. Use things_update_repeat to edit the rule of an existing repeating to-do, or to pause, resume, or stop it.",
         inputSchema: {
           title: z.string().describe("Title of the to-do"),
           notes: z.string().optional().describe("Notes / Markdown description"),
@@ -682,26 +704,7 @@ export class ThingsMCP extends McpAgent {
           canceled: z.boolean().optional().describe("Set true if canceled"),
           completion_date: z.string().optional().describe("Completion date in ISO 8601"),
           creation_date: z.string().optional().describe("Creation date in ISO 8601"),
-          repeat: z
-            .object({
-              frequency: z.enum(["daily", "weekly", "monthly", "yearly"]).describe("Repeat unit"),
-              interval: z.number().int().min(1).max(999).optional().describe("Every N units (default 1)"),
-              weekdays: z.array(z.string()).optional().describe("Weekly only, required: weekday names such as ['mon', 'thu']"),
-              month_days: z.array(z.union([z.number().int(), z.literal("last")])).optional().describe("Monthly: days of the month such as [1, 15], or ['last'] for the last day"),
-              nth_weekday: z
-                .object({ nth: z.union([z.number().int(), z.literal("last")]), weekday: z.string() })
-                .optional()
-                .describe("Monthly or yearly: the nth weekday, e.g. {nth: 2, weekday: 'tue'}. nth is 1 to 4, or 'last' for monthly only."),
-              month: z.union([z.number().int(), z.string()]).optional().describe("Yearly only, required: month 1 to 12 or its name"),
-              day: z.number().int().optional().describe("Yearly: day of the month"),
-              starts: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("First day (YYYY-MM-DD). Must be today or later and a day the rule falls on. Defaults to the next such day."),
-              ends: z
-                .union([z.object({ on: z.string().regex(/^\d{4}-\d{2}-\d{2}$/) }).strict(), z.object({ after: z.number().int().min(1).max(999) }).strict()])
-                .optional()
-                .describe("End: {on: 'YYYY-MM-DD'} or {after: N} times. Omit to repeat forever."),
-              after_completion: z.boolean().optional().describe("true repeats N days after each completion instead of on a fixed schedule. Daily only, with no end."),
-            })
-            .strict()
+          repeat: repeatSchema
             .optional()
             .describe("Make this a repeating to-do. 'when' may then only be left out or give the first day ('today', 'tomorrow', or a date, equal to repeat.starts if both are given). Not allowed with repeat: reminder_time, deadline, completed, canceled, completion_date. Unsupported rules are refused."),
         },
@@ -734,10 +737,46 @@ export class ThingsMCP extends McpAgent {
         });
         if (result.repeating) {
           return textResult(
-            `Successfully created repeating to-do "${result.title}" (template ID: ${result.id}). Rule: ${result.repeatRule}. First day: ${result.firstOccurrence}. Things generates the occurrences. The rule cannot be edited or cleared through this connector; trashing the template stops it.`
+            `Successfully created repeating to-do "${result.title}" (template ID: ${result.id}). Rule: ${result.repeatRule}. First day: ${result.firstOccurrence}. Things generates the occurrences. Use things_update_repeat to edit the rule, pause, resume, or stop it.`
           );
         }
         return textResult(`Successfully created to-do "${result.title}" (ID: ${result.id}) scheduled for ${result.when}.`);
+      }
+    );
+
+    // things_update_repeat
+    server.registerTool(
+      "things_update_repeat",
+      {
+        title: "Update Repeat",
+        description: "Edit the rule of a repeating to-do, pause it, resume it, or stop it. Takes the template id (from things_get_repeating_todos) or the id of one of its occurrences, and exactly one action. \"rule\" replaces the rule with \"repeat\" and keeps the next day: the new rule must fall on the repeat's current next occurrence day, otherwise the edit is refused and names the nearest days the rule does fall on (change it in Things then). \"pause\" stops new occurrences until \"resume\". \"stop\" ends the repeat for good: the template is deleted, open occurrences become ordinary to-dos, a plain to-do is created for the next day, and completed or trashed occurrences are left alone. Stop is refused for a template with checklist items; trashing the template with things_delete_todo is the alternative.",
+        inputSchema: {
+          id: z.string().describe("UUID of the repeating template, or of one of its occurrences"),
+          action: z.enum(["rule", "pause", "resume", "stop"]).describe("What to do: 'rule' (needs repeat), 'pause', 'resume', or 'stop'"),
+          repeat: repeatSchema
+            .optional()
+            .describe("The new rule, for action 'rule' only. Same options as the repeat of things_add_todo. repeat.starts may be left out or must equal the repeat's current next occurrence day. A rule that repeats after completion is refused."),
+        },
+        annotations: {
+          title: "Update Repeat",
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      async ({ id, action, repeat }) => {
+        const client = await getClient();
+        const r = await client.updateRepeat(id, { action, repeat });
+        const name = `repeating to-do "${r.title}" (template ID: ${r.id})`;
+        if (action === "rule") return textResult(`Changed the rule of ${name}. Rule: ${r.repeatRule}. Next day: ${r.nextOccurrence} (unchanged).`);
+        if (action === "stop") {
+          return textResult(
+            `Stopped ${name}. The template is deleted. Created to-do ${r.newTodoId} for ${r.scheduledDate}. Open occurrences made ordinary to-dos: ${r.detachedOccurrences.length ? r.detachedOccurrences.join(", ") : "none"}.`
+          );
+        }
+        if (!r.changed) return textResult(`The ${name} was already ${r.paused ? "paused" : "running"}; nothing was written.`);
+        return textResult(`${action === "pause" ? "Paused" : "Resumed"} ${name}.`);
       }
     );
 

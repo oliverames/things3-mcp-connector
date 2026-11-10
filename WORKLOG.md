@@ -1,5 +1,35 @@
 # Things MCP connector worklog
 
+## 2026-11-09 - Repeat rule edit, pause, resume, and stop (uncommitted, not deployed)
+
+Source: the shapes Things 3.24.2 wrote on 2026-11-09 (history indexes 1688 to 1700), recorded in the orchestrating session's `repeat-edit-shapes.md`. Nothing was written to Things Cloud; the work is covered by tests against the mocked fetch only.
+
+**Tool**: `things_update_repeat` takes `id` (the template, or an occurrence, which is resolved through `rt`), one `action`, and `repeat` for the `rule` action. `ThingsCloudClient.updateRepeat` in `src/things-client.js` does the work.
+
+**Writes** (all `Task6`, like every other write of the connector; the app itself wrote `Task7`)
+- `rule`: one update on the template, `{ md, rr }`. `rr` is `buildRepeatRule(repeat, next day)` with `sr` replaced by the old rule's `sr`, so `ia` is the template's `tir`. `tir`, `icsd`, and `icc` are not written.
+- `pause` and `resume`: one update on the template, `{ icp: true | false, md }`.
+- `stop`: one commit with three kinds of entry, in the recorded order. A create from `buildRepeatStopCreate` with every key and value of the recorded create (`lt` true, `md` null, `icsd` null, `rr` null, `st` 2, `sr` = `tir` = the template's `tir`), with title, notes, tags, `pr`, `agr`, `ar`, and `ix` copied from the template and `cd` set to now. Then `{ rt: [] }` with no `md` on every open, untrashed occurrence. Then the template tombstone (`t` 2, empty `p`).
+
+**Refusals**, each because the shape was not recorded
+- `rule`: the new rule does not fall on the template's `tir`, or `repeat.starts` names another day (the message names the nearest days the rule falls on); the template is paused; the old or new rule repeats after completion; the old rule is not a plain rule (for example a deadline offset in `ts`); the template has no `tir`.
+- `stop`: the template has checklist items, is paused, has `ato` or the deadline sentinel in `dd`, or has a `tir` that is today, past, or missing. The messages name trashing the template as the alternative.
+- Any action on a trashed template, on a to-do that is neither a template nor an occurrence, and `repeat` given with an action other than `rule`.
+
+**Validator**
+- `TEMPLATE_SAFE_KEYS` gained `rr` and `icp` only. An `rr` update on a template must be exactly `{ md, rr }` on an unpaused template, fixed schedule to fixed schedule, with `rr.sr` unchanged, `rr.ia` equal to `tir`, and a rule that falls on the `tir` day. An `icp` update must be exactly `{ icp, md }`, `icp` must be a boolean, and it is refused on anything that is not a template.
+- An occurrence may write `{ rt: [] }` and nothing else, only when it is open and untrashed and the same commit tombstones its template.
+- The recorded stop create passed the existing shape checks as it was: `md` null and `lt` true were already accepted on a create. The validator was tightened instead. A to-do create with `lt` true or `md` null must now have every fixed value of the recorded create, and must come with the tombstone of exactly one template whose `tir` is its `sr`.
+- One check was loosened: in a commit that holds a stop create, completed, canceled, and trashed occurrences may keep naming the tombstoned template in `rt`. Without a stop create the old refusal stands, and an open occurrence that is not detached is still refused.
+
+**Reads**: `repeat.paused` is on every template (`icp` is now decoded). Tool descriptions and the README no longer say a rule cannot be edited or cleared.
+
+**Tests**: 99 pass. The clock is set to each recorded write, so the committed change maps are compared with the recorded entries key for key, `md` and `cd` to the millisecond (the records carry microseconds). Covered: rule, pause, resume, and stop against the recorded history; an occurrence id resolving to its template; stop with two open occurrences, one completed, and one trashed; every refusal above; the validator refusing each near miss.
+
+**Not verified**
+- Nothing here has been read by a Things app. One supervised live run of each action is still needed.
+- The records hold one case per action. Not recorded: a rule edit with an end date or count (allowed, the `rr` shapes are the recorded create shapes), a stop with a completed or trashed occurrence present (they are left alone on the orchestrator's instruction), a stop on a template with tags, notes, a heading, or an area (copied on instruction; the record had a project and none of the others), and `Task6` against the recorded `Task7`.
+
 ## 2026-11-09 - Password encoding and closing a project's to-dos (commit `3eaff0d`, deployed as Worker `9bb2877b`, both verified live)
 
 **Password encoding**: `ThingsCloudClient.encodePassword` ran `encodeURIComponent` and then escaped a character class that included `%`, so it escaped its own percent signs and `@` became `%2540`. It now escapes once and adds only `!*'()`, which is exactly what the Swift client in things-reminders-sync does: `p@ss w!rd*'()~` becomes `p%40ss%20w%21rd%2A%27%28%29~`. Which form Things Cloud itself wants is unverified. The owner's password has no special characters, so every form signs in, and no sign-in with a special character has been tried.

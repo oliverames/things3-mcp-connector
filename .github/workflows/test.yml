@@ -24,5 +24,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      # The tests import only src/things-client.js and src/pages.js, which have no dependencies, so no install step.
+          cache: npm
+      # The tests import src/things-handler.js, which needs hono, so dependencies are installed.
+      - run: npm ci
       - run: npm test

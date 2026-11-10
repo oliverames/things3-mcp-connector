@@ -1,6 +1,6 @@
 # Things MCP connector worklog
 
-## 2026-11-10 - Importing a finished project, and a note on tag titles (uncommitted, not deployed)
+## 2026-11-10 - Importing a finished project, and a note on tag titles (commit `acb2f6c`, deployed as Worker `a295a3e1`, verified live)
 
 Nothing was written to Things Cloud and nothing was deployed; the work is covered by tests against the mocked fetch only.
 
@@ -20,7 +20,7 @@ Nothing was written to Things Cloud and nothing was deployed; the work is covere
 
 **Not verified**: the Things apps reading these creates from a live account.
 
-## 2026-11-09 - Repeat rule edit that moves the next day, and stop with notes, tags, and checklist items (uncommitted, not deployed)
+## 2026-11-09 - Repeat rule edit that moves the next day, and stop with notes, tags, and checklist items (commit `63f8ead`, deployed, verified live)
 
 Source: the second sampling session in the orchestrating session's `repeat-edit-shapes.md` (Things 3.24.2, history indexes after 1716). Nothing was written to Things Cloud and nothing was deployed; the work is covered by tests against the mocked fetch only.
 
@@ -59,7 +59,7 @@ Source: the second sampling session in the orchestrating session's `repeat-edit-
 - Which of the two recorded template items was "One" is not in the record, and their `ix` values are not either. `ix` counting from 0 matches the record but a template whose items have other `ix` values was not recorded.
 - Items with a status other than open were not recorded; `ss` and `sp` are carried over as instructed.
 
-## 2026-11-09 - Remaining hardening items from the audit (uncommitted, not deployed)
+## 2026-11-09 - Remaining hardening items from the audit (commit `8ce82b1`, deployed)
 
 These five were declined in the audit pass as small benefit and are now done. Nothing was written to Things Cloud and nothing was deployed; all of it is covered by tests against a mocked fetch. No new wire shape is written: every change sends the same entities and keys as before.
 
@@ -89,7 +89,7 @@ These five were declined in the audit pass as small benefit and are now done. No
 
 ---
 
-## 2026-11-09 - Repeat rule edit, pause, resume, and stop (uncommitted, not deployed)
+## 2026-11-09 - Repeat rule edit, pause, resume, and stop (commit `1d73aa6`, deployed, verified live)
 
 Source: the shapes Things 3.24.2 wrote on 2026-11-09 (history indexes 1688 to 1700), recorded in the orchestrating session's `repeat-edit-shapes.md`. Nothing was written to Things Cloud; the work is covered by tests against the mocked fetch only.
 

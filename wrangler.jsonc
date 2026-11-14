@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "things3-mcp-connector",
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
   "main": "src/index.js",
   "account_id": "059585806715245840e5581f7174246d",
   "workers_dev": false,

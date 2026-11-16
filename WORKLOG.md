@@ -1,5 +1,18 @@
 # Things MCP connector worklog
 
+## 2026-11-15 - Issue #2: Upcoming keeps today's items; update_area schema refresh
+
+**What changed**: No behavior change to Upcoming — per Oliver's decision, `things_get_upcoming` keeps including a to-do scheduled for today when its deadline falls in the window (a test now pins that, plus the boundary that a deadline of today belongs to Today, not Upcoming). The `things_update_area` source schema was already title-only (`id`, `title`; the handler passes only `{ title }` to `updateArea`, which writes only the title), so the stale `visible` clients displayed was a cached tool list: the advertised server version is bumped 1.2.0 → 1.3.0 as the refresh signal, and `package.json` is aligned to 1.3.0 (it had drifted to 1.0.0; clients never see it — the version in the MCP handshake comes from `REMOTE_SERVER_INFO`). A test pins the update_area registration mentions `visible` nowhere and that the advertised version matches `package.json`, so the two cannot drift again. README now states the Upcoming behavior.
+
+**Verification**: `npm test` passes (126 tests, mocked fetch only). Not verified: a fresh Claude session showing the current update_area schema — that needs a reconnect against the deployed Worker after this ships, and the issue stays open until then.
+
+**Left off at**: PR open; deploy and a live reconnect check remain.
+
+**Open questions**:
+- Still open: issues #1, #2 (until the live reconnect check), #4, #5.
+
+---
+
 ## 2026-11-10 - Things list MCP App (commit `51ed310`, deployed as Worker `f43fa5e9`)
 
 **What changed**: Added an interactive list view (`ui://things3/list.html`) for `things_get_today`, `_inbox`, `_upcoming`, `_anytime`, `_someday` and `things_get_project`. Ticking a checkbox calls `things_complete_todo`, only on click, with optimistic UI and rollback on error. Text results are unchanged; a trimmed copy goes in `structuredContent`. The glyphs (checkbox, Today star, Inbox, Anytime, Someday, Upcoming, Evening moon, flag, repeat, project pies) are vector artwork extracted from the Things 3 app (`scripts/extract-glyphs.swift`, `src/app/glyphs/`, NOTICE inside). `ui.domain` is computed for `https://things3mcp.org/mcp` exactly.

@@ -62,7 +62,7 @@ This connector talks directly to Things Cloud using its native wire format (`Tas
 ### Lists & Views
 - `things_get_today`: Retrieve the Today list as Things shows it: start dates that have arrived, plus undated to-dos whose deadline is today or overdue. Takes an optional `timezone`.
 - `things_get_inbox`: Retrieve unorganized Inbox to-dos.
-- `things_get_upcoming`: Retrieve future scheduled tasks and future deadlines. Takes an optional `timezone`.
+- `things_get_upcoming`: Retrieve future scheduled tasks and future deadlines. Takes an optional `timezone`. A to-do scheduled for today still appears when its deadline falls in the window (kept by decision, issue #2).
 - `things_get_anytime`: Retrieve Anytime tasks filtered by area or tag.
 - `things_get_someday`: Retrieve Someday tasks.
 - `things_get_logbook`: Retrieve completed or canceled items sorted by completion date, with optional `since` and `until` filtering. A bare `YYYY-MM-DD` is a calendar day in the connector's time zone, or in `timezone` when given.

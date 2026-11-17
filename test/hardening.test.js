@@ -3,6 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { REMOTE_SERVER_INFO } from "../src/brand-assets.js";
 import { loginPage, errorPage, withSecurityHeaders } from "../src/pages.js";
 import { encryptJson, encryptJsonLegacy, decryptJson, decryptJsonDetailed, readStoredCredentials, upgradeGrantProps } from "../src/credential-crypto.js";
 import { ThingsHandler } from "../src/things-handler.js";
@@ -1072,6 +1073,29 @@ test("things_get_account_info does not return the history key", () => {
   const tool = source.slice(start, source.indexOf("server.registerTool(", start));
   assert.ok(start > 0 && tool.includes("mailDropEmail"));
   assert.ok(!/historyKey/i.test(tool));
+});
+
+// Issue #2: the update_area schema Claude displayed still listed `visible`, which the handler
+// no longer accepts. The source schema is title-only and the handler passes only the title,
+// so a client that re-lists tools on reconnect sees the current schema; the version bump in
+// brand-assets.js is the signal for hosts that cache the tool list against the server version.
+test("things_update_area advertises title only, never visible (issue #2)", () => {
+  const source = readFileSync(new URL("../src/things-mcp.js", import.meta.url), "utf8");
+  const start = source.indexOf('"things_update_area"');
+  assert.ok(start > 0);
+  const tool = source.slice(start, source.indexOf("server.registerTool(", start));
+  const schema = tool.slice(tool.indexOf("inputSchema: {"), tool.indexOf("},", tool.indexOf("inputSchema: {")));
+  assert.match(schema, /id: z\.string\(\)/);
+  assert.match(schema, /title: z\.string\(\)/);
+  assert.ok(!/visible/i.test(tool), "update_area must not mention visible anywhere in its registration");
+  assert.match(tool, /client\.updateArea\(id, \{ title \}\)/);
+});
+
+// The version clients see in the MCP initialize handshake comes from brand-assets.js, not
+// package.json; the two drifted (1.2.0 vs 1.0.0), so a bump in one did not move the other.
+test("the advertised server version matches package.json", () => {
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(REMOTE_SERVER_INFO.version, pkg.version);
 });
 
 // --- creating repeating to-dos ----------------------------------------------------------------------

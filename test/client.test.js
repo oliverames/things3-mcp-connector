@@ -122,6 +122,27 @@ test("Upcoming lists future start dates and deadlines, not undated Today items",
   assert.deepEqual(titles, ["scheduled", "today with deadline"]);
 });
 
+// Issue #2, decided 2026-11-15: things_get_upcoming KEEPS including today's items, unlike
+// Things' own Upcoming list, which excludes today. A to-do scheduled for today stays in
+// Upcoming when its deadline falls in the window; a deadline of today belongs to Today.
+test("Upcoming keeps today's items whose deadline is in the window (issue #2)", () => {
+  const db = new ThingsDatabase("UTC");
+  const day = (n) => Math.floor(Date.now() / 86400000) * 86400 + n * 86400;
+  const task = (title, extra) => ({ t: 0, e: "Task6", p: { tt: title, tp: 0, ss: 0, st: 1, tr: false, ...extra } });
+  db.applyChangeMap({
+    TODAYDL: task("today, deadline in 5 days", { st: 1, sr: day(0), tir: day(0), dd: day(5) }),
+    TODAYDLTODAY: task("today, deadline today", { st: 1, sr: day(0), tir: day(0), dd: day(0) }),
+    TODAYONLY: task("today, no deadline", { st: 1, sr: day(0), tir: day(0) }),
+    FUTUREDL: task("undated, deadline in 5 days", { st: 1, dd: day(5) }),
+  });
+  const upcoming = db.getUpcoming().map((t) => t.title).sort();
+  assert.deepEqual(upcoming, ["today, deadline in 5 days", "undated, deadline in 5 days"]);
+  // The today-scheduled item with a future deadline is in both lists: it is a Today item
+  // whose deadline also falls in the Upcoming window.
+  const today = db.getToday().map((t) => t.title).sort();
+  assert.deepEqual(today, ["today, deadline in 5 days", "today, deadline today", "today, no deadline"]);
+});
+
 test("creating a to-do with completed and completion-date", async () => {
   const { calls, fetchImpl } = fakeCloud();
   const client = new ThingsCloudClient({ email: "a@b.c", password: "pw", historyKey: "KEY", fetchImpl });

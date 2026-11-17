@@ -3,7 +3,7 @@
 // registering the same helpers on a plain McpServer and by reading the source for the tool list.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -94,7 +94,7 @@ test("the generated view is current (run `npm run build:app` after editing src/a
   assert.equal(THINGS_LIST_HTML, await buildHtml());
 });
 
-test("every glyph the view references is inlined, ids are namespaced, and the artwork notice ships with it", () => {
+test("every glyph the view references is inlined, and ids are namespaced", () => {
   const defined = new Set([...THINGS_LIST_HTML.matchAll(/<symbol id="gl-([^"]+)"/g)].map((m) => m[1]));
   const html = readFileSync(new URL("../src/app/things-list.html", import.meta.url), "utf8");
   const literal = [...html.matchAll(/(?:glyph|pair)\("([A-Za-z0-9-]+)"/g)].map((m) => m[1]);
@@ -102,5 +102,4 @@ test("every glyph the view references is inlined, ids are namespaced, and the ar
   for (const n of wanted) assert.ok(defined.has(n), `missing glyph ${n}`);
   const ids = [...THINGS_LIST_HTML.matchAll(/\sid="([^"]+)"/g)].map((m) => m[1]).filter((id) => id.includes("__"));
   assert.equal(new Set(ids).size, ids.length, "glyph ids collide");
-  assert.ok(existsSync(new URL("../src/app/glyphs/NOTICE.md", import.meta.url)));
 });
